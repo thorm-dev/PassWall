@@ -1,0 +1,419 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>640</width>
+    <height>440</height>
+   </rect>
+  </property>
+  <property name="minimumSize">
+   <size>
+    <width>520</width>
+    <height>380</height>
+   </size>
+  </property>
+  <property name="windowTitle">
+   <string>PassWall</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="mainLayout">
+    <item>
+     <widget class="QStackedWidget" name="stackedWidget">
+      <property name="currentIndex">
+       <number>0</number>
+      </property>
+      <widget class="QWidget" name="pageWelcome">
+       <layout class="QVBoxLayout" name="welcomeLayout">
+        <item>
+         <spacer name="welcomeTopSpacer">
+          <property name="orientation">
+           <enum>Qt::Orientation::Vertical</enum>
+          </property>
+          <property name="sizeHint" stdset="0">
+           <size>
+            <width>20</width>
+            <height>40</height>
+           </size>
+          </property>
+         </spacer>
+        </item>
+        <item>
+         <widget class="QLabel" name="welcomeTitle">
+          <property name="styleSheet">
+           <string>font-size: 28px; font-weight: bold;</string>
+          </property>
+          <property name="text">
+           <string>PassWall</string>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignmentFlag::AlignCenter</set>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="welcomeDescription">
+          <property name="text">
+           <string>Votre coffre-fort de mots de passe local</string>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignmentFlag::AlignCenter</set>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <spacer name="welcomeMiddleSpacer">
+          <property name="orientation">
+           <enum>Qt::Orientation::Vertical</enum>
+          </property>
+          <property name="sizeHint" stdset="0">
+           <size>
+            <width>20</width>
+            <height>30</height>
+           </size>
+          </property>
+         </spacer>
+        </item>
+        <item>
+         <widget class="QPushButton" name="createPageButton">
+          <property name="text">
+           <string>Créer un coffre</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="openPageButton">
+          <property name="styleSheet">
+           <string notr="true">background-color: #00476b</string>
+          </property>
+          <property name="text">
+           <string>Ouvrir un coffre existant</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <spacer name="welcomeBottomSpacer">
+          <property name="orientation">
+           <enum>Qt::Orientation::Vertical</enum>
+          </property>
+          <property name="sizeHint" stdset="0">
+           <size>
+            <width>20</width>
+            <height>40</height>
+           </size>
+          </property>
+         </spacer>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="pageCreate">
+       <layout class="QVBoxLayout" name="createLayout">
+        <item>
+         <widget class="QLabel" name="createTitle">
+          <property name="styleSheet">
+           <string>font-size: 20px; font-weight: bold;</string>
+          </property>
+          <property name="text">
+           <string>Créer un nouveau coffre</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="createPathLabel">
+          <property name="text">
+           <string>Emplacement du fichier</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="createPathLayout">
+          <item>
+           <widget class="QLineEdit" name="createPathEdit">
+            <property name="placeholderText">
+             <string>Choisir l'emplacement du coffre...</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="createBrowseButton">
+            <property name="text">
+             <string>Parcourir...</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <widget class="QLabel" name="createPasswordLabel">
+          <property name="text">
+           <string>Mot de passe maître</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLineEdit" name="createPasswordEdit">
+          <property name="echoMode">
+           <enum>QLineEdit::EchoMode::Password</enum>
+          </property>
+          <property name="placeholderText">
+           <string>Saisir un mot de passe fort</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="confirmPasswordLabel">
+          <property name="text">
+           <string>Confirmer le mot de passe maître</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLineEdit" name="confirmPasswordEdit">
+          <property name="echoMode">
+           <enum>QLineEdit::EchoMode::Password</enum>
+          </property>
+          <property name="placeholderText">
+           <string>Saisir à nouveau le mot de passe</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <spacer name="createSpacer">
+          <property name="orientation">
+           <enum>Qt::Orientation::Vertical</enum>
+          </property>
+          <property name="sizeHint" stdset="0">
+           <size>
+            <width>20</width>
+            <height>20</height>
+           </size>
+          </property>
+         </spacer>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="createButtonsLayout">
+          <item>
+           <widget class="QPushButton" name="createBackButton">
+            <property name="text">
+             <string>Retour</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="createButtonSpacer">
+            <property name="orientation">
+             <enum>Qt::Orientation::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>40</width>
+              <height>20</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="QPushButton" name="createVaultButton">
+            <property name="text">
+             <string>Créer le coffre</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="pageUnlock">
+       <layout class="QVBoxLayout" name="unlockLayout">
+        <item>
+         <widget class="QLabel" name="unlockTitle">
+          <property name="styleSheet">
+           <string>font-size: 20px; font-weight: bold;</string>
+          </property>
+          <property name="text">
+           <string>Ouvrir un coffre</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLabel" name="unlockPathLabel">
+          <property name="text">
+           <string>Fichier du coffre</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="unlockPathLayout">
+          <item>
+           <widget class="QLineEdit" name="unlockPathEdit">
+            <property name="placeholderText">
+             <string>Sélectionner un fichier de coffre...</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="unlockBrowseButton">
+            <property name="text">
+             <string>Parcourir...</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <widget class="QLabel" name="unlockPasswordLabel">
+          <property name="text">
+           <string>Mot de passe maître</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QLineEdit" name="unlockPasswordEdit">
+          <property name="echoMode">
+           <enum>QLineEdit::EchoMode::Password</enum>
+          </property>
+          <property name="placeholderText">
+           <string>Saisir le mot de passe maître</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <spacer name="unlockSpacer">
+          <property name="orientation">
+           <enum>Qt::Orientation::Vertical</enum>
+          </property>
+          <property name="sizeHint" stdset="0">
+           <size>
+            <width>20</width>
+            <height>40</height>
+           </size>
+          </property>
+         </spacer>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="unlockButtonsLayout">
+          <item>
+           <widget class="QPushButton" name="unlockBackButton">
+            <property name="text">
+             <string>Retour</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="unlockButtonSpacer">
+            <property name="orientation">
+             <enum>Qt::Orientation::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>40</width>
+              <height>20</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="QPushButton" name="unlockVaultButton">
+            <property name="text">
+             <string>Déverrouiller</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="pageVault">
+       <layout class="QVBoxLayout" name="vaultLayout">
+        <item>
+         <layout class="QHBoxLayout" name="vaultHeaderLayout">
+          <item>
+           <widget class="QLabel" name="vaultTitle">
+            <property name="styleSheet">
+             <string>font-size: 22px; font-weight: bold;</string>
+            </property>
+            <property name="text">
+             <string>Mes identifiants</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="vaultHeaderSpacer">
+            <property name="orientation">
+             <enum>Qt::Orientation::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>40</width>
+              <height>20</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+          <item>
+           <widget class="QPushButton" name="lockVaultButton">
+            <property name="text">
+             <string>Verrouiller</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <widget class="QLineEdit" name="credentialSearchEdit">
+          <property name="placeholderText">
+           <string>Rechercher par titre, URL ou utilisateur...</string>
+          </property>
+          <property name="clearButtonEnabled">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QListWidget" name="credentialsList">
+          <property name="alternatingRowColors">
+           <bool>true</bool>
+          </property>
+          <property name="selectionMode">
+           <enum>QAbstractItemView::SelectionMode::SingleSelection</enum>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="credentialButtonsLayout">
+          <item>
+           <widget class="QPushButton" name="addCredentialButton">
+            <property name="text">
+             <string>Ajouter</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="editCredentialButton">
+            <property name="text">
+             <string>Modifier</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="deleteCredentialButton">
+            <property name="text">
+             <string>Supprimer</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+       </layout>
+      </widget>
+     </widget>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

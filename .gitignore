@@ -1,0 +1,63 @@
+# ==================================================
+# PassWall - Git ignore
+# ==================================================
+
+# Compilation CMake / Ninja / Qt
+/build/
+/cmake-build-*/
+/out/
+/CMakeFiles/
+/CMakeCache.txt
+/Testing/
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+*.autogen/
+*_autogen/
+
+# Fichiers generes et caches
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+.cache/
+__pycache__/
+.pytest_cache/
+.DS_Store
+
+# Configuration locale des editeurs
+.vscode/
+.idea/
+
+# Variables d'environnement et secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+
+# Coffres SQLite et fichiers auxiliaires
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db3
+*.db3-*
+
+# Coffres et sauvegardes PassWall
+*.vault
+*.vault-*
+*.passwall
+*.pwv
+*.vaultbackup

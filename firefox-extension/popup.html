@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PassWall</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      width: 300px;
+      padding: 12px;
+    }
+
+    #result {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      overflow-wrap: anywhere;
+    }
+
+    .credential {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+      width: 100%;
+      padding: 10px;
+      text-align: left;
+      cursor: pointer;
+      border: 1px solid #aaa;
+      border-radius: 6px;
+      background: transparent;
+      color: inherit;
+    }
+
+    .credential:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+  </style>
+</head>
+<body>
+  <h2>PassWall</h2>
+  <div id="result">Recherche en cours…</div>
+  <script src="fill_script.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

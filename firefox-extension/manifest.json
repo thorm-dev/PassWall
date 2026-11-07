@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "PassWall - Test natif",
+  "version": "0.1.0",
+  "description": "Test de communication locale avec PassWall.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "passwall-native-test@passwall.local"
+    }
+  },
+  "permissions": [
+    "nativeMessaging",
+    "activeTab",
+    "scripting"
+  ],
+  "action": {
+    "default_title": "Tester PassWall",
+    "default_popup": "popup.html"
+  }
+}
