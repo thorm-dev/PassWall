@@ -1,6 +1,7 @@
 #include "models/credential.hpp"
 #include "services/credential_service.hpp"
 #include "services/vault_lifecycle_service.hpp"
+#include "storage/sqlite_connection_config.hpp"
 
 #include <gtest/gtest.h>
 #include <sodium.h>
@@ -11,6 +12,8 @@
 
 #include <array>
 #include <chrono>
+#include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -18,6 +21,7 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <unistd.h>
 
 namespace {
 using passwall::core::SecureBuffer;
@@ -60,13 +64,13 @@ bool allZero(const void* memory, std::size_t size) noexcept
     return true;
 }
 
-enum class CommitBehavior { Normal, ReturnError, Throw };
+enum class CommitBehavior { Normal, ReturnError, Throw, InterruptBeforeCommit };
 struct CommitFailure {};
 
 enum class TransactionFault {
     None, BeginBusy, BeginUnconfirmed, CommitActive, CommitEnded,
     CommitPersistedButError, RollbackFailure, RollbackUnconfirmed,
-    UnknownState, CommitUnconfirmed, StatementError, StatementAutoRollback
+    UnknownState, CommitUnconfirmed, StatementError, StatementAutoRollback, StatementIoError
 };
 enum class TransactionPhase { None, Begin, Statement, Commit, Rollback };
 
@@ -115,6 +119,11 @@ struct MemoryProbe {
     bool closed = false;
     bool closeWithStatements = false;
     bool activeAtClose = false;
+    bool limitDatabasePages = false;
+    bool pageLimitApplied = false;
+    sqlite3_int64 pageLimit = 0;
+    int realWriteResult = -1;
+    int realWriteExtended = -1;
 
     bool allStringsZeroed() const noexcept
     {
@@ -154,6 +163,20 @@ bool withProbe(MemoryProbe& probe, Operation&& operation)
 {
     ProbeScope scope(probe);
     return operation();
+}
+
+bool integerPragma(sqlite3* database, const char* sql, sqlite3_int64& value)
+{
+    sqlite3_stmt* statement = nullptr;
+    bool success = sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) == SQLITE_OK;
+    success = success && sqlite3_step(statement) == SQLITE_ROW
+        && sqlite3_column_type(statement, 0) == SQLITE_INTEGER;
+    if (success) {
+        value = sqlite3_column_int64(statement, 0);
+        success = sqlite3_step(statement) == SQLITE_DONE;
+    }
+    const int finalized = sqlite3_finalize(statement);
+    return success && finalized == SQLITE_OK;
 }
 } // namespace
 
@@ -268,6 +291,22 @@ extern "C" int __wrap_sqlite3_exec(sqlite3* database, const char* sql,
         auto& probe = *activeProbe;
         probe.transactionDatabase = database;
         probe.phase = TransactionPhase::Begin;
+        if (probe.limitDatabasePages) {
+            // max_page_count is connection-local: cap the actual service
+            // connection, not an unrelated connection opened by the test.
+            sqlite3_int64 pages = 0;
+            sqlite3_int64 applied = 0;
+            char pragma[96];
+            if (!integerPragma(database, "PRAGMA main.page_count;", pages) || pages <= 0)
+                return SQLITE_ERROR;
+            const int length = std::snprintf(pragma, sizeof(pragma),
+                "PRAGMA main.max_page_count=%lld;", static_cast<long long>(pages));
+            if (length <= 0 || static_cast<std::size_t>(length) >= sizeof(pragma)
+                || !integerPragma(database, pragma, applied) || applied != pages)
+                return SQLITE_ERROR;
+            probe.pageLimit = pages;
+            probe.pageLimitApplied = true;
+        }
         if (probe.transactionFault == TransactionFault::BeginBusy) {
             probe.transactionFaultInjected = true;
             probe.injectedExtended = SQLITE_BUSY_TIMEOUT;
@@ -300,6 +339,17 @@ extern "C" int __wrap_sqlite3_exec(sqlite3* database, const char* sql,
             probe.commitFaultInjected = true;
             if (probe.commitBehavior == CommitBehavior::Throw)
                 throw CommitFailure{};
+            if (probe.commitBehavior == CommitBehavior::InterruptBeforeCommit) {
+                // Only enabled in a GoogleTest child process. Force genuine
+                // uncommitted database writes and a recoverable journal before
+                // killing this child, without running any SQLite/RAII cleanup.
+                if (!probe.writePendingAtCommit
+                    || sqlite3_txn_state(database, "main") != SQLITE_TXN_WRITE
+                    || sqlite3_db_cacheflush(database) != SQLITE_OK)
+                    ::_exit(80);
+                std::raise(SIGKILL);
+                ::_exit(81);
+            }
             return SQLITE_IOERR;
         }
         const auto fault = probe.transactionFault;
@@ -346,16 +396,30 @@ extern "C" int __wrap_sqlite3_txn_state(sqlite3* database, const char* schema)
 extern "C" int __real_sqlite3_step(sqlite3_stmt*);
 extern "C" int __wrap_sqlite3_step(sqlite3_stmt* statement)
 {
-    const int result = __real_sqlite3_step(statement);
     const char* sql = sqlite3_sql(statement);
-    if (activeProbe == nullptr || sql == nullptr || result != SQLITE_DONE
-        || (std::strncmp(sql, "INSERT INTO entries", 19) != 0
-            && std::strncmp(sql, "UPDATE entries", 14) != 0
-            && std::strncmp(sql, "DELETE FROM entries", 19) != 0))
+    const bool businessWrite = sql != nullptr
+        && (std::strncmp(sql, "INSERT INTO entries", 19) == 0
+            || std::strncmp(sql, "UPDATE entries", 14) == 0
+            || std::strncmp(sql, "DELETE FROM entries", 19) == 0);
+    const int result = __real_sqlite3_step(statement);
+    if (activeProbe == nullptr || !businessWrite
+        || activeProbe->transactionDatabase != sqlite3_db_handle(statement))
         return result;
     auto& probe = *activeProbe;
     ++probe.writeSteps;
+    probe.realWriteResult = result;
+    probe.realWriteExtended = __real_sqlite3_extended_errcode(sqlite3_db_handle(statement));
+    if (result != SQLITE_DONE)
+        return result;
     const auto fault = probe.transactionFault;
+    if (fault == TransactionFault::StatementIoError) {
+        // Artificial API failure after a real, uncommitted business write.
+        // This is not a VFS fault and does not simulate a failing disk.
+        probe.phase = TransactionPhase::Statement;
+        probe.transactionFaultInjected = true;
+        probe.injectedExtended = SQLITE_IOERR_WRITE;
+        return SQLITE_IOERR;
+    }
     if (fault == TransactionFault::StatementError || fault == TransactionFault::StatementAutoRollback) {
         probe.phase = TransactionPhase::Statement;
         probe.transactionFaultInjected = true;
@@ -662,6 +726,35 @@ protected:
         ASSERT_TRUE(CredentialService::add(path, dataKey, survivor, error));
         wipeTestCredential(survivor);
     }
+
+    void expectIntegrity()
+    {
+        ASSERT_TRUE(path.starts_with("/tmp/passwall-credential-memory-case-"));
+        sqlite3* database = nullptr;
+        const int opened = sqlite3_open_v2(path.c_str(), &database,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr);
+        std::unique_ptr<sqlite3, decltype(&sqlite3_close_v2)> owner(database, sqlite3_close_v2);
+        ASSERT_EQ(opened, SQLITE_OK);
+        ASSERT_TRUE(passwall::storage::configureSqliteConnection(database, error));
+        sqlite3_stmt* statement = nullptr;
+        const int prepared = sqlite3_prepare_v2(database, "PRAGMA main.integrity_check;",
+            -1, &statement, nullptr);
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> query(statement, sqlite3_finalize);
+        ASSERT_EQ(prepared, SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(statement), SQLITE_ROW);
+        ASSERT_EQ(sqlite3_column_type(statement, 0), SQLITE_TEXT);
+        const auto* result = sqlite3_column_text(statement, 0);
+        EXPECT_TRUE(result != nullptr && sqlite3_column_bytes(statement, 0) == 2
+            && std::memcmp(result, "ok", 2) == 0);
+        EXPECT_EQ(sqlite3_step(statement), SQLITE_DONE);
+    }
+
+    void expectEntryCount(std::size_t count)
+    {
+        std::vector<passwall::models::CredentialSummary> summaries;
+        ASSERT_TRUE(CredentialService::listSummaries(path, dataKey, summaries, error));
+        EXPECT_EQ(summaries.size(), count);
+    }
 };
 
 TEST_F(CredentialTransactionTest, BeginErrorPreservesExtendedCodeAndPublishesNothing)
@@ -822,6 +915,14 @@ TEST_F(CredentialTransactionTest, AutocommitAfterCommitErrorIsNotProofOfRollback
     std::vector<passwall::models::CredentialSummary> summaries;
     ASSERT_TRUE(CredentialService::listSummaries(path, dataKey, summaries, error));
     EXPECT_EQ(summaries.size(), 2u); // deliberately committed before injecting the returned error
+    expectIntegrity();
+    expectStored(original);
+    for (const auto& summary : summaries) {
+        if (summary.id != original.id) {
+            incoming.id = summary.id;
+            expectStored(incoming); // Authenticate the actually persisted entry too.
+        }
+    }
 }
 
 TEST_F(CredentialTransactionTest, CommitOkWithUnknownStateDoesNotPublishIdOrRetry)
@@ -834,6 +935,9 @@ TEST_F(CredentialTransactionTest, CommitOkWithUnknownStateDoesNotPublishIdOrRetr
     EXPECT_EQ(probe.commitCalls, 1);
     EXPECT_TRUE(probe.closed);
     EXPECT_TRUE(sameCredential(incoming, sourceBefore));
+    expectIntegrity();
+    expectStored(original);
+    expectEntryCount(2);
 }
 
 TEST_F(CredentialTransactionTest, RealWriterContentionFailsBeginWithinConfiguredTimeoutThenRecovers)
@@ -879,5 +983,176 @@ TEST_F(CredentialTransactionTest, RealReaderContentionFailsCommitAndConfirmsRoll
     ASSERT_EQ(sqlite3_exec(reader, "ROLLBACK;", nullptr, nullptr, nullptr), SQLITE_OK);
     expectClosedAndUnchanged(before);
     expectRetry(false);
+}
+
+class CredentialStorageFailureTest : public CredentialTransactionTest {
+protected:
+    void makeWriteLargerThanExistingDatabase()
+    {
+        // Bounded, fictitious data: force allocation of new SQLite pages, not
+        // exhaustion of /tmp, the SD card or any real filesystem capacity.
+        incoming.password.assign(64 * 1024, 'p');
+        incoming.notes.assign(64 * 1024, 'n');
+        sourceBefore = incoming;
+    }
+
+    void expectRealFull(bool adding)
+    {
+        makeWriteLargerThanExistingDatabase();
+        probe.limitDatabasePages = true;
+        const auto before = persistentBytes();
+        EXPECT_FALSE(run(adding ? 0 : 1));
+        ASSERT_TRUE(probe.pageLimitApplied);
+        EXPECT_GT(probe.pageLimit, 0);
+        EXPECT_EQ(probe.realWriteResult, SQLITE_FULL);
+        EXPECT_EQ(probe.realWriteExtended, SQLITE_FULL);
+        expectCode(SQLITE_FULL, SQLITE_FULL);
+        EXPECT_NE(error.find("Annulation automatique observée avant COMMIT"), std::string::npos);
+        EXPECT_EQ(probe.commitCalls, 0);
+        EXPECT_EQ(probe.rollbackCalls, 0);
+        EXPECT_FALSE(probe.activeAtClose);
+        expectClosedAndUnchanged(before);
+        expectIntegrity();
+        expectEntryCount(1);
+        // A fresh service connection has no test-only page cap. The same
+        // larger write succeeds, demonstrating a recoverable incident.
+        expectRetry(adding);
+        expectIntegrity();
+        expectStored(original.id == incoming.id ? incoming : original);
+        expectEntryCount(adding ? 2 : 1);
+    }
+
+    void expectInterruptedBeforeCommit(bool adding)
+    {
+        makeWriteLargerThanExistingDatabase();
+        const auto before = persistentBytes();
+        // GoogleTest creates and waits for ONLY its own forked test child.
+        // No running PassWall or other user process is targeted. Fast mode
+        // preserves this isolated fixture's path and key in the child.
+        GTEST_FLAG_SET(death_test_style, "fast");
+        ASSERT_EXIT({
+            ::alarm(10); // Bound a stuck child; SIGALRM would fail the test.
+            probe.commitBehavior = CommitBehavior::InterruptBeforeCommit;
+            const bool success = run(adding ? 0 : 1);
+            (void)success;
+            ::_exit(82); // Reaching here must fail, never masquerade as SIGKILL.
+        }, ::testing::KilledBySignal(SIGKILL), "");
+
+        // Inspect before SQLite can recover: prove that this was more than
+        // losing a private in-memory cache. Dirty pages reached the DB file
+        // and a nonempty, initialized rollback journal was left behind.
+        QFile journal(QString::fromStdString(path + "-journal"));
+        ASSERT_TRUE(journal.open(QIODevice::ReadOnly));
+        EXPECT_GT(journal.size(), 512);
+        const QByteArray header = journal.read(8);
+        constexpr unsigned char journalMagic[] = {0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7};
+        EXPECT_TRUE(header.size() == 8 && std::memcmp(header.constData(), journalMagic, 8) == 0);
+        journal.close();
+        EXPECT_TRUE(persistentBytes() != before);
+
+        // New connection, real SQLite recovery, then separate structural and
+        // cryptographic checks. integrity_check alone cannot authenticate data.
+        expectIntegrity();
+        expectStored(original);
+        expectEntryCount(1);
+        EXPECT_TRUE(persistentBytes() == before);
+        EXPECT_FALSE(QFile::exists(QString::fromStdString(path + "-journal")));
+        EXPECT_TRUE(sameCredential(incoming, sourceBefore));
+        expectRetry(adding);
+        expectIntegrity();
+        expectEntryCount(adding ? 2 : 1);
+    }
+
+    void expectInterruptedAfterCommit(bool adding)
+    {
+        makeWriteLargerThanExistingDatabase();
+        GTEST_FLAG_SET(death_test_style, "fast");
+        ASSERT_EXIT({
+            ::alarm(10);
+            // No injected commit error: the real service must report success
+            // after COMMIT confirmation (and publish add's id/version).
+            if (!run(adding ? 0 : 1)
+                || (adding && (incoming.id == sourceBefore.id || incoming.version != 1)))
+                ::_exit(83);
+            std::raise(SIGKILL);
+            ::_exit(84);
+        }, ::testing::KilledBySignal(SIGKILL), "");
+        expectIntegrity();
+        expectEntryCount(adding ? 2 : 1);
+        if (adding) {
+            expectStored(original);
+            std::vector<passwall::models::CredentialSummary> summaries;
+            ASSERT_TRUE(CredentialService::listSummaries(path, dataKey, summaries, error));
+            bool found = false;
+            for (const auto& summary : summaries) {
+                if (summary.id != original.id) {
+                    found = true;
+                    incoming.id = summary.id;
+                    expectStored(incoming);
+                }
+            }
+            EXPECT_TRUE(found);
+        } else {
+            expectStored(incoming);
+        }
+        EXPECT_FALSE(QFile::exists(QString::fromStdString(path + "-journal")));
+        // No residual writer lock after child termination and fresh recovery.
+        expectRetry(false);
+        expectIntegrity();
+    }
+};
+
+TEST_F(CredentialStorageFailureTest, RealFullDuringAddPreservesCommittedEntriesAndAllowsRetry)
+{
+    expectRealFull(true);
+}
+
+TEST_F(CredentialStorageFailureTest, RealFullDuringUpdatePreservesCommittedEntriesAndAllowsRetry)
+{
+    expectRealFull(false);
+}
+
+TEST_F(CredentialStorageFailureTest, InjectedWriteIoErrorRejectsCrudAndPreservesIntegrity)
+{
+    const auto before = persistentBytes();
+    for (int operation = 0; operation < 3; ++operation) {
+        probe = MemoryProbe{};
+        probe.transactionFault = TransactionFault::StatementIoError;
+        EXPECT_FALSE(run(operation));
+        ASSERT_TRUE(probe.transactionFaultInjected);
+        EXPECT_EQ(probe.realWriteResult, SQLITE_DONE); // Real write preceded the fake error.
+        expectCode(SQLITE_IOERR, SQLITE_IOERR_WRITE);
+        EXPECT_NE(error.find(operation == 0 ? "INSERT" : operation == 1 ? "UPDATE" : "DELETE"),
+            std::string::npos);
+        EXPECT_NE(error.find("ROLLBACK explicite confirmé"), std::string::npos);
+        EXPECT_EQ(probe.rollbackCalls, 1);
+        EXPECT_EQ(probe.commitCalls, 0);
+        EXPECT_FALSE(probe.activeAtClose);
+        expectClosedAndUnchanged(before);
+        expectIntegrity();
+        expectEntryCount(1);
+    }
+    expectRetry(false);
+    expectIntegrity();
+}
+
+TEST_F(CredentialStorageFailureTest, KilledAddBeforeCommitRecoversHotJournalAndDiscardsWrite)
+{
+    expectInterruptedBeforeCommit(true);
+}
+
+TEST_F(CredentialStorageFailureTest, KilledUpdateBeforeCommitRecoversHotJournalAndDiscardsWrite)
+{
+    expectInterruptedBeforeCommit(false);
+}
+
+TEST_F(CredentialStorageFailureTest, KilledChildAfterConfirmedAddRetainsAuthenticatedWrite)
+{
+    expectInterruptedAfterCommit(true);
+}
+
+TEST_F(CredentialStorageFailureTest, KilledChildAfterConfirmedUpdateRetainsAuthenticatedWrite)
+{
+    expectInterruptedAfterCommit(false);
 }
 } // namespace
