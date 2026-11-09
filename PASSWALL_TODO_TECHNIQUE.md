@@ -1,8 +1,8 @@
 # PassWall — Plan technique des travaux restants
 
-**Version :** 1.4
-**Date :** 7 novembre 2026
-**Statut :** feuille de route actualisée avec la clôture fonctionnelle locale du verrouillage Linux rapportée par l'utilisateur. Les essais manuels sont distingués des validations automatisées ; les limites de sécurité et les travaux non réalisés restent explicites.
+**Version :** 1.9
+**Date :** 9 novembre 2026
+**Statut :** moteur synchrone 6B de remplacement développé sur 6A/6A-bis, avec inspection/reprise contrôlée et conservation de l'ancien principal. Les campagnes ciblées sont distinguées en section 6 ; aucune campagne complète n'est revendiquée. Prochain chantier : étape 7, délégation limitée et auxiliaire de restauration, sans GUI.
 
 ## 1. Objet et méthode
 
@@ -12,71 +12,57 @@ Cette feuille de route synthétise les travaux restant à réaliser ou à vérif
 - **À vérifier** : une implémentation existe ou a été évoquée, mais doit être contrôlée.
 - **Conditionnel** : dépend d'une décision préalable.
 - **Réalisé** : étape implémentée ou observation rapportée, dans le seul périmètre explicitement indiqué ; cela ne vaut pas certification de sécurité.
+- **Fondation** : contrat ou mécanisme préparatoire implémenté/testé, sans parcours fonctionnel complet.
+- **Partiel** : certains composants sont opérationnels, mais l'ensemble du besoin n'est pas livré.
+- **Anomalie ouverte** : incident constaté ou rapporté qui n'est pas résolu par la seule réussite d'un passage ultérieur.
+
+La documentation technique décrit les contrats et limites des composants ; ce TODO privilégie les actions restantes et leurs critères d'acceptation. Les résultats historiques de tests ne sont ni additionnables comme une campagne unique, ni une preuve d'exécution de l'état actuel complet.
 
 ### Faits vérifiés dans l'implémentation
 
-- Le coffre local, le chiffrement des entrées, l'interface Qt, le pont Firefox, `SiteMatcher` et le générateur de mots de passe sont implémentés.
-- Le générateur est intégré à la boîte d'édition et couvert par des tests C++.
-- Le chemin de production Firefox est Firefox → Extension PassWall → `passwall_native_host` → `NativeBridgeServer` → `MainWindow::handleNativeRequest()` → `NativeRequestProcessor` → `NativeVaultAccess` → Coffre PassWall. `MainWindow` implémente `NativeVaultAccess` ; `NativeRequestProcessor` est l'unique implémentation métier Native Messaging, compilée à la fois par l'application et les tests.
-- La migration de `MainWindow` vers `CredentialSummary` et `CredentialService::listSummaries()` est réalisée ; l'interface ne conserve plus une collection durable de credentials complets.
-- TOTP, passkeys, audit de mots de passe, synchronisation, sauvegarde, restauration et migration ne sont pas implémentés.
-- Le verrouillage manuel et par inactivité, le nettoyage immédiat des éditeurs et l'armement précoce du timer sont implémentés. `LinuxSessionMonitor` traite les préparations de suspension/hibernation et d'arrêt/redémarrage de logind, avec inhibiteur `delay`, vérification effective du descripteur et politique fail-closed.
-- L'instance unique, `Control1.Lock()` acquitté après nettoyage et `passwall-session-lock` sont implémentés. Le coordinateur est installé et raccordé à `Ctrl+Alt+L` et au pilote conservé `Ctrl+Super+L`. Le parcours labwc/PassWall/Firefox est fonctionnellement validé manuellement sur Raspberry Pi 5 / Debian 13, dans le périmètre de la section 3.4.
-- `SessionGuard1` est définitivement supprimé. Il n'existe ni garde persistante globale ni authentification globale supplémentaire : chaque coffre reste indépendant, avec son propre mot de passe maître et sans restauration automatique d'une ancienne session.
+- Coffre local, GUI, Firefox à traitement unique `NativeRequestProcessor`, générateur, validation des champs, durcissement mémoire et SQLite V1 sont développés. Leur architecture et leurs validations figurent dans la documentation technique, sections 5 et 6.
+- Les étapes de sauvegarde 1 à 5 et l'export manuel existent ; préférences/reprise GUI restent absentes. L'intermittence du test de rotation est résolue par synchronisation déterministe, sans changement de production (section 4.4). L'ancien moteur restaure vers un nouveau fichier ; le moteur 6B remplace réellement le principal sous autorisation 6A/6A-bis, sans auxiliaire ni GUI.
+- Les protections Linux, des éditeurs et des générations natives sont présentes. `SessionGuard1` est supprimé, sans garde globale ni authentification globale supplémentaire ; l'intention de récupération 6A reste propre à une opération sur un coffre.
+- Le coffre est cryptographiquement autonome ; ses copies sont indépendantes et l'utilisateur assure leurs transferts/cohérence. Aucun modèle d'autorisation d'appareil ni développement de synchronisation automatique ou de serveur de référence n'est retenu dans le périmètre actuel. Les contrôles locaux de récupération restent applicables (section 5).
+- TOTP, passkeys, audit de mots de passe, migrations et export de configuration restent absents ; l'import de configuration n'est pas défini.
 
 ## 2. Ordre des priorités
 
 | Priorité | Domaine | Objectif |
 |---|---|---|
-| P0 | Mémoire sensible | Réduire la présence des secrets et les copies |
-| P0 | Flux Firefox/natif | Contrôler le parcours complet du mot de passe |
-| P0 | Verrouillage | Préserver le nettoyage acquis et compléter la couverture des défaillances et événements Linux |
-| P1 | Stockage | Fiabiliser erreurs, migrations et sauvegardes |
-| P1 | Tests | Ajouter des scénarios de sécurité et d'échec |
-| P1 | Spécification des entrées | Imposer les champs obligatoires prévus |
-| P1 | Installation Firefox | Rendre reproductible l'installation du Native Host et de l'extension |
-| P1 | Synchronisation | Finaliser conflits, appareils et révocation |
+| P0 | Mémoire sensible | Préserver le durcissement réalisé ; contrôler les nouveaux chemins sensibles, surtout la restauration asynchrone |
+| P0 | Flux Firefox/natif | Préserver le traitement unique, les origines et l'invalidation ; étendre la validation de l'intégration réelle |
+| P0 | Verrouillage | Préserver le nettoyage acquis et vérifier son articulation avec les opérations longues et les défaillances Linux |
+| P1 | Restauration — 7 | Déléguer étroitement l'autorisation 6A au futur auxiliaire, superviser les secrets et l'annulation ; préserver le moteur 6B sans GUI à l'étape 7 |
+| P1 | Interfaces et finalisation — 8 | Préférences/reprise, GUI de restauration/récupération, export de configuration et politique de verrouillage automatique obligatoire |
+| P1 | Tests et distribution | Compléter les scénarios manquants, établir une campagne actuelle et rendre l'installation Linux/Firefox reproductible |
+| P1 | Migrations | Préparer lorsqu'une évolution de format le nécessitera, après stabilisation locale |
 | P2 | Produit | Finaliser TOTP, passkeys, audit et ergonomie |
 | P3 | Plateformes | Linux, puis Windows ; iOS différé |
+
+Les P0 restent des invariants de maintenance, non une demande de recommencer les chantiers clos. Après validation du moteur 6B, **7 est le prochain chantier**, sous réserve d'une nouvelle vulnérabilité prioritaire. L'ordre détaillé de la section 8 suit ce tableau.
 
 ## 3. P0 — Réduction de l'exposition mémoire
 
 ### 3.1 Ne plus conserver tous les credentials complets dans MainWindow
 
-**Réalisé :** l'ancienne collection `MainWindow::credentials_` de credentials complets a été remplacée par des `CredentialSummary` contenant l'identifiant, la version, le titre, l'URL et le nom d'utilisateur, sans mot de passe ni notes. L'interface utilise ces résumés ; l'édition et une demande Firefox ciblée chargent temporairement l'entrée nécessaire, avec nettoyage RAII.
+**Réalisé :** `CredentialSummary` / `listSummaries()` remplacent la collection durable de credentials complets dans `MainWindow` ; voir documentation technique, sections 5.3 à 5.5.
 
-`CredentialService::listSummaries()` déchiffre les entrées une par une, extrait les métadonnées puis nettoie chaque credential temporaire, sans vecteur intermédiaire de credentials complets.
-
-**Travaux restants :** vérifier qu'aucun autre composant GUI ne conserve de copie complète, auditer la durée de vie des objets temporaires sur les chemins d'erreur et réduire les copies encore évitables. La migration ne garantit pas l'effacement de toutes les anciennes allocations des chaînes et des types Qt.
+**Travaux restants :** préserver cette propriété dans les nouvelles fonctions, notamment restauration et annulation ; compléter l'audit global V1 des copies résiduelles. La migration et le durcissement ciblé ne garantissent pas l'effacement de toutes les anciennes allocations des chaînes et des types Qt.
 
 **Acceptation :** aucun conteneur durable de l'interface ne conserve les mots de passe ou notes de toutes les entrées.
 
-### 3.2 Nettoyage RAII des objets temporaires dans CredentialService
+### 3.2 Nettoyage RAII des objets temporaires
 
-**État vérifié :** `CredentialService` utilise déjà des nettoyeurs RAII pour des credentials temporaires et des vecteurs de credentials, et nettoie la sortie de `get()` et `list()` avant remplacement. Cela réduit certains chemins d'erreur, sans éliminer les copies internes de `std::string`, SQLite ou Qt.
+**Réalisé :** nettoyage des mots de passe maîtres, temporaires CRUD et authentification entrée par entrée, avec tests d'erreur/exception (documentation technique, sections 5.4 et 5.5). Le chantier ciblé est clos ; ne pas le rouvrir sans défaut démontré.
 
-Les chemins à examiner dans `credential_service.cpp` :
-- copies locales dans `add()` ;
-- credential existant et candidat dans `update()` ;
-- credential chargé dans `remove()` ;
-- candidat de désérialisation ;
-- vecteurs temporaires dans `list()` ;
-- sortie de `get()` avant remplacement.
-
-**Travaux :**
-1. Auditer les nettoyeurs existants sur chaque retour anticipé et chaque exception.
-2. Réduire les copies complètes encore évitables.
-3. Ajouter des tests ciblant succès, erreur et exception.
+**Travaux restants :** conserver ces régressions et appliquer les mêmes règles aux futurs buffers de restauration asynchrone. Documenter dans l'audit global V1 les limites des historiques d'allocations, des copies Qt, SQLite et du système, sans créer un nouveau framework mémoire par principe.
 
 **Limite importante :** nettoyer la zone actuellement utilisée par un `std::string` ne garantit pas l'effacement de toutes ses anciennes allocations, copies ou données SSO. Il ne faut pas présenter `sodium_memzero()` sur `string.data()` comme une garantie absolue.
 
 ### 3.3 Consolider le flux natif Firefox de bout en bout
 
-**Architecture effective :** le chemin complet figure en section 1. `popup.js` contacte `org.passwall.native` ; `passwall_native_host` (`native_host.cpp`) rejoint `NativeBridgeServer` par socket Unix. `MainWindow` implémente `NativeVaultAccess`, qui fournit au processeur l'état du coffre, les résumés et le chargement ciblé. La consolidation autour de l'unique implémentation métier `NativeRequestProcessor` est réalisée ; il ne reste pas de second handler métier à maintenir.
-
-**Installation locale réalisée :** application `/home/thormster/.local/bin/passwall_app`, Host `/home/thormster/.local/bin/passwall_native_host`, manifeste `/home/thormster/.mozilla/native-messaging-hosts/org.passwall.native.json`. Le manifeste pointe vers ce Host ; les deux exécutables ont les permissions `0755` et leurs SHA-256 correspondent aux versions compilées et testées selon les vérifications rapportées. Cette installation est manuelle, pas une procédure reproductible intégrée au projet.
-
-**Première campagne Firefox réelle, le 6 novembre 2026 :** l'utilisateur rapporte le chargement de l'extension temporaire, l'ouverture du popup, le démarrage automatique, la communication, la détection du coffre verrouillé, la recherche, le remplissage, le blocage après verrouillage et l'isolation entre domaines réussis. La fermeture puis le redémarrage automatique réussissent et le coffre reste verrouillé. Tous les essais utilisent uniquement des données fictives. Le changement de session pendant une requête a été déclaré fonctionnel lors d'un essai manuel, sans reproduction déterministe de l'instant d'invalidation. Le détail figure en section 6.5 de la documentation technique ; il ne s'agit pas de tests automatisés de bout en bout.
+**Réalisé :** traitement métier unique `NativeRequestProcessor`, adaptateur `MainWindow` / `NativeVaultAccess` et pont Host/socket. Installation manuelle et essais réels du 6 novembre rapportés : documentation technique, sections 5.6 et 6.5. Cela ne prouve ni la présence de toutes les sources récentes dans les exécutables installés, ni une automatisation Firefox de bout en bout.
 
 Composants à consolider :
 - `native_host.cpp` ;
@@ -96,21 +82,28 @@ Composants à consolider :
 8. Vérifier que l'extension ne conserve le secret que le temps nécessaire au remplissage.
 9. Versionner un modèle de manifeste Native Messaging `org.passwall.native` et fournir une installation reproductible du Native Host et de l'extension, au-delà de l'installation manuelle locale déjà réalisée. `passwall-native-test@passwall.local` provient de `browser_specific_settings.gecko.id` dans `firefox-extension/manifest.json`, pour l'extension temporaire « PassWall - Test natif » ; le packaging et l'identifiant d'une future diffusion restent à définir.
 
-**À faire :** automatiser les tests de bout en bout avec Firefox, ajouter des scénarios déterministes d'invalidation de session pendant une réponse en cours, et poursuivre les vérifications de sécurité et de robustesse. Les succès manuels ne clôturent pas ces travaux.
+**Réalisé aussi :** validation canonique partagée des `EntryId` (32 caractères hexadécimaux minuscules et type JSON chaîne), `NativeRequestResponse` non copiable à buffer propriétaire, limite commune de 1 Mio hors préfixe, transmission segmentée et invalidation des réponses en attente. Des tests déterministes de composant couvrent l'invalidation entre segments ; les erreurs de redirection du Host sont également testées.
+
+**À faire :** automatiser les tests de bout en bout avec Firefox, étendre les scénarios d'invalidation déterministe à cette intégration réelle et poursuivre les vérifications de robustesse. Les succès manuels et les tests du bridge ne clôturent pas ces travaux. Aucun second handler métier n'est à recréer.
 
 **Acceptation :** une demande ne charge qu'une entrée ciblée après validation ; pas de secret dans les logs ; buffers temporaires nettoyés au mieux.
 
 ### 3.4 Verrouillage
 
-**Réalisé :** nettoyage immédiat des éditeurs sans attente d'une notification modale, protection contre les anciens éditeurs et réentrances, minuterie active avant le rafraîchissement d'une session utilisable et respect de « Désactivé ». `lockVault()` invalide la session Native Messaging et les transmissions encore détenues par l'application avant de détruire la clé. `LinuxSessionMonitor` surveille les préparations logind de suspension/hibernation et d'arrêt/redémarrage, avec nettoyage sur le thread Qt propriétaire avant libération de l'inhibiteur ; une protection indisponible interdit l'accès aux secrets.
+**État actuel :** nettoyage immédiat/réentrant des éditeurs et des réponses natives, minuterie armée avant rafraîchissement, protections logind et coordinateur `Control1.Lock()` sont implémentés. Installation, budget D-Bus de 1 500 ms, limites et retour arrière : documentation technique, sections 4.5, 5.5 et 5.9.
 
-**Coordination de session réalisée :** `passwall-session-lock` appelle `org.passwall.PassWall.Control1.Lock()` sans activer PassWall, consacre un budget de 1 500 ms à l'attente D-Bus, puis tente `/usr/bin/swaylock -p`. Ce budget inclut le démarrage de l'auxiliaire mais ne constitue pas une garantie temps réel globale. Absence, refus ou non-réponse de PassWall n'empêchent pas la tentative de verrouillage de l'écran et ne valent pas acquittement de nettoyage.
+**À faire — politique obligatoire validée, étape 8 :** remplacer les choix actuels (désactivation possible, défaut cinq minutes, 10 minutes présent et 60 absent) par **1 minute par défaut, 5, 15, 30 et 60 minutes maximum**. Supprimer « Désactivé » ; convertir les anciennes configurations `security/autoLockMinutes=0` vers 1 minute. Retirer aussi le choix 10 minutes, hors de la nouvelle liste. La règle de conversion des anciennes valeurs 10 ou invalides devra être explicitée avant sa mise en œuvre ; ne pas conserver de valeur non autorisée ni inventer une nouvelle option. Aucun changement du code du minuteur n'est réalisé ici.
 
-**Installation et utilisation locales réalisées :** application `/home/thormster/.local/bin/passwall_app`, coordinateur `/home/thormster/.local/bin/passwall-session-lock`, Native Host inchangé `/home/thormster/.local/bin/passwall_native_host`. Le fichier utilisateur labwc définit `C-A-l` et conserve `C-W-l` ; le mode `--merge-config` remplace l'action système de `C-A-l`, sans cumul des deux verrouilleurs. Le thème, la souris, le fichier système et Firefox sont préservés. Les sauvegardes datées vérifiées et les commandes de retour arrière figurent dans [le guide du coordinateur](docs/linux-session-lock.md).
+**Acceptation et tests nécessaires :**
 
-**Décisions closes :** `SessionGuard1` est supprimé, sans remplacement par une garde persistante globale. Aucun mot de passe maître global ni obligation de rouvrir le dernier coffre. Après le verrouillage, chaque coffre peut être ouvert par une nouvelle authentification avec son propre mot de passe maître, si les protections système sont disponibles. Le déverrouillage de Linux ne restaure jamais de session. Aucune modification du code de swaylock/labwc ni preuve de déverrouillage Wayland n'est requise pour cette nouvelle authentification.
+- Installation sans préférence : 1 minute ; liste GUI et validation de configuration limitées exactement à 1/5/15/30/60, sans désactivation.
+- Ancienne valeur 0 : conversion vers 1, armement effectif et persistance contrôlée ; vérifier le rechargement. Définir/tester le traitement des anciennes valeurs 10 et des configurations invalides, sans laisser le coffre sans protection si la sauvegarde de préférence échoue.
+- Vérifier chaque durée, le plafond 60, l'expiration en boucle Qt imbriquée et l'armement avant tout rafraîchissement/notification ; aucune réactivation après verrouillage et aucune ancienne session restaurée.
+- Adapter les tests qui valident aujourd'hui la désactivation, tout en préservant les régressions des éditeurs, générations Native Messaging, logind et `Control1.Lock()`. Ne pas supprimer ces protections pour modifier la politique du timer.
 
-**Validation manuelle rapportée, bilan du 7 novembre 2026 :** `Ctrl+Alt+L` déclenche le coordinateur ; PassWall se verrouille avant le verrouillage Linux visible ; la session Linux se verrouille et se déverrouille normalement ; le coffre reste verrouillé ; Firefox refuse le remplissage jusqu'à une nouvelle authentification ; le remplissage reprend ensuite ; `Ctrl+Super+L` reste disponible. Le verrouillage avec PassWall absent avait également été essayé avec succès. Ces observations clôturent la validation fonctionnelle de cette intégration locale, pas un audit exhaustif de la mémoire ou de tous les scénarios d'échec.
+**Décisions closes :** `SessionGuard1` est supprimé, sans remplacement par une garde persistante globale. Aucun mot de passe maître global ni obligation de rouvrir le dernier coffre. Après le verrouillage, chaque coffre peut être ouvert par une nouvelle authentification avec son propre mot de passe maître, si les protections système et la porte de récupération de ce coffre l'autorisent. Le déverrouillage de Linux ne restaure jamais de session. Aucune modification du code de swaylock/labwc ni preuve de déverrouillage Wayland n'est requise pour cette nouvelle authentification.
+
+**Jalon acquis :** le parcours local des raccourcis et du remplissage après nouvelle authentification a été validé manuellement le 7 novembre ; voir documentation technique, section 6.6. Il ne démontre pas tous les scénarios d'échec ni un effacement mémoire exhaustif.
 
 **Propriétés à préserver et à vérifier au-delà du changement d'écran :**
 
@@ -123,7 +116,7 @@ Composants à consolider :
 - traitement des requêtes natives en cours ;
 - maintien des protections logind déjà implémentées, sans les assimiler à une interception garantie des fermetures de session, crashs ou arrêts forcés.
 
-**Travaux restant ouverts :** compléter les scénarios pendant une opération SQLite et une requête Firefox, maintenir les régressions GUI déjà présentes et poursuivre les tests déterministes de transmission. Valider séparément les transitions réelles de suspension/hibernation/arrêt : les tests simulés et les essais du raccourci ne les démontrent pas. Recenser les déclencheurs directs de swaylock et autres mécanismes de fermeture de session, qui peuvent contourner le coordinateur. Documenter le cas de PassWall bloqué, sans nettoyage confirmé, et les limites d'un thread principal ou de logind indisponible.
+**Travaux restant ouverts :** maintenir les régressions GUI, logind et de transmission ; compléter les entrelacements avec les nouvelles opérations longues. La préparation 6A distingue déjà son verrouillage volontaire du verrouillage de sécurité, qui révoque l'autorisation ; l'annulation et le nettoyage d'un futur worker de restauration restent à réaliser. Valider séparément les transitions réelles de suspension/hibernation/arrêt : les tests simulés et les essais du raccourci ne les démontrent pas. Recenser les déclencheurs directs de swaylock et autres mécanismes de fermeture de session, qui peuvent contourner le coordinateur. Documenter le cas de PassWall bloqué, sans nettoyage confirmé, et les limites d'un thread principal ou de logind indisponible.
 
 L'état réel de déverrouillage Wayland n'est pas surveillé ; le code de sortie de swaylock ne constitue pas une preuve de déverrouillage. La disparition éventuelle de l'indication du raccourci dans `pishutdown` reste un point ergonomique à vérifier, sans modifier le programme système. Le pilote `Ctrl+Super+L` peut être conservé ou retiré ultérieurement sur décision explicite. L'installation reproductible du coordinateur reste à formaliser au-delà de cette installation locale.
 
@@ -133,20 +126,17 @@ Le verrouillage visible ne prouve pas l'effacement de toutes les allocations his
 
 Vérifier les conversions `std::string`/`QByteArray`/`QString`, les propriétés Qt, `UserRole`, messages d'erreur et logs. Qt peut conserver des copies internes ; leur effacement physique ne peut pas être garanti simplement par l'application. Vérifier aussi le délai d'effacement du presse-papiers et le cas où l'utilisateur copie autre chose entre-temps.
 
-### 3.6 Imposer les champs obligatoires de PassWall V1
+### 3.6 Champs obligatoires de PassWall V1 — réalisé
 
-**Décision fonctionnelle V1 :** titre, nom d'utilisateur et mot de passe sont obligatoires. **État vérifié :** l'interface ne refuse actuellement que le titre vide et `CredentialService` accepte des chaînes vides pour les trois champs.
+Titre, nom d'utilisateur et mot de passe sont imposés à l'ajout et à la modification par `CredentialService::validate()`, réutilisé dans les dialogues Qt. Titre et nom d'utilisateur vides ou uniquement composés d'espaces Unicode sont refusés. Un mot de passe vide est refusé, mais ses espaces sont conservés exactement, y compris s'il ne contient que des espaces. Aucune normalisation silencieuse n'est appliquée ; les limites de taille restent en vigueur.
 
-**Travaux :**
-1. Imposer les trois champs dans l'interface graphique, à l'ajout comme à la modification.
-2. Imposer les trois champs dans `CredentialService`, afin que les appels non-GUI ne contournent pas l'invariant.
-3. Ajouter les tests d'ajout et de mise à jour vérifiant qu'aucun de ces champs ne peut être vide.
+Les tests couvrent champs manquants, valeurs Unicode/blanches, cohérence GUI/service, préservation de l'entrée source, absence d'écriture après refus et nouvelle opération valide. **Reste à faire :** maintenir ces tests dans les évolutions des formulaires et futurs chemins d'écriture, pas redécider les obligations ni ajouter une migration des anciens coffres de test.
 
 ## 4. P0/P1 — Cryptographie et stockage
 
 ### 4.1 Moteur cryptographique
 
-Le moteur utilise libsodium, Argon2id et XChaCha20-Poly1305. Les paramètres actuels sont 3 itérations et 256 Mio (`VaultArgon2Operations=3`, `VaultArgon2Memory=256 MiB`), avec une plage acceptée de 3 à 4 itérations et de 256 à 512 Mio à l'ouverture. À vérifier :
+Le moteur utilise libsodium, Argon2id et XChaCha20-Poly1305. Les paramètres actuels sont 3 itérations et 256 Mio (`VaultArgon2Operations=3`, `VaultArgon2Memory=256 MiB`), avec une plage acceptée de 3 à 4 itérations et de 256 à 512 Mio à l'ouverture. Des tests de chiffrement, altération, troncature et authentification existent ; ils ne remplacent pas une revue cryptographique globale V1. Points à examiner dans cette revue :
 - justification documentée de ces paramètres au regard du matériel cible ;
 - génération et stockage du sel ;
 - unicité des nonces ;
@@ -156,79 +146,132 @@ Le moteur utilise libsodium, Argon2id et XChaCha20-Poly1305. Les paramètres act
 - nettoyage des clés et buffers sur tous les chemins d'erreur ;
 - comportement si libsodium ne s'initialise pas.
 
-Documenter les paramètres et ajouter des tests de corruption, troncature et incompatibilité de format.
+Conserver les tests existants et compléter seulement les scénarios réellement manquants. Justifier les paramètres sur le matériel cible sans modifier la cryptographie à l'occasion d'un chantier de sauvegarde.
 
 ### 4.2 SQLite
 
-**État vérifié :** chaque coffre utilise sa propre base SQLite, qui stocke les notes chiffrées avec le reste de l'entrée. À la création, le coffre applique `PRAGMA journal_mode=DELETE`, `PRAGMA synchronous=FULL`, `PRAGMA secure_delete=ON` et `PRAGMA temp_store=MEMORY`; `CredentialService` réapplique `secure_delete=ON` à ses connexions.
+**Réalisé :** chaque connexion concernée utilise `configureSqliteConnection()` et vérifie `DELETE`, `EXTRA=3`, `secure_delete=1`, `temp_store=2`, les options de compilation compatibles et `busy_timeout=3000`. `NO_CKPT_ON_CLOSE=1` est établi et relu avant inspection. Un journal incompatible est refusé sans conversion ni nettoyage manuel ; les modifications normales du SHM restent possibles. Le passage FULL → EXTRA est une décision validée, pas une comparaison encore à refaire.
 
-À vérifier :
-- persistance effective du mode `journal_mode=DELETE` et de ses fichiers associés après création/réouverture ;
-- WAL, journaux, fichiers temporaires et sauvegardes ;
-- permissions du coffre et du répertoire ;
-- arrêt brutal, disque plein et corruption ;
-- transactions d'ajout, modification et suppression ;
-- absence de données en clair dans colonnes, tables auxiliaires et logs.
+Connexions, statements, erreurs SQLite et temporaires de création disposent de protections RAII, y compris sur exception. Les transactions CRUD restent `BEGIN IMMEDIATE` / `COMMIT` : codes initiaux préservés, état transactionnel consulté, rollback confirmé/échoué/automatique et résultat incertain distingués. Ni autocommit après erreur ni terminaison d'un processus ne prouvent un succès durable.
 
-Le mode `DELETE` évite le WAL persistant, mais ses propriétés de confidentialité et de durabilité après incident restent à valider expérimentalement.
+Les tests existants traitent déjà refus WAL, vérification des PRAGMA, exceptions d'allocation, échecs BEGIN/COMMIT/ROLLBACK, contention réelle, `FULL`, `IOERR` injecté et interruption de processus. **Travaux restants :** maintenir ces régressions, compléter l'audit de corruption et les essais sur matériels/supports annoncés ; ne pas présenter les injections comme des pannes électriques. L'effacement physique sur SSD, snapshots ou swap et les garanties d'un stockage distant ne sont pas démontrés par SQLite.
 
 ### 4.3 Migrations
 
-Décision validée : bloquer l'ouverture normale lorsqu'une migration est nécessaire et proposer une migration contrôlée après sauvegarde. **État vérifié :** le coffre et les entrées portent une version de format, mais aucun mécanisme de migration n'est implémenté.
+Décision validée : bloquer l'ouverture normale lorsqu'une migration est nécessaire et proposer une migration contrôlée après sauvegarde. **État vérifié :** le coffre et les entrées portent une version de format, les versions incompatibles sont refusées, mais aucun moteur de migration n'est implémenté.
 
-À faire : versionner le format, décrire les migrations, créer et vérifier une sauvegarde préalable, rendre l'opération atomique ou récupérable, vérifier le résultat, tester interruption/échec/restauration et refuser les formats non pris en charge.
+Lorsqu'une évolution de format le nécessitera : spécifier les transitions supportées, créer et vérifier une sauvegarde préalable, rendre la migration atomique ou récupérable, puis tester interruption/échec/restauration. Réutiliser les fondations d'exclusion et de publication sans les confondre avec un moteur de migration déjà livré. Aucune reprise des anciens coffres fictifs n'est exigée pour les chantiers courants.
 
-### 4.4 Sauvegardes
+### 4.4 Sauvegardes — moteurs réalisés et finitions restantes
 
-La sauvegarde chiffrée du coffre et la rétention de 7 jours ont été discutées, mais aucune fonction de sauvegarde/restauration du coffre n'est implémentée. La sauvegarde automatique locale avait été différée. Les copies manuelles des exécutables et de la configuration labwc ne remplissent pas cet objectif.
+**Fondations réalisées :** étapes 1 à 5 (registre, exclusion, suivi persistant, sauvegarde/worker/coordination et catalogue/rotation) et export manuel Qt. Les contrats détaillés figurent dans la documentation technique, sections 5.10 à 5.15 ; ils ne sont pas à reconstruire. `Unknown` ne prouve pas la terminaison d'un auxiliaire, et les réservations restent détenues jusqu'à sa fin effective.
 
-À faire : préciser le format (copie du coffre chiffré ou export), métadonnées, destination et permissions ; tester sauvegarde/restauration réelle ; vérifier l'intégrité après restauration ; documenter la sauvegarde manuelle vers un autre ordinateur ou NAS local.
+**Résolu le 9 novembre 2026 :** le test `AutomaticBackupTest.RotationCancellationAfterCopyNeverRetractsPublishedBackup` supposait reçue une annulation seulement mise en tampon Qt. Il acquitte désormais la lecture réelle avant poursuite ; un nouveau test `RotationQueuedCancellationCannotUndoAnAlreadyAppliedDeletion` démontre l'autre ordre, avec `EAGAIN` puis suppression réelle avant livraison. Chacun a réussi 30 passages isolés ; les 102 régressions ciblées ont réussi. Moteur, protocole et temporisations de production sont inchangés. Maintenir ces deux scénarios et la distinction entre demande, réception, acceptation et terminaison ; le diagnostic détaillé est conservé dans la documentation technique, section 6.3. Cette anomalie n'est plus une priorité immédiate.
 
-## 5. P1 — Synchronisation et appareils
+**Travaux restants :**
 
-### 5.1 Conflits
+1. Fournir les réglages GUI par coffre et « Reprendre la sauvegarde » (section 4.6), sans réintroduire de répétitions automatiques après échec.
+2. Proposer une résolution explicite des intentions de rotation interrompues, sans suppression aveugle, réutilisation d'une ancienne preuve ni effacement d'un fichier inconnu.
+3. Compléter la validation sur supports locaux annoncés, changements de destination, retrait de support et fermeture ; distinguer les erreurs réellement retournées des diagnostics supposés.
+4. Distribuer le worker à côté de l'application et tester son absence/incompatibilité dans une installation reproductible.
 
-Ne pas écraser silencieusement une modification concurrente. Détecter les versions divergentes, conserver les deux versions, présenter les différences et demander une résolution explicite. Tester des reconnexions dans des ordres différents.
+**Décisions closes :** automatique désactivé, dossier vide, sept versions par défaut ; nomenclature `NomDuCoffre_JJ-MM-AAAA_HH-MM-SS.db` avec protection contre collisions ; nouvelle copie à l'activation puis sur modifications au verrouillage ; reprise explicite avec une copie fraîche après erreur, sans destination de secours. Rotation seulement après copie et association confirmées. NAS et systèmes de fichiers réseau ne sont pas actuellement des destinations validées : étudier leur prise en charge avant de les annoncer, sans affaiblir les refus existants.
 
-### 5.2 Autorisation et révocation
+### 4.5 Restauration par remplacement — moteur 6B, auxiliaire encore absent
 
-La règle de référence dans les notes est : ajout d'un appareil approuvé par un appareil déjà autorisé ; mot de passe maître toujours requis pour déchiffrer le coffre. Une révocation d'urgence avec évaluation du risque, rotation de clés et identification des secrets externes à renouveler a été privilégiée.
+Le moteur existant `VaultRestoreService` authentifie le mot de passe maître et toutes les entrées avant publication vers un nouveau fichier. Il est testé, mais ne remplace pas le principal et n'a pas de parcours GUI. Son mot de passe est un `std::span` emprunté : sa durée de vie et son nettoyage restent à la charge de l'appelant.
 
-À consolider dans une spécification unique : rôle du mot de passe maître à l'enrôlement, clés par appareil, preuve de possession, révocation, rotation et conséquences pour les appareils restants.
+**Étape 6A — fondations de sécurité, implémentée :** autorisation opaque émise par `MainWindow` après nettoyage réel, réservation exclusive, barrière aux nouvelles sessions, intention persistante et porte de récupération (documentation technique, section 5.16). Ces fondations seules ne substituaient aucun fichier ; elles sont maintenant utilisées par 6B. Les tests simulés ne remplacent pas ceux de l'émetteur GUI réel.
 
-### 5.3 Récupération et serveur
+**Étape 6A-bis — durcissement implémenté et validé :** la nouvelle identité est persistée en phase `identity-confirmed` avec blocage encore actif ; une confirmation durable est exigée avant résolution. La résolution conserve un reçu `resolvedReplacement` borné à la dernière opération, avec identités et références, sans second registre ni effacement d'artefact. Une erreur de confirmation finale peut laisser l'ancien état protégé ou un reçu sûr, jamais supprimer les seules preuves en prétendant que rien n'a eu lieu. Résultats explicites, reprise idempotente limitée au même UUID déjà confirmé et contrôles physiques sont décrits en section 5.16 de la documentation. `snapshotPrincipal()` permet uniquement la lecture du principal initial en phase `prepared`, sous l'autorisation 6A vivante ; une réservation seule ne contourne pas la porte. 6B y raccorde le remplacement et la copie conditionnelle ; worker et GUI restent absents.
 
-Décision validée : pas de récupération si tous les appareils autorisés sont perdus ; pas de contournement en cas de perte du mot de passe maître.
+**À conserver après 6B :** phases sans court-circuit, double identité et empreintes, ancien inode et réservations continues. La reprise 6B ne répète jamais une substitution : elle reconnaît les dispositions réelles et ne finalise que l'échange déjà prouvé. Seule une autorisation encore vivante peut abandonner `prepared` avec preuves intactes ; après perte de celle-ci, la préparation reste bloquée. `armed` avant échange ne bénéficie d'aucun abandon automatique, même avec autorisation vivante. Leur parcours utilisateur contrôlé relève de 8, pas d'une authentification levant implicitement le blocage. Perte externe du registre, participants non coopératifs, supports non validés et limites physiques de `fsync` restent explicites.
 
-Préférences : fonctionnement hors ligne obligatoire ; serveur distant ne nécessitant pas d'exposer le Raspberry Pi à Internet ; Europe privilégiée, Norvège/Suisse possibles si garanties adéquates ; budget de quelques euros par mois.
+**Étape 6B — moteur de remplacement récupérable, implémenté et validé dans son périmètre synchrone :**
 
-À faire : définir le modèle de menace, protocole, chiffrement de bout en bout, données visibles du serveur, juridiction, sauvegardes, suppression et disponibilité hors ligne.
+1. `replacePrincipal()` exige l'autorisation opaque et son principal exact ; copie privée stable, validation structurelle, même `vault_id`, authentification réelle de toutes les entrées et nettoyage du `SecureBuffer` propriétaire/DEK/credentials avant publication. L'ancienne API de restauration vers un nouveau fichier reste inchangée.
+2. Copie de précaution par `snapshotPrincipal()` en `prepared` obligatoire lorsque automatique désactivé : destination explicite inexistante, échec ou durabilité incertaine bloquants, exclusion du catalogue. Si activé : ni copie récente ni disponibilité du dossier habituel exigée.
+3. Candidat privé 0600 dans un dossier 0700 du système de fichiers du principal, empreinte authentifiée et durabilité établies avant `armed`. Échange réel `RENAME_EXCHANGE`, sans copie en place : l'ancien inode reste au nom technique du candidat, avec références persistantes et réservations continues.
+4. Finalisation 6A-bis réutilisée, résultats détaillés, conservation de l'identifiant local/préférences/catalogue/suspensions, `backupRequired` conservateur si automatique activé. Aucune ouverture, sauvegarde ou rotation déclenchée par le moteur.
+5. Inspection/reprise explicite par UUID : reconnaître `armed` avant/après échange avec les deux identités et empreintes ; finaliser seulement l'échange démontré, jamais le répéter. États manquants/incohérents restent bloqués. Tests de vrais fichiers et interruptions de sous-processus, sans panne électrique réelle.
+
+**Limites maintenues :** aucun auxiliaire, délégation ou parcours GUI. Le moteur synchrone respecte encore le thread propriétaire de l'autorisation ; ne pas le déplacer arbitrairement pour éviter de bloquer la GUI. Ne pas nettoyer automatiquement les anciens inodes ni les dossiers privés orphelins après crash ; définir en 8 une récupération/éventuelle suppression avec preuves, pas un effacement aveugle. Registre et SQLite ne forment pas une transaction atomique ; visibilité et confirmation de durabilité restent distinctes.
+
+**Étape 7 — processus auxiliaire de restauration, à développer :**
+
+- Ajouter `passwall_restore_worker`, distinct du worker de sauvegarde sans clé, puis exécuter le moteur 6B hors du thread GUI.
+- Définir la délégation interprocessus limitée depuis l'émetteur 6A, qui conserve son autorité et l'exclusion jusqu'à terminaison réelle ; aucune reconstruction de l'autorisation depuis un UUID ou un booléen, aucun accès aux méthodes d'émission pour l'auxiliaire.
+- Transmettre le mot de passe par canal privé et propriété explicite d'un `SecureBuffer` ; aucun secret dans arguments, environnement, fichiers ou logs. Démontrer nettoyage du mot de passe, DEK et credentials avant publication.
+- Coordonner annulation coopérative, verrouillages de sécurité et acquittements réels de nettoyage, sans confondre le verrouillage volontaire de préparation avec une annulation inattendue.
+- Superviser résultats, réponses tardives, fermeture et terminaison réelle ; conserver les protections nécessaires tant que l'auxiliaire peut encore agir. Ne pas attendre dans un destructeur Qt ni considérer un processus bloqué dans le noyau comme immédiatement interrompu.
+
+**Acceptation 7 :** tests ciblés du canal secret, des générations obsolètes, annulation avant/après engagement, verrouillage, perte de résultat et enfant non coopératif. Une sortie seule ne prouve pas publication/nettoyage, et `Unknown` ne prouve pas terminaison. Aucune GUI de restauration n'est incluse dans cette étape.
+
+### 4.6 Étape 8 — Interface utilisateur et finalisation, à développer
+
+- Ajouter la GUI des trois seuls réglages de sauvegarde : activation, dossier, nombre de versions. L'activation initiale doit demander la première copie ; aucune option de cadence, délai global ou répétition automatique n'est à inventer.
+- Exposer la reprise manuelle après erreur avec revalidation de la destination, nouveau snapshot, notification unique et maintien de la suspension en cas de nouvel échec.
+- Ajouter la GUI de restauration après 6B et 7 : sélection du principal et de la sauvegarde librement choisie, saisie protégée du mot de passe, choix de copie de précaution obligatoire selon configuration et confirmation explicite du remplacement. Résultat/cancel restent réactifs ; aucun coffre n'est automatiquement ouvert ou sélectionné après réussite.
+- Exporter le fichier global de configuration sans altérer l'original ni écraser sans autorisation ; protéger les chemins privés qu'il contient. **Import non défini :** ne pas l'ajouter par déduction.
+- Proposer une réassociation conservatrice et des parcours de récupération de restauration/rotation interrompues ; ne pas réinitialiser un registre corrompu ni lever un blocage par simple confirmation.
+- Finaliser la politique de verrouillage automatique obligatoire et ses tests décrits en section 3.4, sans affaiblir les autres verrouillages.
+- Documenter les changements d'identité après déplacement/copie/remplacement et l'absence de transaction unique entre QSettings et SQLite. Un registre supprimé extérieurement ne peut pas toujours être distingué d'une première configuration.
+
+**Acceptation 8 :** tests GUI d'intégration des réglages, reprise, restauration/confirmation, copie préalable, récupération, export de configuration et minuteur obligatoire. Une copie ne reçoit pas automatiquement les préférences/autorisations locales de sauvegarde du principal ; un registre illisible/ambigu refuse les accès lorsque la récupération ne peut pas être exclue ; une récupération n'active jamais une ancienne session. Les opérations sur un coffre indépendant restent possibles lorsque son état peut être établi.
+
+## 5. P1 — Portabilité des fichiers et contrôles locaux
+
+### 5.1 Périmètre et vérification du code
+
+Le coffre est autonome et les copies sont indépendantes ; les transferts et leur cohérence relèvent de l'utilisateur. Aucun système d'autorisation d'appareil, serveur de référence, synchronisation automatique ou résolution de conflits entre copies n'est planifié dans le périmètre actuel. Une éventuelle évolution demanderait une nouvelle décision.
+
+La lecture de `VaultLifecycleService`, `VaultKeyService` et `VaultPreferencesStore` ne révèle pas de dépendance au registre d'origine pour ouvrir une copie cohérente. Un registre destinataire absent est accepté ; l'enregistrement local après authentification utilise les trois préférences par défaut, sans héritage de la source. La documentation technique, section 5.10, distingue déchiffrement, association locale, protections d'installation et récupération. Il ne s'agit pas d'un essai exécuté entre machines.
+
+### 5.2 Tests et limites à traiter
+
+- Ajouter un scénario complet de transfert sur installation/configuration isolée neuve : ouverture et lecture au mot de passe, nouvel UUID/préférences par défaut, mutation de la copie sans changement de l'original. Les tests actuels de copie sur un même registre et de porte de récupération avec registre absent ne démontrent pas seuls ce parcours complet.
+- Maintenir les refus sur registre local occupé/corrompu/illisible ou intention 6A correspondante. Ne pas supprimer le registre, réassocier arbitrairement ou contourner les contrôles d'identité pour prétendre rendre la copie portable.
+- Tester séparément les associations ambiguës dans un registre déjà utilisé (déplacement, original manquant, remplacement inattendu). Elles peuvent empêcher les préférences de sauvegarde sans constituer une autorisation de machine manquante.
+- Documenter le transfert d'un export/instantané confirmé ou d'un fichier dont toutes les écritures/connexions sont terminées ; ne pas recommander une copie brute en cours d'écriture ni la suppression des journaux SQLite.
+- Le registre supprimé reste indistinguable dans certains cas d'une première configuration ; les intentions de récupération ne voyagent pas automatiquement avec une copie. Préserver cette limite et prévoir la récupération contrôlée 6B/8, pas un contournement automatique.
+- Valider chaque future plateforme : le garde d'opérations interprocessus refuse actuellement l'accès hors Linux. C'est une limite de portage, pas une dépendance à l'ancienne machine.
+
+**Acceptation :** sur une installation Linux compatible et sûre, l'absence du seul QSettings d'origine ne bloque pas la copie ; aucune préférence de sauvegarde source n'est héritée. Pas d'incompatibilité de ce type identifiée par inspection ; les validations complètes de transfert et Windows/iOS restent à faire.
+
+### 5.3 Récupération
+
+La récupération repose sur des copies/sauvegardes utilisables et le mot de passe maître. Aucun mécanisme ne contourne sa perte et aucune récupération centralisée n'est prévue. Distinguer cette récupération de données de la résolution locale d'une opération 6A interrompue ; les protections `VaultReplacementAuthorization`, `VaultOperationGuard`, Firefox et Linux restent requises.
 
 ## 6. P1 — Tests
 
-Compléter la couverture automatisée et les scénarios d'échec :
+**Couverture déjà présente à conserver :** mémoire succès/erreur/exception, listes partiellement lues et corruption, validation des champs, nettoyage des éditeurs, minuterie, contrôle D-Bus et générations natives ; configuration/ressources SQLite et diagnostics transactionnels ; exclusion réelle entre processus, suivi persistant, snapshots, worker, export GUI, catalogue/rotation ; restauration vers un nouveau fichier ; contrats et émetteur réel d'autorisation 6A. Ne pas redemander ces suites comme si elles étaient absentes.
 
-1. mémoire : nettoyage succès/échec/exception, sortie déjà remplie, vecteur partiellement rempli ;
-2. service : désérialisation invalide, entrée corrompue au milieu d'une liste, échec update/remove ;
-3. GUI : maintenir les régressions existantes des éditeurs, du minuteur, du contrôle D-Bus et des générations natives ; compléter les scénarios avec liste ou requête active et les contrôles d'absence de mot de passe dans les données de recherche ;
-4. Firefox : tests automatisés de bout en bout avec site autorisé, domaine ressemblant, redirection, entrée modifiée/supprimée, coffre verrouillé, message invalide et invalidation déterministe pendant une réponse ;
-5. stockage : arrêt brutal, corruption, disque plein, restauration et migration interrompue ;
-6. synchronisation : conflit, appareil révoqué, hors ligne, perte de tous les appareils.
-7. JavaScript : exécution explicite des cinq tests existants avec `node --test tests/extension/*.test.cjs`, puis ajout d'une commande de projet et d'une version Node minimale documentée.
-8. Firefox : rendre reproductibles l'installation et les essais avec le manifeste et l'hôte installés ; la première campagne réelle a été effectuée manuellement le 6 novembre, mais son automatisation reste à faire.
-9. Linux : maintenir les tests du coordinateur, de `Control1.Lock()`, de logind et de l'instance unique ; compléter la couverture des déclencheurs et transitions système sans assimiler les services simulés à une transition réelle.
+**Scénarios manquants ou à consolider :**
 
-**Validations automatisées ciblées rapportées au 6 novembre :** `EntryIdParserTest` 9/9, `NativeRequestProcessorTest` 27/27, `NativeRequestResponseTest` 1/1, `SiteMatcherTest` 12/12, `NativeBridgeServerTest` 21/21 avec sockets Unix réels dans l'environnement Debian habituel, et `passwall_native_host_tests` 6/6, concernant notamment les échecs de redirection des flux. Ces résultats ne prouvent pas une nouvelle exécution complète de tous les tests du projet et sont distincts des essais manuels Firefox.
+1. Maintenir les deux ordres déterministes d'annulation de rotation désormais validés (section 4.4), sans remplacer les acquittements par des délais ni confondre `Unknown` et terminaison. Le développement prioritaire après validation de 6B est l'étape 7.
+2. Maintenir les tests 6B de remplacement réel sur principal fictif, interruptions, résultats incertains, copie préalable conditionnelle et récupération ; préserver aussi les contrats 6A-bis de visibilité/durabilité, UUID et lecture autorisée. En 7, démontrer les mêmes protections sous délégation réelle, supervision des secrets et verrouillage de sécurité, pas seulement dans un appel synchrone de test.
+3. Auxiliaire 7 et secrets asynchrones : propriétés/durée de vie du canal et du `SecureBuffer`, erreur, fermeture, verrouillage de sécurité, terminaison réelle de l'enfant non coopératif et callback tardif. Une exception injectée ou un acquittement simulé ne prouve pas un nettoyage réel.
+4. GUI/finalisation 8 : préférences, reprise, restauration/confirmation, copie de précaution, export de configuration et récupération contrôlée. Appliquer les tests de la politique de minuteur obligatoire (section 3.4) et maintenir les régressions existantes : réentrances, ancienne session, éditeur ouvert.
+5. Firefox : automatisation de bout en bout et entrelacements déterministes avec navigateur réel. Les scénarios métier de refus d'origine, entrée absente/modifiée et les tests d'invalidation du bridge existent déjà ; ils ne prouvent pas l'intégration Firefox complète.
+6. Stockage/supports : étendre aux supports effectivement annoncés, retraits et erreurs remontées ; ne pas confondre interruption de processus et perte d'alimentation. Évaluer NAS/réseau avant support, sans relâcher les protections existantes par simple nom de système de fichiers.
+7. Linux : maintenir les tests du coordinateur, de `Control1.Lock()`, de logind et de l'instance unique ; compléter la couverture des déclencheurs et transitions système sans assimiler les services simulés à une transition réelle.
+8. JavaScript : exécution explicite des cinq tests existants avec `node --test tests/extension/*.test.cjs`, puis commande de projet et version minimale de Node documentées. Les tests restent hors CTest.
+9. Distribution : rendre reproductibles l'installation et les essais avec application, workers, manifeste et extension ; tester les versions incompatibles ou auxiliaires manquants. Les premières campagnes Firefox/Linux locales ne remplacent pas cette validation.
+10. Portabilité : vérifier le transfert complet avec registre neuf et l'indépendance des copies (section 5). Lorsque nécessaire, tester les migrations interrompues ; ne pas ajouter des tests de confiance entre machines pour un modèle abandonné.
 
-**Validations du verrouillage rapportées avant installation :** `SessionLockCoordinatorTest` 21/21 (cible `passwall_session_lock_tests`, bus privé et faux verrouilleur) et `SessionLockServiceTest` 10/10. Les régressions GUI de nettoyage des éditeurs, de minuterie et de générations natives, ainsi que celles du moniteur logind, de son backend D-Bus et de l'instance unique, ont été rapportées comme réussies au fil des interventions. Un jalon antérieur de campagne complète 225/225 a été rapporté avant les évolutions ultérieures ; il ne représente pas le total actuel de tous ces tests. Les essais réels du raccourci et de Firefox de la section 3.4 restent des observations manuelles distinctes. Aucune compilation ni suite de tests n'a été relancée lors de cette clôture documentaire.
+**Jalons et réserves :** l'historique chiffré reste dans la documentation technique, section 6.2 : bilan 6A rapporté de 426 cas, dont passage 65/65 alors insuffisant pour clôturer l'intermittence. L'intervention suivante l'a diagnostiquée et corrigée dans les tests : 66/66 `AutomaticBackupTest`, 23/23 `BackupJobTest`, 13/13 `VaultOperationGuardTest`, soit 102 cas distincts réussis en 44,04 s, plus 30 répétitions isolées de chacun des deux ordres (60 exécutions en 5,58 s, pas 60 cas distincts supplémentaires). Ces validations sont ciblées, hors sandbox ; elles ne prouvent ni une campagne complète actuelle ni une nouvelle exécution JavaScript.
 
-Le journal CTest de 69/69 tests réussis le 5 novembre est un jalon historique, pas le nombre actuel établi de tous les tests. Les cinq tests JavaScript existants ne sont actuellement ni intégrés à CTest ni déclarés par un `package.json` ; aucune nouvelle exécution JavaScript n'est établie par le compte rendu du 6 novembre.
+**Validation 6A-bis clôturée le 9 novembre :** 41 nouveaux cas, `VaultReplacementTest` 73/73 ; au terme des sélections, 472 cas distincts validés, sans échec restant ni test ignoré. La documentation technique, section 6.2, donne les résultats par périmètre et les trois échecs initiaux de harnais corrigés : usage incorrect de l'insertion de métadonnées dans un nouveau test, puis absence d'initialisation de libsodium dans deux tests SQLite lancés en processus isolés (confirmée par GDB). La sélection finale remplacement/ressources a réussi 97/97 ; GUI 123/123 ; les autres régressions ciblées ont réussi. Ne pas additionner les reprises aux cas distincts ni présenter les transitions de registre modélisées comme un remplacement atomique réel. Maintenir ces tests en 6B ; le défaut initial de suppression prématurée de l'intention est corrigé dans ce périmètre, pas une certification globale de stockage.
+
+**Validation 6B clôturée le 9 novembre :** **62 nouveaux cas** (55 moteur, 7 interruptions de sous-processus), ajoutés aux 73 contrats 6A/6A-bis : dernière sélection remplacement 135/135. Les régressions métier/stockage/sauvegardes passent 276/276 et la sélection GUI pertinente 38/38, soit **449 cas ciblés distincts validés, sans échec restant ni test ignoré**. Les détails et les défauts initiaux de harnais corrigés sont dans la documentation technique, section 6.2. Les tests utilisent des fichiers fictifs réellement échangés et une reprise dans un processus neuf, pas seulement des transitions modélisées. Ils couvrent notamment la précaution non confirmée, les deux dispositions `armed`, les erreurs de finalisation, les identités/empreintes et les chemins de l'appelant figés avant callback. Les réexécutions et résultats historiques ne sont pas additionnés ; aucune suite CTest complète, panne électrique, nouvelle transition Linux réelle ou validation du futur worker n'est revendiquée. `git diff --check` est sans erreur ; étape 7 prochaine, étape 8 ouverte.
 
 Pour chaque changement technique : point Git initial, modification ciblée, compilation et tests adaptés au périmètre, inspection du diff et consignation du résultat. Préciser si la validation est ciblée ou complète, et ne pas assimiler des essais manuels à une suite automatisée.
 
+Les anciens échecs `EPERM` de sockets dans le sandbox ne sont pas une preuve de régression applicative. Lors de cette intervention, la présentation de `/tmp` comme propriété de `nobody` y empêchait aussi l'initialisation sûre des sauvegardes ; ne pas contourner les contrôles de chemins pour faire passer les tests. Les régressions ont été exécutées dans l'environnement autorisé. L'intermittence de rotation est un incident distinct, désormais résolu dans son harnais.
+
 ## 7. P2/P3 — Fonctionnalités et plateformes
 
-Le générateur de mots de passe est implémenté, intégré à l'interface et testé. TOTP, passkeys, audit des mots de passe et synchronisation restent à développer. Les paramètres, l'ergonomie, la recherche et la gestion des erreurs doivent être repris selon les besoins produit.
+Le générateur de mots de passe est implémenté, intégré à l'interface et testé. TOTP, passkeys et audit des mots de passe restent à développer. Les paramètres, l'ergonomie, la recherche et la gestion des erreurs doivent être repris selon les besoins produit, sans masquer les interfaces de l'étape 8 encore absentes. Aucune synchronisation entre copies n'est engagée dans cette feuille de route.
 
 L'intégration aux applications locales a été reportée après stabilisation du coffre et de Firefox.
 
@@ -236,32 +279,41 @@ Ordre des plateformes : Linux d'abord ; Windows via VM pour les tests ; iOS diff
 
 La campagne Firefox manuelle du 6 novembre et le bilan du verrouillage Linux du 7 novembre concernent l'installation locale Raspberry Pi 5 / Debian 13 / labwc uniquement. Les validations Windows et des autres plateformes prévues restent à réaliser.
 
+La reproductibilité Linux doit également couvrir `passwall_backup_worker` à côté de l'application ; une future restauration asynchrone ajoutera son propre auxiliaire. Vérifier les versions réellement installées avant toute mise à jour, sans considérer les sources récentes comme automatiquement déployées.
+
 ## 8. Ordre de travail recommandé
 
-1. Poursuivre la réduction de l'exposition des secrets après la migration réalisée vers `CredentialSummary` : auditer les nettoyeurs RAII et réduire les copies évitables, sans réintroduire de credentials complets dans l'état durable de `MainWindow`.
-2. Compléter la validation du flux Firefox désormais unifié autour de `NativeRequestProcessor` : tests déterministes d'invalidation pendant une réponse, tests automatisés de bout en bout et vérifications supplémentaires de sécurité et de robustesse.
-3. Préserver le verrouillage Linux fonctionnellement validé et ses protections internes ; compléter la couverture des défaillances, des déclencheurs non coordonnés et des événements système, sans rouvrir les décisions de garde globale abandonnées.
-4. Poursuivre les travaux P1 de stockage et de tests : valider SQLite face aux incidents, compléter les scénarios de sécurité, puis mettre en place migrations, sauvegardes et restauration testées.
-5. Appliquer les champs obligatoires dans l'interface et `CredentialService`, rendre reproductible l'installation du Native Host et de l'extension au-delà de l'installation locale manuelle, puis documenter la commande de tests JavaScript.
-6. Finaliser la spécification de synchronisation, d'enrôlement et de révocation.
-7. Développer les fonctionnalités produit restantes : TOTP, passkeys, audit et ergonomie.
-8. Étendre et tester les plateformes dans l'ordre Linux, Windows, puis iOS.
+1. **P0 — Mémoire :** maintenir le durcissement clos et `CredentialSummary` ; vérifier les nouveaux chemins sensibles au fur et à mesure, sans recommencer les corrections validées.
+2. **P0 — Firefox :** maintenir l'implémentation unique et l'invalidation ; préparer l'extension de validation déterministe au parcours réel et l'automatisation de bout en bout.
+3. **P0 — Verrouillage :** conserver les protections Linux/éditeurs/minuteur ; assurer leur articulation avec les opérations longues, sans réintroduire de garde globale abandonnée.
+4. **P1 — Maintien de 6B :** conserver le moteur synchrone, les preuves de remplacement réel, la copie préalable conditionnelle, l'ancien inode et la reprise sans seconde substitution ; ne pas élargir son usage à la GUI ou à un worker sans le contrat de délégation suivant.
+5. **P1 — Étape 7, prochain chantier :** délégation limitée de l'autorisation, auxiliaire de restauration, canal secret, `SecureBuffer`, annulation/verrouillage de sécurité, supervision et terminaison réelle ; aucune GUI dans cette étape.
+6. **P1 — Étape 8 :** préférences/reprise, GUI de restauration et confirmation, choix de copie de précaution, récupération contrôlée, export de configuration et verrouillage automatique obligatoire. Les interfaces indépendantes peuvent avancer séparément ; le parcours de restauration dépend de 6B et 7.
+7. **P1 — Validation et distribution :** campagne adaptée aux changements, audit global V1, portabilité des copies et déploiement Linux/Firefox/auxiliaires reproductible, avec tests JavaScript. Ne pas annoncer les supports réseau ou autres plateformes avant validation.
+8. **P1 — Évolutions de données :** développer les migrations lorsqu'une transition de format le nécessitera. Aucun chantier de synchronisation, serveur de référence ou autorisation d'appareil n'est décidé.
+9. **P2/P3 — Produit et plateformes :** TOTP, passkeys, audit et ergonomie ; étendre les plateformes dans l'ordre Linux, Windows, puis iOS.
 
-Une étape doit être validée avant de passer à la suivante.
+Chaque étape fonctionnelle doit disposer de ses critères d'acceptation et tests ciblés. Les invariants P0 s'appliquent à toutes les étapes ; ils ne retardent pas artificiellement les P1 en l'absence de nouveau défaut.
 
 ## 9. Incertitudes à lever dans le dépôt
 
-- versions actuelles exactes de tous les fichiers ;
-- nombre et nature des copies du mot de passe dans le flux natif ;
-- détails de conception des futures sauvegardes, migrations et synchronisation, aujourd'hui absentes ;
-- couverture globale au-delà des suites ciblées rapportées, automatisation Firefox et scénarios déterministes d'invalidation de session.
+- délégation de l'autorisation et auxiliaire asynchrone 7 ; interfaces/finalisation utilisateur 8, dont récupération des états `prepared`/`armed` avant échange et nettoyage éventuel des anciens artefacts avec preuves ;
+- conversion des anciennes valeurs de minuteur 10 ou invalides lors du passage obligatoire à 1/5/15/30/60 ; la conversion de « Désactivé » vers 1 et le nouveau défaut 1 sont déjà décidés ;
+- validation complète d'une copie transférée sur configuration neuve et sur les futures plateformes, sans affaiblir la récupération 6A ;
+- limites de nettoyage des nouvelles tâches sensibles et comportement sous E/S durablement bloquée ;
+- comportement/durabilité sur chaque support annoncé, notamment avant une éventuelle ouverture aux NAS ;
+- couverture globale au-delà des suites ciblées rapportées, automatisation Firefox et validation réelle des transitions logind ;
+- correspondance des exécutables installés avec les sources récentes et procédure reproductible complète ;
+- spécification détaillée des migrations lorsqu'une évolution de format l'exigera ; aucun moteur n'existe.
 
-Les points suivants sont connus et ne doivent plus être traités comme incertains : le chemin Firefox de production (section 1, avec `MainWindow` comme `NativeVaultAccess`), l'installation locale manuelle et la première campagne réelle rapportée le 6 novembre (section 3.3), la configuration SQLite de création (`DELETE`, `FULL`, `secure_delete=ON`, `temp_store=MEMORY`), les paramètres Argon2id (3 itérations, 256 Mio), l'absence de sauvegarde/migration/synchronisation et l'absence de TOTP, passkeys et audit.
+Les composants déjà vérifiés ne sont pas des incertitudes à rouvrir : voir le bilan de la documentation technique, sections 5 et 6. L'autonomie cryptographique et l'absence de dépendance au registre d'origine ressortent de la lecture du code ; cela ne dispense pas des protections de l'installation destinataire ni des tests complets de transfert. Synchronisation automatique, autorisation d'appareil et serveur de référence ne sont pas des travaux différés déjà décidés.
 
-L'installation du coordinateur, la surcharge utilisateur de `Ctrl+Alt+L`, le maintien du pilote et les succès fonctionnels rapportés de la section 3.4 sont également établis dans ce périmètre local. `SessionGuard1` est définitivement supprimé ; une garde globale persistante, une authentification globale ou une modification de swaylock/labwc ne sont pas des travaux en attente. Les limites de mémoire, de couverture des déclencheurs et de comportement sous défaillance restent ouvertes.
+L'installation locale manuelle et les campagnes réelles Firefox/Linux sont des jalons rapportés, non réexécutés ici. L'installation du coordinateur, la surcharge utilisateur de `Ctrl+Alt+L`, le maintien du pilote et les succès de la section 3.4 sont établis dans ce périmètre historique local. `SessionGuard1` est définitivement supprimé ; une garde globale persistante, une authentification globale ou une modification de swaylock/labwc ne sont pas des travaux en attente. La porte de récupération par coffre de 6A ne contredit pas cette décision. Les limites de mémoire, de couverture des déclencheurs et de comportement sous défaillance restent ouvertes.
 
 Ne pas résoudre ces incertitudes par supposition : inspecter le dépôt et consigner les observations.
 
 ## 10. Critères de candidature à une première version
 
-Avant une première diffusion : chiffrement et formats documentés ; tests du cycle de vie et de la corruption ; exposition mémoire réduite et vérifiée ; flux Firefox de production consolidé, installation reproductible et validation automatisée de bout en bout, au-delà des essais manuels déjà réalisés ; invalidation de session testée de manière déterministe pendant une réponse ; couverture du verrouillage système étendue au-delà des raccourcis Linux déjà validés localement, avec limites documentées ; sauvegarde/restauration et migration testées ; absence de secrets dans les logs ; plateformes annoncées testées ; limites et absence de récupération clairement documentées.
+Avant une première diffusion : chiffrement et formats documentés ; maintien des tests du cycle de vie, de corruption et de mémoire ; audit global V1 avec risques résiduels explicites ; flux Firefox unique préservé, installation reproductible et validation automatisée de bout en bout au-delà des essais manuels ; invalidation composant existante conservée et entrelacements d'intégration vérifiés ; couverture du verrouillage système étendue au-delà des raccourcis déjà validés localement, avec limites documentées ; sauvegardes exposées et rétention sans anomalie non qualifiée ; restauration V1 complète avec récupération et résultats incertains correctement traités ; politique de refus des formats incompatibles et migrations testées si une transition est nécessaire ; absence de secrets dans les logs ; plateformes et supports annoncés testés.
+
+Les fonctionnalités déjà réalisées ne sont pas à reconstruire. Les lacunes produit (étapes 7 et 8, dont minuteur obligatoire, puis distribution) et l'absence de campagne complète récente empêchent de confondre l'état courant avec une V1 prête à diffuser. Le moteur 6B et la correction ciblée du test de rotation ne valent pas certification exhaustive du stockage. La perte du mot de passe maître n'a pas de mécanisme de contournement ; une sauvegarde ne crée pas une récupération cryptographique sans ce mot de passe. Aucun mécanisme de confiance entre machines n'est un critère de cette V1.

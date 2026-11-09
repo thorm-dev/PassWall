@@ -1,7 +1,9 @@
 
 #include "services/credential_service.hpp"
+#include "storage/vault_operation_guard.hpp"
 
 #include "services/vault_key_service.hpp"
+#include "services/vault_preferences_store.hpp"
 #include "storage/vault_storage.hpp"
 #include "storage/sqlite_connection_config.hpp"
 
@@ -103,6 +105,7 @@ constexpr std::array<unsigned char, 16> EntryPurpose = {
 };
 
 struct Database {
+    storage::VaultOperationGuard access;
     sqlite3* handle = nullptr;
 
     ~Database()
@@ -177,6 +180,8 @@ bool openDatabase(
         return false;
     }
 
+    if (!database.access.tryAccess(path, error)) return false;
+    if (!VaultPreferencesStore::checkRecoveryAccess(path, error)) return false;
     const int result = sqlite3_open_v2(
         path.c_str(),
         &database.handle,
@@ -766,6 +771,16 @@ bool loadMetadata(
         databasePath, metadata, error);
 }
 
+bool prepareMutation(const std::string& path, storage::VaultOperationGuard& access,
+                     std::string& error)
+{
+    QString failure;
+    if (VaultPreferencesStore().prepareMutation(QString::fromStdString(path), access, failure))
+        return true;
+    error = "Modification refusée (suivi des sauvegardes) : " + failure.toStdString();
+    return false;
+}
+
 } // namespace
 
 bool CredentialService::validate(const Credential& credential, std::string& error)
@@ -806,6 +821,9 @@ bool CredentialService::add(
     if (!validate(credential, error)) {
         return false;
     }
+
+    storage::VaultOperationGuard mutation;
+    if (!prepareMutation(databasePath, mutation, error)) return false;
 
     services::VaultKeyMetadata metadata{};
 
@@ -1105,6 +1123,42 @@ bool CredentialService::listSummaries(
     return true;
 }
 
+bool CredentialService::authenticateAll(
+    const std::string& databasePath, const SecureBuffer& dataKey, std::string& error)
+{
+    error.clear();
+    if (!validKey(dataKey)) {
+        error = "La clé du coffre est invalide ou le coffre est verrouillé.";
+        return false;
+    }
+    VaultKeyMetadata metadata{};
+    if (!loadMetadata(databasePath, metadata, error)) return false;
+    Database database;
+    if (!openDatabase(databasePath, database, error)) return false;
+    Statement statement;
+    if (!prepare(database.handle, "SELECT entry_id FROM entries ORDER BY entry_id;", statement, error))
+        return false;
+    for (;;) {
+        const int code = sqlite3_step(statement.handle);
+        if (code == SQLITE_DONE) return true;
+        if (code != SQLITE_ROW)
+            return sqlError(database.handle, code, "Parcours d'authentification", error);
+        if (sqlite3_column_type(statement.handle, 0) != SQLITE_BLOB
+            || sqlite3_column_bytes(statement.handle, 0) != static_cast<int>(models::EntryIdSize)
+            || sqlite3_column_blob(statement.handle, 0) == nullptr) {
+            error = "Un identifiant d'entrée SQLite est invalide.";
+            return false;
+        }
+        Credential credential;
+        CredentialWiper wiper(credential); // Armed before read/assign can throw.
+        EntryId id{};
+        std::copy_n(static_cast<const unsigned char*>(sqlite3_column_blob(statement.handle, 0)), id.size(), id.begin());
+        if (!readEntry(database.handle, metadata, dataKey, id, credential, error)
+            || !validate(credential, error)) return false;
+        // The scope ends (and wipes all five strings) before the next SQL step.
+    }
+}
+
 bool CredentialService::update(
     const std::string& databasePath,
     const SecureBuffer& dataKey,
@@ -1121,6 +1175,9 @@ bool CredentialService::update(
     if (!validate(credential, error)) {
         return false;
     }
+
+    storage::VaultOperationGuard mutation;
+    if (!prepareMutation(databasePath, mutation, error)) return false;
 
     services::VaultKeyMetadata metadata{};
 
@@ -1235,6 +1292,9 @@ bool CredentialService::remove(
         error = "La clé du coffre est invalide ou le coffre est verrouillé.";
         return false;
     }
+
+    storage::VaultOperationGuard mutation;
+    if (!prepareMutation(databasePath, mutation, error)) return false;
 
     services::VaultKeyMetadata metadata{};
 

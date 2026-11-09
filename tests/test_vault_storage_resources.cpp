@@ -56,6 +56,7 @@ struct ResourceProbe {
     const char* replacement = nullptr;
     const char* failSetting = nullptr;
     bool failPrepareConfiguration = false;
+    bool failOpen = false;
     bool throwConfigurationDiagnostic = false;
     bool configurationFaultInjected = false;
     int noCheckpointFault = 0; // setter error/value, getter error/value
@@ -174,6 +175,9 @@ protected:
 
     void SetUp() override
     {
+        // CTest starts each case in a fresh process. SecureBuffer must not
+        // depend on an earlier lifecycle test having initialized libsodium.
+        ASSERT_TRUE(passwall::core::CryptoEngine::initialize());
         ASSERT_TRUE(directory.isValid());
         path = (directory.path() + "/fictional-vault.db").toStdString();
         metadata.vaultId.fill(0x31);
@@ -226,7 +230,12 @@ extern "C" void* wrappedNew(std::size_t size)
 extern "C" int __real_sqlite3_open_v2(const char*, sqlite3**, int, const char*);
 extern "C" int __wrap_sqlite3_open_v2(const char* path, sqlite3** database, int flags, const char* vfs)
 {
-    const int result = __real_sqlite3_open_v2(path, database, flags, vfs);
+    // Fail behind the business-access preflight, using a real SQLite failure
+    // handle. Appending a child to an existing regular test file is ENOTDIR.
+    const auto invalid = activeProbe && activeProbe->failOpen
+        ? std::string(path) + "/missing.db" : std::string();
+    const int result = __real_sqlite3_open_v2(
+        invalid.empty() ? path : invalid.c_str(), database, flags, vfs);
     if (activeProbe != nullptr && *database != nullptr)
         ++activeProbe->connections;
     return result;
@@ -455,21 +464,23 @@ TEST_F(VaultStorageResourcesTest, PrepareFailuresRollBackAndAllowRetry)
 
 TEST_F(VaultStorageResourcesTest, OpenDiagnosticExceptionClosesFailedConnection)
 {
-    const std::string missing = path + "/missing.db";
+    ASSERT_TRUE(VaultStorage::createSchema(path, error));
     ResourceProbe probe;
     probe.throwOnDiagnostic = true;
+    probe.failOpen = true;
     bool caught = false;
     {
         ProbeScope scope(probe);
         VaultKeyMetadata output;
-        try { (void)VaultStorage::readMetadata(missing, output, error); }
+        try { (void)VaultStorage::readMetadata(path, output, error); }
         catch (const std::bad_alloc&) { caught = true; }
     }
     EXPECT_TRUE(caught);
     EXPECT_TRUE(probe.allocationFailed);
     expectReleased(probe);
-    EXPECT_TRUE(files().isEmpty());
-    EXPECT_TRUE(VaultStorage::createSchema(path, error));
+    EXPECT_EQ(files().size(), 1);
+    expectWritable();
+    EXPECT_TRUE(VaultStorage::writeMetadata(path, metadata, error));
 }
 
 TEST_F(VaultStorageResourcesTest, PrepareDiagnosticExceptionsReleaseReadAndWriteConnections)

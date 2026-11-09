@@ -1,6 +1,8 @@
 
 #include "vault_storage.hpp"
 #include "storage/sqlite_connection_config.hpp"
+#include "storage/vault_operation_guard.hpp"
+#include "services/vault_preferences_store.hpp"
 
 #include <sqlite3.h>
 
@@ -15,6 +17,7 @@ namespace passwall::storage {
 namespace {
 
 struct Database {
+    VaultOperationGuard access;
     sqlite3* handle = nullptr;
 
     Database() = default;
@@ -92,6 +95,8 @@ bool openDatabase(
     std::string& error,
     bool newlyCreated = false)
 {
+    if (!database.access.tryAccess(databasePath, error)) return false;
+    if (!services::VaultPreferencesStore::checkRecoveryAccess(databasePath, error)) return false;
     const int result = sqlite3_open_v2(
         databasePath.c_str(),
         &database.handle,
@@ -132,6 +137,9 @@ bool VaultStorage::createSchema(
         return false;
     }
 
+    VaultOperationGuard access;
+    if (!access.tryAccess(databasePath, error)) return false;
+    if (!services::VaultPreferencesStore::checkRecoveryAccess(databasePath, error)) return false;
     CreatedFile createdFile(databasePath);
     const int fileDescriptor = ::open(
         databasePath.c_str(),

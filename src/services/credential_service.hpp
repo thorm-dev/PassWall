@@ -35,6 +35,15 @@ public:
         std::vector<models::CredentialSummary>& summaries,
         std::string& error);
 
+    // No output, cache, session or vector of entries/summaries. Authenticate,
+    // deserialize and validate each record with the existing read path, then
+    // wipe it before advancing. Caller supplies a stable private database (the
+    // restore engine validates its structure first). No business SQL writes.
+    [[nodiscard]] static bool authenticateAll(
+        const std::string& databasePath,
+        const core::SecureBuffer& dataKey,
+        std::string& error);
+
     [[nodiscard]] static bool get(
         const std::string& databasePath,
         const core::SecureBuffer& dataKey,

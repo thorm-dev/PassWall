@@ -354,6 +354,16 @@
            </spacer>
           </item>
           <item>
+           <widget class="QPushButton" name="exportVaultButton">
+            <property name="enabled">
+             <bool>false</bool>
+            </property>
+            <property name="text">
+             <string>Exporter le coffre</string>
+            </property>
+           </widget>
+          </item>
+          <item>
            <widget class="QPushButton" name="lockVaultButton">
             <property name="text">
              <string>Verrouiller</string>

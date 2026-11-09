@@ -4,11 +4,13 @@
 #include "core/crypto_engine.hpp"
 #include "models/credential.hpp"
 #include "native/native_request_processor.hpp"
+#include "services/vault_replacement_authorization.hpp"
 
 #include <QMainWindow>
 #include <QString>
 #include <QTimer>
 #include <QJsonObject>
+#include <QPointer>
 
 #include <cstdint>
 #include <functional>
@@ -16,12 +18,22 @@
 #include <vector>
 
 QT_BEGIN_NAMESPACE
+class QVariant;
 namespace Ui {
 class MainWindow;
 }
 QT_END_NAMESPACE
 
+#ifdef Q_OS_LINUX
+namespace passwall::services { class BackupJob; class AutomaticBackupCoordinator; }
+class QCloseEvent;
+#endif
+
 namespace passwall::gui {
+
+#ifdef Q_OS_LINUX
+class VaultExportDialog;
+#endif
 
 class MainWindow : public QMainWindow, public native::NativeVaultAccess {
     Q_OBJECT
@@ -43,6 +55,10 @@ public:
     // never on vaultSessionInvalidated. true confirms accessible cleanup,
     // not erasure of historical Qt/kernel copies. No unlock operation.
     void requestExternalLock(std::function<void(bool)> completion);
+    // Internal 6A entry point, no restore GUI or replacement. Owner-thread only.
+    // The only production issuer is this real cleanup/acknowledgement path.
+    void requestReplacementAuthorization(const QString& localId,
+        std::function<void(services::VaultReplacementAuthorization, QString)> completion);
     [[nodiscard]] native::NativeRequestResponse handleNativeRequest(
         const QJsonObject& request);
 
@@ -66,15 +82,22 @@ signals:
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
+#ifdef Q_OS_LINUX
+    void closeEvent(QCloseEvent* event) override;
+#endif
 
 private:
     void chooseCreatePath();
     void chooseUnlockPath();
     void createVault();
     void unlockVault();
+    void registerAuthenticatedVault(const QString& path);
+    void persistUiPreference(const QString& key, const QVariant& value);
 
     void showUnlockedVault();
-    void lockVault();
+    enum class LockReason { Security, ReplacementPreparation };
+    void lockVault(LockReason reason = LockReason::Security);
+    void requestLock(std::function<void(bool)> completion, LockReason reason);
 
     bool refreshCredentials();
     void filterCredentials(const QString& text);
@@ -95,12 +118,32 @@ private:
     [[nodiscard]] bool externalLockBlocksAccess() const noexcept;
     void updateSessionAccessUi();
     [[nodiscard]] bool isFullyLocked() const;
+    [[nodiscard]] bool recoveryAllowsCurrentSession() const noexcept;
     void updateInactivityTimer();
     [[nodiscard]] bool beginUnlockedSession() noexcept;
     [[nodiscard]] native::VaultAccessResult leaseFailureResult(
         const native::VaultLease& lease) const noexcept;
     static void clearSummaryOutput(
         std::vector<models::CredentialSummary>& output) noexcept;
+
+#ifdef Q_OS_LINUX
+    void exportVault();
+    void updateExportAction();
+    [[nodiscard]] bool exportAuthorizationCurrent(native::VaultLease lease, const QString& source);
+    [[nodiscard]] bool hasOpenCredentialEditor() const;
+    void startVaultExport(const QString& source, const QString& destination);
+    void cancelVaultExport();
+    void queueExportClose();
+    bool exportInProgress_ = false;
+    bool exportLockPending_ = false;
+    bool exportCloseRequested_ = false;
+    bool exportUncertain_ = false;
+    QPointer<services::BackupJob> backupJob_;
+    services::AutomaticBackupCoordinator* automaticBackup_ = nullptr;
+    // Independent modeless window: lockVault must not reject/cancel a keyless
+    // backup window when another session is locked. Explicitly owned below.
+    QPointer<VaultExportDialog> exportDialog_;
+#endif
 
     QTimer inactivityTimer_;
     int autoLockMinutes_ = 5;
@@ -122,6 +165,8 @@ private:
     bool externalLockReplyInProgress_ = false;
     bool externalLockFailed_ = false;
     bool externalLockClosing_ = false;
+    bool replacementTransition_ = false;
+    std::weak_ptr<services::VaultReplacementAuthorization::State> replacement_;
     struct LifecycleProtectionValidator {
         std::function<bool()> check;
         std::function<void()> invalidate;

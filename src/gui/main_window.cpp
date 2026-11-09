@@ -4,7 +4,16 @@
 #include "native/native_bridge_server.hpp"
 #include "services/credential_service.hpp"
 #include "services/vault_lifecycle_service.hpp"
+#include "services/vault_preferences_store.hpp"
+#ifdef Q_OS_LINUX
+#include "services/automatic_backup_coordinator.hpp"
+#endif
+#include "storage/vault_operation_guard.hpp"
 #include "ui_main_window.h"
+#ifdef Q_OS_LINUX
+#include "gui/vault_export_dialog.hpp"
+#include "services/backup_job.hpp"
+#endif
 #include <sodium.h>
 
 #include <QApplication>
@@ -16,6 +25,7 @@
 #include <QDialogButtonBox>
 #include <QEvent>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QGuiApplication>
 #include <QHBoxLayout>
@@ -500,6 +510,23 @@ namespace passwall::gui
           ui_(new Ui::MainWindow)
     {
         ui_->setupUi(this);
+#ifdef Q_OS_LINUX
+        automaticBackup_ = new services::AutomaticBackupCoordinator(this);
+        automaticBackup_->setPaused(true);
+        connect(automaticBackup_, &services::AutomaticBackupCoordinator::notification, this,
+            [this](const QString&, const QString& message) {
+                auto* notice = new QMessageBox(QMessageBox::Warning, tr("Sauvegarde automatique"),
+                    message, QMessageBox::Ok, this);
+                notice->setObjectName(QStringLiteral("automaticBackupWarning"));
+                notice->setTextFormat(Qt::PlainText);
+                notice->setAttribute(Qt::WA_DeleteOnClose);
+                notice->setModal(false); notice->show();
+            });
+        connect(automaticBackup_, &services::AutomaticBackupCoordinator::closeReady,
+            this, &MainWindow::queueExportClose);
+        connect(automaticBackup_, &services::AutomaticBackupCoordinator::activityChanged,
+            this, [this](bool) { updateExportAction(); });
+#endif
         inactivityTimer_.setObjectName(QStringLiteral("vaultInactivityTimer"));
         // Charger le délai de verrouillage automatique.
         QSettings settings("PassWall", "PassWall");
@@ -572,11 +599,10 @@ namespace passwall::gui
                     minutes = selected.section(' ', 0, 0).toInt();
                 }
                 autoLockMinutes_ = minutes;
-                QSettings autoLockSettings("PassWall", "PassWall");
-                autoLockSettings.setValue(
+                updateInactivityTimer();
+                persistUiPreference(
                     "security/autoLockMinutes",
                     autoLockMinutes_);
-                updateInactivityTimer();
             });
         ui_->stackedWidget->setCurrentWidget(ui_->pageWelcome);
         // Restaurer le dernier chemin de coffre utilisé.
@@ -606,7 +632,13 @@ namespace passwall::gui
         connect(ui_->unlockVaultButton, &QPushButton::clicked,
                 this, &MainWindow::unlockVault);
         connect(ui_->lockVaultButton, &QPushButton::clicked,
-                this, &MainWindow::lockVault);
+                this, [this] { lockVault(); });
+#ifdef Q_OS_LINUX
+        connect(ui_->exportVaultButton, &QPushButton::clicked,
+                this, &MainWindow::exportVault);
+#else
+        ui_->exportVaultButton->hide(); // Snapshot backend currently Linux only.
+#endif
         connect(ui_->credentialSearchEdit, &QLineEdit::textChanged,
                 this, &MainWindow::filterCredentials);
         connect(ui_->addCredentialButton, &QPushButton::clicked,
@@ -622,6 +654,17 @@ namespace passwall::gui
     }
     MainWindow::~MainWindow()
     {
+        services::VaultReplacementAuthorization::revoke(replacement_.lock());
+#ifdef Q_OS_LINUX
+        if (automaticBackup_) automaticBackup_->shutdown();
+        exportCloseRequested_ = true;
+        if (backupJob_)
+        {
+            disconnect(backupJob_, nullptr, this, nullptr);
+            backupJob_->cancel(); // No wait, even outside a normal closeEvent.
+        }
+        delete exportDialog_.data();
+#endif
         externalLockClosing_ = true;
         const auto pending = std::exchange(externalLockRequests_, {});
         for (const auto& completion : pending)
@@ -634,13 +677,25 @@ namespace passwall::gui
     }
     bool MainWindow::externalLockBlocksAccess() const noexcept
     {
-        return externalLockClosing_ || externalLockFailed_ ||
+#ifdef Q_OS_LINUX
+        if (exportCloseRequested_)
+            return true;
+#endif
+        return replacementTransition_ || services::VaultReplacementAuthorization::active(replacement_.lock()) ||
+            externalLockClosing_ || externalLockFailed_ ||
             externalLockReplyInProgress_ || !externalLockRequests_.empty();
     }
     void MainWindow::requestExternalLock(std::function<void(bool)> completion)
     {
+        requestLock(std::move(completion), LockReason::Security);
+    }
+    void MainWindow::requestLock(std::function<void(bool)> completion, LockReason reason)
+    {
         if (!isSessionThread())
             qFatal("External locking must run on the vault owner's thread");
+        // Reentry must revoke BEFORE joining an already-running cleanup.
+        if (reason == LockReason::Security)
+            services::VaultReplacementAuthorization::revoke(replacement_.lock());
         if (!completion)
             return;
         if (externalLockClosing_ || externalLockFailed_)
@@ -651,7 +706,7 @@ namespace passwall::gui
         externalLockRequests_.push_back(std::move(completion));
         if (vaultLockInProgress_ || externalLockReplyInProgress_)
             return; // The outer operation schedules completion, never this reentry.
-        try { lockVault(); }
+        try { lockVault(reason); }
         catch (...)
         {
             externalLockFailed_ = true;
@@ -701,6 +756,9 @@ namespace passwall::gui
             {
                 guarded->externalLockReplyInProgress_ = false;
                 guarded->scheduleExternalLockCompletion();
+#ifdef Q_OS_LINUX
+                guarded->updateExportAction();
+#endif
             }
         });
         const auto pending = std::exchange(externalLockRequests_, {});
@@ -796,6 +854,9 @@ namespace passwall::gui
             statusBar()->clearMessage();
         else
             statusBar()->showMessage(tr("Coffre verrouillé : protection système indisponible ou transition en cours."));
+#ifdef Q_OS_LINUX
+        updateExportAction();
+#endif
     }
     bool MainWindow::advanceSessionGeneration() noexcept
     {
@@ -883,6 +944,7 @@ namespace passwall::gui
         }
 
         if (!hasLifecycleProtection() || vaultLockInProgress_ || externalLockBlocksAccess() || vaultPath_.isEmpty() || dataKey_.empty() ||
+            !recoveryAllowsCurrentSession() ||
             sessionGeneration_ == 0)
         {
             return native::VaultAccessResult::Locked;
@@ -900,6 +962,7 @@ namespace passwall::gui
     {
         if (!hasLifecycleProtection() || vaultLockInProgress_ || externalLockBlocksAccess() ||
             vaultPath_.isEmpty() || dataKey_.empty() ||
+            !recoveryAllowsCurrentSession() ||
             sessionGeneration_ == 0)
         {
             return {};
@@ -1004,8 +1067,7 @@ namespace passwall::gui
         {
             ui_->unlockPathEdit->setText(path);
             // Mémoriser le chemin choisi.
-            QSettings settings("PassWall", "PassWall");
-            settings.setValue("vault/lastPath", path);
+            persistUiPreference("vault/lastPath", path);
         }
     }
     void MainWindow::createVault()
@@ -1076,8 +1138,7 @@ namespace passwall::gui
             showError(tr("Impossible d'initialiser une nouvelle session de coffre."));
             return;
         }
-        QSettings settings("PassWall", "PassWall");
-        settings.setValue("vault/lastPath", path);
+        registerAuthenticatedVault(path);
         showUnlockedVault();
     }
     void MainWindow::unlockVault()
@@ -1136,9 +1197,75 @@ namespace passwall::gui
             showError(tr("Impossible d'initialiser une nouvelle session de coffre."));
             return;
         }
-        QSettings settings("PassWall", "PassWall");
-        settings.setValue("vault/lastPath", path);
+        registerAuthenticatedVault(path);
         showUnlockedVault();
+    }
+    void MainWindow::registerAuthenticatedVault(const QString& path)
+    {
+        // Called only after successful authentication, password cleanup and
+        // beginUnlockedSession() (which already arms the inactivity timer).
+        // Configuration and SQLite publication are NOT one transaction.
+        QString error;
+        try
+        {
+            services::VaultPreferencesStore store;
+            services::VaultRegistration registration;
+            const auto result = store.recognizeOrRegister(
+                QFileInfo(path).absoluteFilePath(), registration, error);
+            if (result == services::VaultRecognition::Registered
+                || result == services::VaultRecognition::Recognized)
+            {
+#ifdef Q_OS_LINUX
+                automaticBackup_->trackVault(registration);
+#endif
+                persistUiPreference("vault/lastPath", path);
+                return;
+            }
+        }
+        catch (...)
+        {
+            error = tr("Erreur inattendue pendant l'enregistrement local du coffre.");
+        }
+        // No modal loop and no rollback/deletion of a successfully created vault.
+        // No preferences are applied when recognition/persistence failed.
+        auto* notice = new QMessageBox(QMessageBox::Warning,
+            tr("Configuration du coffre non enregistrée"),
+            tr("Le coffre reste utilisable, mais son enregistrement local n'est pas confirmé.\n%1")
+                .arg(error), QMessageBox::Ok, this);
+        notice->setObjectName(QStringLiteral("vaultRegistrationWarning"));
+        notice->setAttribute(Qt::WA_DeleteOnClose);
+        notice->setModal(false);
+        notice->show();
+    }
+    void MainWindow::persistUiPreference(const QString& key, const QVariant& value)
+    {
+        // Legacy UI settings share the registry's file. A pending setValue()
+        // must not silently rewrite a malformed INI before registry validation.
+        try
+        {
+            services::VaultPreferencesStore store;
+            QVector<services::VaultRegistration> records;
+            QString error;
+            if (store.list(records, error))
+            {
+                QSettings settings("PassWall", "PassWall");
+                settings.setFallbacksEnabled(false);
+                settings.setAtomicSyncRequired(true);
+                settings.sync();
+                (void)settings.allKeys();
+                if (settings.status() == QSettings::NoError)
+                {
+                    settings.setValue(key, value);
+                    settings.sync();
+                    if (settings.status() == QSettings::NoError)
+                        return;
+                }
+            }
+        }
+        catch (...) {}
+        // Nonmodal; runtime inactivity policy still applies even if saving it
+        // fails. Do not include values/paths in diagnostics.
+        statusBar()->showMessage(tr("Préférences non enregistrées : configuration illisible, occupée ou inaccessible."));
     }
     void MainWindow::showUnlockedVault()
     {
@@ -1153,6 +1280,9 @@ namespace passwall::gui
         // rafraîchir une autre session, ni réarmer un timer arrêté au verrouillage.
         if (!isLeaseCurrent(lease))
             return;
+#ifdef Q_OS_LINUX
+        updateExportAction();
+#endif
         refreshCredentials();
     }
     void MainWindow::activateFromNativeRequest()
@@ -1305,11 +1435,25 @@ namespace passwall::gui
     }
     void MainWindow::addCredential()
     {
+#ifdef Q_OS_LINUX
+        const QPointer<MainWindow> autoRetryOwner(this);
+        const auto retryAutomatic = qScopeGuard([autoRetryOwner] {
+            if (autoRetryOwner) QTimer::singleShot(0, autoRetryOwner, [autoRetryOwner] {
+                if (autoRetryOwner) { autoRetryOwner->updateExportAction(); autoRetryOwner->automaticBackup_->retryPending(); }
+            });
+        });
+#endif
         const auto protectionCleanup = qScopeGuard([this]() {
             (void)ensureLifecycleProtection();
         });
         if (!ensureLifecycleProtection())
             return;
+        storage::VaultOperationGuard editing;
+        std::string accessError;
+        if (!editing.tryAccess(vaultPath_.toStdString(), accessError)) {
+            showError(QString::fromStdString(accessError));
+            return;
+        }
         models::Credential credential;
         CredentialWiper credentialWiper(credential);
         CredentialEditorContext editorContext(credential, acquireLease());
@@ -1338,11 +1482,25 @@ namespace passwall::gui
     }
     void MainWindow::editCredential()
     {
+#ifdef Q_OS_LINUX
+        const QPointer<MainWindow> autoRetryOwner(this);
+        const auto retryAutomatic = qScopeGuard([autoRetryOwner] {
+            if (autoRetryOwner) QTimer::singleShot(0, autoRetryOwner, [autoRetryOwner] {
+                if (autoRetryOwner) { autoRetryOwner->updateExportAction(); autoRetryOwner->automaticBackup_->retryPending(); }
+            });
+        });
+#endif
         const auto protectionCleanup = qScopeGuard([this]() {
             (void)ensureLifecycleProtection();
         });
         if (!ensureLifecycleProtection())
             return;
+        storage::VaultOperationGuard editing;
+        std::string accessError;
+        if (!editing.tryAccess(vaultPath_.toStdString(), accessError)) {
+            showError(QString::fromStdString(accessError));
+            return;
+        }
         auto *item = ui_->credentialsList->currentItem();
         if (item == nullptr)
         {
@@ -1459,11 +1617,22 @@ namespace passwall::gui
         }
         refreshCredentials();
     }
-    void MainWindow::lockVault()
+    void MainWindow::lockVault(LockReason reason)
     {
+        // Even a repeated/reentrant security lock revokes a pending operation.
+        // The deliberate preparation lock is the only exception, never a
+        // change in Control1.Lock() or system/manual/idle locking semantics.
+        if (reason == LockReason::Security)
+            services::VaultReplacementAuthorization::revoke(replacement_.lock());
         if (vaultLockInProgress_)
             return;
+#ifdef Q_OS_LINUX
+        const QString lockedSource = vaultPath_; // Non-secret, before session cleanup.
+#endif
         const QScopedValueRollback<bool> locking(vaultLockInProgress_, true);
+#ifdef Q_OS_LINUX
+        if (automaticBackup_) automaticBackup_->setPaused(true);
+#endif
         inactivityTimer_.stop();
         if (!vaultPath_.isEmpty() || !dataKey_.empty())
         {
@@ -1506,9 +1675,22 @@ namespace passwall::gui
             lifecycleLockPending_ = false;
             emit lifecycleSecretsCleared();
         }
+#ifdef Q_OS_LINUX
+        updateExportAction();
+#endif
         // Posting is safe while the guard is still set: even a nested loop in
         // a callback cannot acknowledge until the outer operation has returned.
         scheduleExternalLockCompletion();
+#ifdef Q_OS_LINUX
+        if (reason != LockReason::ReplacementPreparation && !lockedSource.isEmpty()
+            && !externalLockClosing_ && !exportCloseRequested_)
+            QTimer::singleShot(0, this, [this, lockedSource] {
+                // This event follows external-lock completion. Coordinator I/O
+                // is deferred once more; never part of the cleanup/ack stack.
+                updateExportAction();
+                automaticBackup_->requestForLockedVault(lockedSource);
+            });
+#endif
     }
     void MainWindow::clearCredentials()
     {

@@ -2,7 +2,9 @@
 #include "services/vault_lifecycle_service.hpp"
 
 #include "services/vault_key_service.hpp"
+#include "services/vault_preferences_store.hpp"
 #include "storage/vault_storage.hpp"
+#include "storage/vault_operation_guard.hpp"
 
 #include <sodium.h>
 
@@ -137,6 +139,9 @@ bool VaultLifecycleService::createVault(
         return false;
     }
 
+    storage::VaultOperationGuard access;
+    if (!access.tryAccess(databasePath, error)) return false;
+    if (!VaultPreferencesStore::checkRecoveryAccess(databasePath, error)) return false;
     if (!core::CryptoEngine::initialize()) {
         error = "Impossible d'initialiser le moteur cryptographique.";
         return false;
@@ -252,6 +257,9 @@ bool VaultLifecycleService::unlockVault(
         return false;
     }
 
+    storage::VaultOperationGuard access;
+    if (!access.tryAccess(databasePath, error)) return false;
+    if (!VaultPreferencesStore::checkRecoveryAccess(databasePath, error)) return false;
     services::VaultKeyMetadata metadata;
 
     if (!storage::VaultStorage::readMetadata(

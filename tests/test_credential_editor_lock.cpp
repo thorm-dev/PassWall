@@ -1,6 +1,7 @@
 #include "gui/credential_editor_context.hpp"
 #include "gui/main_window.hpp"
 #include "services/credential_service.hpp"
+#include "storage/vault_operation_guard.hpp"
 #include "services/vault_lifecycle_service.hpp"
 #ifdef Q_OS_LINUX
 #include "fake_login1_backend.hpp"
@@ -277,6 +278,11 @@ protected:
         vaultPath = testDirectory->filePath(QStringLiteral("vault.pwdb"));
         ASSERT_TRUE(QFile::copy(
             suiteDirectory->filePath(QStringLiteral("template.pwdb")), vaultPath));
+        // Each case opens a copy with the same vault_id then removes it. Do not
+        // reuse the previous case's registry (a missing original is deliberately
+        // ambiguous); preserve the original assertions on locking/dialogs.
+        QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, testDirectory->path());
+        QSettings::setPath(QSettings::NativeFormat, QSettings::SystemScope, testDirectory->path());
         QSettings settings("PassWall", "PassWall");
         settings.setValue("security/autoLockMinutes", 1);
         settings.setValue("vault/lastPath", vaultPath);
@@ -603,6 +609,179 @@ protected:
 };
 
 #ifdef Q_OS_LINUX
+// These cases exercise the production issuer and real accessible cleanup,
+// unlike the isolated acknowledgement simulator in test_vault_replacement.cpp.
+TEST_F(MainWindowEditorLockTest, ReplacementAuthorizationFollowsRealCleanupAndNativeInvalidation)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error;
+    ASSERT_TRUE(VaultPreferencesStore().list(records, error)); ASSERT_EQ(records.size(), 1);
+    const auto oldLease = window->acquireLease();
+    std::optional<VaultReplacementAuthorization> authority;
+    bool complete = false;
+    window->requestReplacementAuthorization(records[0].localId,
+        [&](VaultReplacementAuthorization value, QString failure) {
+            error = failure;
+            expectLockedAfterRefresh(); expectNativeAccessDenied(oldLease);
+            EXPECT_TRUE(window->findChild<QLineEdit*>("unlockPasswordEdit")->text().isEmpty());
+            authority.emplace(std::move(value)); complete = true;
+        });
+    EXPECT_FALSE(complete); // No early acknowledgement inside lockVault.
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return complete; }));
+    ASSERT_TRUE(authority->valid(error)) << error.toStdString();
+    EXPECT_FALSE(window->isLeaseCurrent(oldLease));
+    ASSERT_TRUE(authority->abandonPreparation(error));
+    runBounded([&] { unlock(); });
+    EXPECT_TRUE(window->acquireLease().unlocked); EXPECT_FALSE(window->isLeaseCurrent(oldLease));
+}
+TEST_F(MainWindowEditorLockTest, ReplacementRefusesOpenEditorWithoutDiscardingUnsavedFields)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    runEditor(false, [&](QDialog& editor) {
+        bool refused = false;
+        window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString e) {
+            refused = !a.valid(error) && !e.isEmpty();
+        });
+        EXPECT_TRUE(refused); EXPECT_TRUE(window->acquireLease().unlocked);
+        EXPECT_FALSE(editor.findChild<QLineEdit*>("credentialPasswordEdit")->text().isEmpty());
+        editor.reject();
+    });
+    expectStoredEntry();
+}
+TEST_F(MainWindowEditorLockTest, ReplacementRefusesBusyReservationWithoutBlockingOrLockingSession)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    passwall::storage::VaultOperationGuard access; std::string failure;
+    ASSERT_TRUE(access.tryAccess(vaultPath.toStdString(), failure));
+    bool complete = false;
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+        complete = true; EXPECT_FALSE(a.valid(error));
+    });
+    EXPECT_TRUE(complete); EXPECT_TRUE(window->acquireLease().unlocked);
+}
+TEST_F(MainWindowEditorLockTest, ReplacementDoesNotLockAnUnrelatedActiveVault)
+{
+    using namespace passwall::services;
+    const auto other = testDirectory->filePath("other-principal.pwdb");
+    ASSERT_TRUE(QFile::copy(vaultPath, other));
+    VaultRegistration record; QString error;
+    ASSERT_EQ(VaultPreferencesStore().recognizeOrRegister(other, record, error), VaultRecognition::Registered);
+    const auto lease = window->acquireLease(); bool complete = false;
+    window->requestReplacementAuthorization(record.localId, [&](VaultReplacementAuthorization a, QString failure) {
+        complete = true; EXPECT_FALSE(a.valid(error)); EXPECT_FALSE(failure.isEmpty());
+    });
+    EXPECT_TRUE(complete); EXPECT_TRUE(window->isLeaseCurrent(lease));
+}
+TEST_F(MainWindowEditorLockTest, ReplacementBlocksReentrantAuthenticationBeforeAcknowledgement)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    bool attempted = false, complete = false;
+    QObject observer;
+    QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated, &observer, [&] {
+        if (attempted) return;
+        attempted = true; unlock(); EXPECT_FALSE(window->acquireLease().unlocked);
+    });
+    std::optional<VaultReplacementAuthorization> authority;
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+        authority.emplace(std::move(a)); complete = true;
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return complete; }));
+    EXPECT_TRUE(attempted); EXPECT_TRUE(authority->valid(error));
+    runBounded([&] { unlock(); }); EXPECT_FALSE(window->acquireLease().unlocked);
+}
+TEST_F(MainWindowEditorLockTest, ReplacementSecurityLockRevokesIssuedAuthorityWithoutRestoringSession)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    std::optional<VaultReplacementAuthorization> authority;
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+        authority.emplace(std::move(a));
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return authority.has_value(); }));
+    ASSERT_TRUE(authority->valid(error)); bool cleaned = false;
+    window->requestExternalLock([&](bool value) { cleaned = value; });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return cleaned; }));
+    EXPECT_FALSE(authority->valid(error));
+    EXPECT_EQ(VaultPreferencesStore().recoveryAccess(vaultPath, error), VaultRecoveryAccess::RecoveryRequired);
+    EXPECT_FALSE(window->acquireLease().unlocked);
+}
+TEST_F(MainWindowEditorLockTest, ReplacementReentrantSecurityLockPreventsIssuance)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    QObject observer; bool requested = false, complete = false, valid = true;
+    QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated, &observer, [&] {
+        if (requested) return; requested = true;
+        window->requestExternalLock([](bool) {});
+    });
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+        valid = a.valid(error); complete = true;
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return complete; }));
+    EXPECT_TRUE(requested); EXPECT_FALSE(valid);
+}
+TEST_F(MainWindowEditorLockTest, ReplacementFreshLifecycleFailureRevokesWithoutWaitingForTimer)
+{
+    using namespace passwall::services;
+    auto healthy = std::make_shared<bool>(true);
+    window->setLifecycleProtectionValidator([healthy] { return *healthy; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    runBounded([&] { unlock(); });
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    std::optional<VaultReplacementAuthorization> authority;
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+        authority.emplace(std::move(a));
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return authority.has_value(); }));
+    ASSERT_TRUE(authority->valid(error));
+    *healthy = false; // No timer/event-loop turn between failure and validation.
+    EXPECT_FALSE(authority->valid(error)); EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_EQ(VaultPreferencesStore().recoveryAccess(vaultPath, error), VaultRecoveryAccess::RecoveryRequired);
+}
+TEST_F(MainWindowEditorLockTest, ReplacementWindowDestructionCannotAcknowledgeOrKeepReservation)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    bool complete = false;
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+        complete = true; EXPECT_FALSE(a.valid(error));
+    });
+    window.reset(); EXPECT_TRUE(complete); QApplication::processEvents();
+    passwall::storage::VaultOperationGuard reserve; std::string failure;
+    EXPECT_TRUE(reserve.tryReserve(vaultPath.toStdString(), failure));
+}
+TEST_F(MainWindowEditorLockTest, ReplacementRepeatedRequestCannotIssueSecondAuthority)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    bool first = false, second = false; std::optional<VaultReplacementAuthorization> authority;
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+        authority.emplace(std::move(a)); first = true;
+    });
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+        second = true; EXPECT_FALSE(a.valid(error));
+    });
+    EXPECT_TRUE(second); ASSERT_TRUE(passwall::tests::waitFor([&] { return first; }));
+    EXPECT_TRUE(authority->valid(error));
+}
+TEST_F(MainWindowEditorLockTest, ReplacementInconsistentCleanupDoesNotIssueAuthority)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    QObject observer;
+    QObject::connect(window->findChild<QStackedWidget*>("stackedWidget"), &QStackedWidget::currentChanged,
+        &observer, [&] { window->findChild<QLineEdit*>("unlockPasswordEdit")->setText("fictitious-residual"); });
+    bool complete = false;
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+        EXPECT_FALSE(a.valid(error)); complete = true;
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return complete; }));
+    QVector<VaultRegistration> after; ASSERT_TRUE(VaultPreferencesStore().list(after, error));
+    EXPECT_FALSE(after[0].replacement);
+}
 TEST_F(MainWindowEditorLockTest, ExternalLockDbusAcknowledgesCompleteCleanupAndInvalidatesOldLease)
 {
     ControlHarness control(*window);
@@ -1833,6 +2012,14 @@ TEST_F(MainWindowEditorLockTest, InactivityDisabledPolicyIsRespectedInsideRefres
 
 int main(int argc, char** argv)
 {
+    // Explicit organization/application constructors use NativeFormat in Qt
+    // 6.8.2, regardless of setDefaultFormat(). Isolate that format too, BEFORE
+    // any fixture/window can read or write the user's personal configuration.
+    QTemporaryDir nativeSettings;
+    if (!nativeSettings.isValid())
+        return 1;
+    QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, nativeSettings.path());
+    QSettings::setPath(QSettings::NativeFormat, QSettings::SystemScope, nativeSettings.path());
     // Les tests ne lancent ni passwall_app ni Firefox et n'utilisent pas le
     // bureau utilisateur. Ce choix permet aussi la decouverte CTest sans ecran.
     qputenv("QT_QPA_PLATFORM", QByteArrayLiteral("offscreen"));
