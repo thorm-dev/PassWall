@@ -30,6 +30,7 @@ jobs:
             libsodium-dev \
             libsqlite3-dev \
             libgtest-dev \
+            nlohmann-json3-dev \
             libgl1-mesa-dev \
             libxkbcommon-dev
 
