@@ -113,6 +113,11 @@ public:
     // Stored records for management, NOT permission to use them for a file.
     // Call recognizeOrRegister before applying any stored backup authorization.
     [[nodiscard]] bool list(QVector<VaultRegistration>& output, QString& error) const;
+    // Non-authorizing display snapshot of the atomically published settings.
+    // No registry writer lock/cache sync: GUI observation cannot contend with
+    // backup finalization. May be stale or visible before durability is known;
+    // NEVER use it as recovery/business/backup admission or as a success proof.
+    [[nodiscard]] bool listForDisplay(QVector<VaultRegistration>& output, QString& error) const;
     // Readable ordinary configuration errors remain separate from a recovery
     // fence. An unreadable/ambiguous registry is NOT permission to access SQL.
     // Caller keeps its business guard across this check and the whole access.
@@ -121,6 +126,11 @@ public:
     [[nodiscard]] VaultRecognition recognizeOrRegister(
         const QString& path, VaultRegistration& output, QString& error) const;
     [[nodiscard]] bool updatePreferences(const QString& localId,
+        const VaultBackupPreferences& preferences, QString& error) const;
+    // GUI optimistic concurrency: compare identity AND displayed preferences
+    // under the same registry lock as the existing durable update. Internal
+    // catalogue/suspension/recovery fields are never taken from this snapshot.
+    [[nodiscard]] bool updatePreferencesIfCurrent(const VaultRegistration& expected,
         const VaultBackupPreferences& preferences, QString& error) const;
 
     // Before ANY SQLite access of a mutation: acquire business access, inspect
@@ -163,6 +173,8 @@ public:
         VaultFileIdentity& output, QString& error);
 
 private:
+    [[nodiscard]] bool updatePreferencesImpl(const QString& localId,
+        const VaultRegistration* expected, const VaultBackupPreferences&, QString& error) const;
     friend class VaultReplacementAuthorization;
 #ifdef PASSWALL_REPLACEMENT_TESTING
     friend class ReplacementTestAccess;

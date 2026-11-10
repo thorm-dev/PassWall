@@ -36,6 +36,8 @@ namespace passwall::gui {
 
 #ifdef Q_OS_LINUX
 class VaultExportDialog;
+class VaultRestoreController;
+class VaultBackupSettingsController;
 #endif
 
 class MainWindow : public QMainWindow, public native::NativeVaultAccess {
@@ -60,12 +62,13 @@ public:
     // it confirms accessible cleanup,
     // not erasure of historical Qt/kernel copies. No unlock operation.
     void requestExternalLock(std::function<void(bool)> completion);
-    // Internal 6A entry point, no restore GUI or replacement. Owner-thread only.
+    // Internal 6A preparation entry point, also used by the restoration GUI.
+    // Does not replace a file. Owner-thread only.
     // The only production issuer is this real cleanup/acknowledgement path.
     void requestReplacementAuthorization(const QString& localId,
         std::function<void(services::VaultReplacementAuthorization, QString)> completion);
 #ifdef Q_OS_LINUX
-    // Internal pilot API, no restore GUI. Only an authority issued by THIS
+    // Internal execution API used by the restoration GUI/tests. Only an authority issued by THIS
     // MainWindow can be consumed. Returned facade remains owned by the window.
     services::RestoreJob* startReplacementOperation(services::VaultReplacementAuthorization,
         const QString& source, core::SecureBuffer password, const QString& precaution);
@@ -98,6 +101,15 @@ protected:
 #endif
 
 private:
+#ifdef Q_OS_LINUX
+    friend class VaultRestoreController; // Coordinates the real issuer; never a friend of Authorization.
+    friend class VaultBackupSettingsController; // Presentation uses the existing backup coordinator.
+    VaultBackupSettingsController* backupSettingsController_ = nullptr;
+    void restoreVault();
+    bool replacementMatchesSelection(const services::VaultReplacementAuthorization&,
+        const services::VaultRegistration&) const noexcept;
+    VaultRestoreController* restoreController_ = nullptr;
+#endif
     void chooseCreatePath();
     void chooseUnlockPath();
     void createVault();

@@ -100,6 +100,15 @@ extern "C" ssize_t __wrap_send(int fd, const void* data, size_t size, int flags)
     return __real_send(fd, data, restoreSendSlice ? std::min<size_t>(size, restoreSendSlice) : size, flags);
 }
 namespace passwall::tests {
+// Reuse the existing background fsync barrier for settings GUI tests too.
+void holdSettingsSync() {
+    preparationSyncEntered = false; releasePreparationSync = false; pausePreparationSync = true;
+}
+bool settingsSyncEntered() { return preparationSyncEntered.load(); }
+void releaseSettingsSync() {
+    releasePreparationSync = true; pausePreparationSync = false; preparationSyncCondition.notify_all();
+}
+void failSettingsSync() { failPreparationSync = true; }
 void suppressGuiStopsForRestore(bool);
 bool guiRestoreStopWasRequested();
 void releaseGuiRestoreStop();

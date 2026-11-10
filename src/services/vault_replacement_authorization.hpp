@@ -93,6 +93,8 @@ private:
     static void revoke(const std::shared_ptr<State>&) noexcept;
     static bool active(const std::shared_ptr<State>&) noexcept;
     static bool targetsSession(const std::shared_ptr<State>&, const QString&);
+    // Read-only GUI consent binding. No I/O, issuance or authorization bypass.
+    [[nodiscard]] bool matchesSelection(const VaultRegistration&) const noexcept;
     // Internal delegation only; callers cannot import an authority. The worker
     // additionally verifies the executable parent and private inherited socket.
     [[nodiscard]] QJsonObject delegate(QString& error);

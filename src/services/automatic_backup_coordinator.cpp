@@ -161,6 +161,7 @@ void AutomaticBackupCoordinator::dispatch()
         const auto interrupted = std::make_shared<bool>(false);
         auto* job = new BackupJob(worker_, this);
         job_ = job;
+        activeId_ = id;
         voluntaryCancellation_ = false;
         unconfirmedRotationStop_ = false;
         normalInterruption_ = interrupted;
@@ -203,7 +204,7 @@ void AutomaticBackupCoordinator::dispatch()
         connect(job, &BackupJob::processTerminated, this, [this, job] {
             if (job_ != job) return;
             const QPointer<AutomaticBackupCoordinator> guarded(this);
-            job_.clear(); job->deleteLater();
+            job_.clear(); activeId_.clear(); job->deleteLater();
             emit activityChanged(false);
             if (!guarded) return;
             if (closing_) { closeReady_ = true; emit closeReady(); }
@@ -216,7 +217,7 @@ void AutomaticBackupCoordinator::dispatch()
                     result = {BackupOutcome::Unknown, error};
             }, directory, AutomaticBackupContext{store_.fileName(), id, token});
         if (!started) {
-            job_.clear(); job->deleteLater(); fail(id, job->startError());
+            job_.clear(); activeId_.clear(); job->deleteLater(); fail(id, job->startError());
         } else emit activityChanged(true);
     } catch (...) {
         if (job_ && !job_->isActive()) { job_->deleteLater(); job_.clear(); }

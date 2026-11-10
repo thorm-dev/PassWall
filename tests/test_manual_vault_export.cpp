@@ -43,6 +43,7 @@ struct LaunchProbe {
     std::function<void()> beforeStart;
 };
 thread_local LaunchProbe* activeExportProbe = nullptr;
+thread_local QString settingsWorkerOverride;
 thread_local bool suppressExportStops = false;
 thread_local QPointer<QProcess> suppressedExportProcess;
 bool until(const std::function<bool()>& predicate, int limit = 7000)
@@ -74,6 +75,7 @@ extern "C" void wrappedExportTerminate(QProcess* process)
 // Reuse the same isolated Qt stop wrappers for the restore supervisor tests.
 // This models an unconfirmed stop, not an actual unkillable kernel process.
 namespace passwall::tests {
+void setBackupSettingsTestWorker(QString path) { settingsWorkerOverride = std::move(path); }
 void suppressGuiStopsForRestore(bool value) { suppressExportStops = value; }
 bool guiRestoreStopWasRequested() { return !suppressedExportProcess.isNull(); }
 void releaseGuiRestoreStop() {
@@ -89,6 +91,7 @@ extern "C" QString realWorkerPath() asm("__real__ZN8passwall8services9BackupJob1
 extern "C" QString wrappedWorkerPath() asm("__wrap__ZN8passwall8services9BackupJob17siblingWorkerPathEv");
 extern "C" QString wrappedWorkerPath()
 {
+    if (!activeExportProbe && !settingsWorkerOverride.isEmpty()) return settingsWorkerOverride;
     return activeExportProbe && !activeExportProbe->executable.isEmpty()
         ? activeExportProbe->executable : realWorkerPath();
 }
@@ -334,7 +337,10 @@ TEST_F(ManualVaultExportTest, RealCleanupPrecedesLaunchAndSnapshotReopensWithOri
 {
     const auto oldLease = window->acquireLease();
     bool invalidated = false, verified = false;
-    QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated, window.get(), [&] { invalidated = true; });
+    // The fixture destroys the window AFTER this test body's locals. Do not
+    // retain a callback into their stack when the destructor locks again.
+    QObject observer;
+    QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated, &observer, [&] { invalidated = true; });
     probe.beforeStart = [&] {
         verified = true;
         EXPECT_TRUE(invalidated);

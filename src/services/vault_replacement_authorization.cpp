@@ -122,6 +122,11 @@ QString VaultReplacementAuthorization::operationId() const
 { return state_ ? state_->intent.operationId : QString{}; }
 QString VaultReplacementAuthorization::localId() const
 { return state_ ? state_->registration.localId : QString{}; }
+bool VaultReplacementAuthorization::matchesSelection(const VaultRegistration& expected) const noexcept
+{
+    return state_ && state_->registration.localId == expected.localId
+        && state_->registration.file == expected.file && state_->registration.backup == expected.backup;
+}
 
 bool VaultReplacementAuthorization::delegationCurrent() const noexcept
 {

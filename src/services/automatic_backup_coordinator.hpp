@@ -26,6 +26,12 @@ public:
     void cancel(); // Explicit voluntary cancellation suspends subsequent attempts.
     void shutdown();
     [[nodiscard]] bool isActive() const noexcept;
+    // Owner-thread, read-only presentation. A pending resume is not a result
+    // and an active child retains its reservation even after finished(Unknown).
+    [[nodiscard]] QString activeVaultId() const { return isActive() ? activeId_ : QString{}; }
+    [[nodiscard]] bool resumePending(const QString& id) const { return resumes_.contains(id); }
+    [[nodiscard]] bool isPaused() const noexcept { return paused_; }
+    [[nodiscard]] bool isClosing() const noexcept { return closing_; }
     [[nodiscard]] bool canClose() const noexcept { return closeReady_; }
 signals:
     void notification(QString localId, QString message);
@@ -41,6 +47,7 @@ private:
     void fail(const QString& id, const QString& message);
     VaultPreferencesStore store_;
     QString worker_;
+    QString activeId_;
     QMap<QString, QString> known_; // path -> local id, automatic only
     QMap<QString, QString> pending_; // local id -> source
     QSet<QString> resumes_, notified_, deferredIds_;

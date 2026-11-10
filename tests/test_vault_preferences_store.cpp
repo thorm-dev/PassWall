@@ -135,6 +135,56 @@ TEST_F(VaultPreferencesStoreTest, FirstRegistrationHasRandomLocalIdAndExactlyThr
     EXPECT_EQ(root["vaults"].toArray().first().toObject()["backup"].toObject().size(), 3);
 }
 
+TEST_F(VaultPreferencesStoreTest, ConditionalUpdateRejectsStalePreferencesWithoutWriting)
+{
+    const auto expected = registerFirst(); const VaultPreferencesStore store(config);
+    ASSERT_TRUE(store.updatePreferences(expected.localId, {false, {}, 9}, error));
+    const auto before = contents(config);
+    EXPECT_FALSE(store.updatePreferencesIfCurrent(expected, {false, {}, 2}, error));
+    EXPECT_EQ(contents(config), before); EXPECT_TRUE(error.contains("actualisez"));
+    QVector<VaultRegistration> records; ASSERT_TRUE(store.list(records, error)); ASSERT_EQ(records.size(), 1);
+    ASSERT_TRUE(store.updatePreferencesIfCurrent(records.first(), {false, {}, 2}, error));
+    ASSERT_TRUE(VaultPreferencesStore(config).list(records, error)); EXPECT_EQ(records.first().backup.retainedVersions, 2);
+}
+
+TEST_F(VaultPreferencesStoreTest, ConditionalUpdateRejectsAnotherIdentityEvenWithTheSameLocalId)
+{
+    auto expected = registerFirst(); ++expected.file.inode; const auto before = contents(config);
+    EXPECT_FALSE(VaultPreferencesStore(config).updatePreferencesIfCurrent(expected, {false, {}, 4}, error));
+    EXPECT_EQ(contents(config), before);
+}
+
+TEST_F(VaultPreferencesStoreTest, ConditionalUpdatePreservesInternalChangesNotPresentInTheDisplayedSnapshot)
+{
+    const auto expected = registerFirst(); const VaultPreferencesStore store(config);
+    ASSERT_TRUE(store.suspendAutomaticBackup(expected.localId, error));
+    ASSERT_TRUE(store.updatePreferencesIfCurrent(expected, {false, {}, 4}, error));
+    QVector<VaultRegistration> records; ASSERT_TRUE(store.list(records, error)); ASSERT_EQ(records.size(), 1);
+    const auto& current = records.first(); EXPECT_EQ(current.localId, expected.localId); EXPECT_TRUE(current.file == expected.file);
+    EXPECT_TRUE(current.automaticSuspended); EXPECT_TRUE(current.backupRequired); EXPECT_EQ(current.backup.retainedVersions, 4);
+}
+
+TEST_F(VaultPreferencesStoreTest, DisplaySnapshotDoesNotTakeTheBusinessRegistryWriterLock)
+{
+    const auto expected = registerFirst(); const VaultPreferencesStore store(config); const auto before = contents(config);
+    QLockFile writer(config + ".registry-lock"); writer.setStaleLockTime(0); ASSERT_TRUE(writer.tryLock(0));
+    QVector<VaultRegistration> records; ASSERT_TRUE(store.listForDisplay(records, error)); ASSERT_EQ(records.size(), 1);
+    EXPECT_EQ(records.first().localId, expected.localId); EXPECT_EQ(contents(config), before);
+    // This observation is NOT admission: ordinary locked queries and writes
+    // must still refuse while the other writer owns the registry lock.
+    EXPECT_FALSE(store.list(records, error)); EXPECT_FALSE(store.updatePreferencesIfCurrent(expected, {false, {}, 3}, error));
+    EXPECT_EQ(contents(config), before); writer.unlock();
+    EXPECT_TRUE(store.updatePreferencesIfCurrent(expected, {false, {}, 3}, error));
+}
+
+TEST_F(VaultPreferencesStoreTest, CorruptDisplaySnapshotIsRejectedWithoutPartialRecordsOrReset)
+{
+    const auto original = registerFirst(); setRawRegistry("{invalid"); const auto before = contents(config);
+    QVector<VaultRegistration> records{original};
+    EXPECT_FALSE(VaultPreferencesStore(config).listForDisplay(records, error)); EXPECT_TRUE(records.isEmpty());
+    EXPECT_EQ(contents(config), before); EXPECT_FALSE(error.isEmpty());
+}
+
 TEST_F(VaultPreferencesStoreTest, UpdatesPersistAcrossReconstructionAndPreserveOtherVaultAndSettings)
 {
     QDir().mkpath(QFileInfo(config).absolutePath());

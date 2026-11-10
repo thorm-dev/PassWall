@@ -12,6 +12,8 @@
 #include "ui_main_window.h"
 #ifdef Q_OS_LINUX
 #include "gui/vault_export_dialog.hpp"
+#include "gui/vault_restore_controller.hpp"
+#include "gui/vault_backup_settings_controller.hpp"
 #include "services/backup_job.hpp"
 #endif
 #include <sodium.h>
@@ -634,6 +636,17 @@ namespace passwall::gui
         connect(ui_->lockVaultButton, &QPushButton::clicked,
                 this, [this] { lockVault(); });
 #ifdef Q_OS_LINUX
+        auto* restoreMenu = menuBar()->addMenu(tr("Coffre"));
+        auto* restoreAction = restoreMenu->addAction(tr("Restaurer depuis une sauvegarde…"));
+        restoreAction->setObjectName(QStringLiteral("restoreVaultAction"));
+        connect(restoreAction, &QAction::triggered, this, &MainWindow::restoreVault);
+        auto* backupSettings = restoreMenu->addAction(tr("Sauvegardes automatiques…"));
+        backupSettings->setObjectName(QStringLiteral("backupSettingsAction"));
+        connect(backupSettings, &QAction::triggered, this, [this] {
+            if (externalLockClosing_ || exportCloseRequested_) return;
+            if (!backupSettingsController_) backupSettingsController_ = new VaultBackupSettingsController(*this);
+            backupSettingsController_->open();
+        });
         connect(ui_->exportVaultButton, &QPushButton::clicked,
                 this, &MainWindow::exportVault);
 #else
@@ -673,6 +686,10 @@ namespace passwall::gui
             catch (...) { /* No successful acknowledgement while closing. */ }
         }
         lockVault();
+#ifdef Q_OS_LINUX
+        delete std::exchange(restoreController_, nullptr);
+        delete std::exchange(backupSettingsController_, nullptr);
+#endif
         delete ui_;
     }
     bool MainWindow::externalLockBlocksAccess() const noexcept
@@ -728,6 +745,9 @@ namespace passwall::gui
     }
     bool MainWindow::isFullyLocked() const
     {
+#ifdef Q_OS_LINUX
+        if (restoreController_ && restoreController_->hasSensitiveInput()) return false;
+#endif
         if (vaultLockInProgress_ || !dataKey_.empty() || !vaultPath_.isEmpty() ||
             !credentialSummaries_.empty() || inactivityTimer_.isActive() || !ui_ ||
             !ui_->createPasswordEdit->text().isEmpty() ||
@@ -1634,12 +1654,18 @@ namespace passwall::gui
         if (reason == LockReason::Security)
             revokeReplacement();
         if (vaultLockInProgress_)
+        {
+#ifdef Q_OS_LINUX
+            if (restoreController_) restoreController_->onLock(reason == LockReason::Security);
+#endif
             return;
+        }
 #ifdef Q_OS_LINUX
         const QString lockedSource = vaultPath_; // Non-secret, before session cleanup.
 #endif
         const QScopedValueRollback<bool> locking(vaultLockInProgress_, true);
 #ifdef Q_OS_LINUX
+        if (restoreController_) restoreController_->onLock(reason == LockReason::Security);
         if (automaticBackup_) automaticBackup_->setPaused(true);
 #endif
         inactivityTimer_.stop();

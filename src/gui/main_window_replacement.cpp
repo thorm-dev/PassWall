@@ -1,6 +1,9 @@
 #include "gui/main_window.hpp"
 #include "services/vault_preferences_store.hpp"
 #include "services/automatic_backup_coordinator.hpp"
+#ifdef Q_OS_LINUX
+#include "gui/vault_restore_controller.hpp"
+#endif
 #include <QScopeGuard>
 #include <QThread>
 
@@ -113,6 +116,17 @@ void MainWindow::requestReplacementAuthorization(const QString& localId,
     }
 }
 #ifdef Q_OS_LINUX
+void MainWindow::restoreVault()
+{
+    if (externalLockClosing_ || exportCloseRequested_) return;
+    if (!restoreController_) restoreController_ = new VaultRestoreController(*this);
+    restoreController_->open();
+}
+bool MainWindow::replacementMatchesSelection(const services::VaultReplacementAuthorization& authority,
+    const services::VaultRegistration& selected) const noexcept
+{
+    return authority.state_ && authority.state_ == replacement_.lock() && authority.matchesSelection(selected);
+}
 services::RestoreJob* MainWindow::startReplacementOperation(services::VaultReplacementAuthorization authority,
     const QString& source, core::SecureBuffer password, const QString& precaution)
 {

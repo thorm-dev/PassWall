@@ -672,6 +672,22 @@ bool VaultPreferencesStore::inspect(const QString& path,
     return true;
 }
 
+bool VaultPreferencesStore::listForDisplay(QVector<VaultRegistration>& output, QString& error) const
+{
+    output.clear(); error.clear();
+    if (!prepareSettings(settingsFile_, error)) return false;
+    QVariant published;
+    if (!readRegistryOnDisk(settingsFile_, published, error)) return false;
+    if (!published.isValid()) return true;
+    QJsonParseError parse;
+    const auto document = QJsonDocument::fromJson(published.toByteArray(), &parse);
+    if (parse.error != QJsonParseError::NoError || !document.isObject())
+        return fail(error, "Registre corrompu ; aucune réinitialisation effectuée.");
+    QVector<VaultRegistration> snapshot;
+    if (!decode(document.object(), snapshot, error)) return false;
+    output = std::move(snapshot);
+    return true;
+}
 bool VaultPreferencesStore::list(QVector<VaultRegistration>& output, QString& error) const
 {
     output.clear();
@@ -727,6 +743,16 @@ VaultRecognition VaultPreferencesStore::recognizeOrRegister(
 bool VaultPreferencesStore::updatePreferences(const QString& localId,
     const VaultBackupPreferences& preferences, QString& error) const
 {
+    return updatePreferencesImpl(localId, nullptr, preferences, error);
+}
+bool VaultPreferencesStore::updatePreferencesIfCurrent(const VaultRegistration& expected,
+    const VaultBackupPreferences& preferences, QString& error) const
+{
+    return updatePreferencesImpl(expected.localId, &expected, preferences, error);
+}
+bool VaultPreferencesStore::updatePreferencesImpl(const QString& localId,
+    const VaultRegistration* expected, const VaultBackupPreferences& preferences, QString& error) const
+{
     if (!validPreferences(preferences))
         return fail(error, "Préférences invalides : nombre positif et chemin absolu requis.");
     // Keep policy changes outside ongoing mutations: otherwise enabling backups
@@ -738,6 +764,8 @@ bool VaultPreferencesStore::updatePreferences(const QString& localId,
     const bool saved = accessRegistry(settingsFile_, error, [&](auto& records, bool& changed) {
         for (auto& record : records) {
             if (record.localId != localId) continue;
+            if (expected && (record.file != expected->file || record.backup != expected->backup))
+                return fail(error, "Préférences ou identité modifiées depuis l'affichage ; actualisez avant d'enregistrer.");
             if (record.replacement)
                 return fail(error, "Préférences bloquées pendant une récupération.");
             VaultFileIdentity current;

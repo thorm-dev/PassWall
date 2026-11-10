@@ -417,12 +417,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(passwall_gui_tests PRIVATE passwall_linux_session)
     foreach(gui_target passwall_app passwall_gui_tests)
         target_sources(${gui_target} PRIVATE src/gui/main_window_export.cpp
-            src/gui/vault_export_dialog.hpp src/gui/vault_export_dialog.cpp)
+            src/gui/vault_export_dialog.hpp src/gui/vault_export_dialog.cpp
+            src/gui/vault_restore_dialog.hpp src/gui/vault_restore_dialog.cpp
+            src/gui/vault_restore_controller.hpp src/gui/vault_restore_controller.cpp
+            src/gui/vault_backup_settings_dialog.hpp src/gui/vault_backup_settings_dialog.cpp
+            src/gui/vault_backup_settings_controller.hpp src/gui/vault_backup_settings_controller.cpp)
         target_link_libraries(${gui_target} PRIVATE passwall_backup_driver passwall_automatic_backup passwall_restore_driver)
         add_dependencies(${gui_target} passwall_backup_worker passwall_restore_worker)
     endforeach()
     target_sources(passwall_gui_tests PRIVATE
         tests/test_manual_vault_export.cpp
+        tests/test_vault_restore_gui.cpp
+        tests/test_vault_backup_settings_gui.cpp
         tests/test_master_password_cleanup.cpp
         tests/test_linux_session_monitor.cpp
         tests/test_logind_dbus_backend.cpp
@@ -435,7 +441,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(passwall_gui_tests PRIVATE
         RESTORE_TEST_WORKER="$<TARGET_FILE:passwall_restore_worker_test>")
     target_link_options(passwall_gui_tests PRIVATE
-        -Wl,--wrap=_ZN8passwall8services10RestoreJob17siblingWorkerPathEv -Wl,--wrap=fsync -Wl,--wrap=send)
+        -Wl,--wrap=_ZN8passwall8services10RestoreJob17siblingWorkerPathEv -Wl,--wrap=fsync -Wl,--wrap=send
+        -Wl,--wrap=fstatfs)
     target_compile_definitions(passwall_gui_tests PRIVATE
         EXPORT_FAKE_WORKER="$<TARGET_FILE:passwall_fake_backup_worker>")
     target_link_options(passwall_gui_tests PRIVATE
