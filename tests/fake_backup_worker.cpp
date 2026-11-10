@@ -1,6 +1,7 @@
 // Deliberately faulty protocol peer. Never linked to production.
 #include "services/backup_protocol.hpp"
 #include "services/backup_rotation_service.hpp"
+#include "posix_test_io.hpp"
 #include <QCoreApplication>
 #include <QFile>
 #include <QThread>
@@ -13,7 +14,7 @@ int main(int argc, char** argv)
     QCoreApplication application(argc, argv);
     QByteArray bytes;
     char byte;
-    while (::read(0, &byte, 1) == 1 && bytes.size() < 32768) {
+    while (passwall::test_io::readSome(0, &byte, 1) == 1 && bytes.size() < 32768) {
         bytes += byte;
         if (byte == '\n') break;
     }
@@ -33,11 +34,11 @@ int main(int argc, char** argv)
         if (fault.open(QIODevice::ReadOnly)) {
             const auto mode = fault.readAll();
             if (mode == "missing") return 0;
-            if (mode == "malformed") { (void)::write(1, "invalid", 7); return 0; }
+            if (mode == "malformed") return passwall::test_io::writeAll(1, "invalid", 7) ? 0 : 1;
         }
         const auto result = backup_protocol::rotationResult(BackupRotationService::rotate(
             context.settingsFile, context.localId, context.attempt, source, reservation));
-        return ::write(1, result.constData(), result.size()) == result.size() ? 0 : 1;
+        return passwall::test_io::writeAll(1, result.constData(), result.size()) ? 0 : 1;
     }
     QString mode = source.mid(1);
     QFile selection(source + ".fake-mode");
@@ -56,12 +57,11 @@ int main(int argc, char** argv)
     }
     if (mode == "crash") { ::raise(SIGKILL); return 1; }
     if (mode == "missing") return 0;
-    if (mode == "malformed") { (void)::write(1, "not-json", 8); return 0; }
-    if (mode == "partial") { (void)::write(1, "{\"v\":1", 6); return 0; }
+    if (mode == "malformed") return passwall::test_io::writeAll(1, "not-json", 8) ? 0 : 1;
+    if (mode == "partial") return passwall::test_io::writeAll(1, "{\"v\":1", 6) ? 0 : 1;
     if (mode == "oversize") {
         const QByteArray flood(65536, 'x');
-        (void)::write(1, flood.constData(), flood.size());
-        return 0;
+        return passwall::test_io::writeAll(1, flood.constData(), flood.size()) ? 0 : 1;
     }
     if (mode == "ignore") {
         for (;;) ::pause();
@@ -75,7 +75,7 @@ int main(int argc, char** argv)
     if (mode == "cancel" || mode == "late") {
         struct pollfd input{0, POLLIN, 0};
         if (::poll(&input, 1, 5000) <= 0) return 1;
-        if (::read(0, &byte, 1) < 0) return 1;
+        if (passwall::test_io::readSome(0, &byte, 1) < 0) return 1;
     }
     const auto outcome = mode == "cancel" ? BackupOutcome::CancelledBeforePublication :
         (mode == "failed" || mode == "enospc") ? BackupOutcome::FailedBeforePublication :
@@ -89,6 +89,6 @@ int main(int argc, char** argv)
     const auto result = backup_protocol::result(value);
     // Fragmented output is legal; terminal parsing occurs only after exit.
     for (auto part : {result.first(5), result.sliced(5)})
-        if (::write(1, part.constData(), part.size()) != part.size()) return 1;
+        if (!passwall::test_io::writeAll(1, part.constData(), part.size())) return 1;
     return 0;
 }

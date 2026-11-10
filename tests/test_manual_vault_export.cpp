@@ -71,6 +71,18 @@ extern "C" void wrappedExportTerminate(QProcess* process)
     else realExportTerminate(process);
 }
 
+// Reuse the same isolated Qt stop wrappers for the restore supervisor tests.
+// This models an unconfirmed stop, not an actual unkillable kernel process.
+namespace passwall::tests {
+void suppressGuiStopsForRestore(bool value) { suppressExportStops = value; }
+bool guiRestoreStopWasRequested() { return !suppressedExportProcess.isNull(); }
+void releaseGuiRestoreStop() {
+    suppressExportStops = false;
+    if (suppressedExportProcess) realExportKill(suppressedExportProcess);
+    suppressedExportProcess.clear();
+}
+}
+
 // Test-only linker instrumentation. No factory, executable override or fake
 // locking implementation is exposed in the production MainWindow API.
 extern "C" QString realWorkerPath() asm("__real__ZN8passwall8services9BackupJob17siblingWorkerPathEv");

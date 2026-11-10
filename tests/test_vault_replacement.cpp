@@ -19,6 +19,7 @@
 #include <QTemporaryDir>
 #include <QUuid>
 #include <type_traits>
+#include <climits>
 #include <cerrno>
 #include <cstdarg>
 #include <cstring>
@@ -41,6 +42,11 @@ public:
         const QString& id, QString& error) {
         return VaultReplacementAuthorization::acknowledge(
             VaultReplacementAuthorization::reserve(store, id, [] { return true; }, error), error);
+    }
+    static VaultReplacementAuthorization issueWithValidation(const VaultPreferencesStore& store,
+        const QString& id, std::function<bool()> check, QString& error) {
+        return VaultReplacementAuthorization::acknowledge(
+            VaultReplacementAuthorization::reserve(store, id, std::move(check), error), error);
     }
     static auto reserve(const VaultPreferencesStore& store, const QString& id, QString& error) {
         return VaultReplacementAuthorization::reserve(store, id, [] { return true; }, error);
@@ -243,6 +249,14 @@ extern "C" void __wrap__ZN9QSettings4syncEv(QSettings* settings) {
 namespace {
 TEST_F(VaultReplacementTest, DefaultAuthorityIsNotADeclarationOfCleanup) {
     Authorization empty; EXPECT_FALSE(empty.valid(error)); EXPECT_FALSE(error.isEmpty());
+}
+TEST_F(VaultReplacementTest, OwnerProtectionIsRevalidatedAfterPersistentInspection) {
+    int calls = 0, rejectOn = INT_MAX;
+    auto authority = ReplacementTestAccess::issueWithValidation(store(), registered.localId,
+        [&] { return ++calls < rejectOn; }, error);
+    ASSERT_TRUE(authority.valid(error));
+    rejectOn = calls + 2; // First check is healthy, final post-I/O check is not.
+    EXPECT_FALSE(authority.valid(error)); EXPECT_FALSE(error.isEmpty());
 }
 TEST_F(VaultReplacementTest, BoundToOneRegistrationAndUniqueOperation) {
     auto a = issue(); ASSERT_TRUE(a.valid(error)); EXPECT_EQ(a.localId(), registered.localId);

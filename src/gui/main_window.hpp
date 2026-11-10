@@ -11,6 +11,9 @@
 #include <QTimer>
 #include <QJsonObject>
 #include <QPointer>
+#ifdef Q_OS_LINUX
+#include "services/restore_job.hpp"
+#endif
 
 #include <cstdint>
 #include <functional>
@@ -52,13 +55,21 @@ public:
     void setLifecycleProtectionValidator(std::function<bool()> check,
                                          std::function<void()> invalidate);
     // Owner-thread only. Completion is queued AFTER the outer lock returns,
-    // never on vaultSessionInvalidated. true confirms accessible cleanup,
+    // never on vaultSessionInvalidated. true also waits for delegated secret
+    // cleanup/actual termination, not just local cleanup or a cancel request;
+    // it confirms accessible cleanup,
     // not erasure of historical Qt/kernel copies. No unlock operation.
     void requestExternalLock(std::function<void(bool)> completion);
     // Internal 6A entry point, no restore GUI or replacement. Owner-thread only.
     // The only production issuer is this real cleanup/acknowledgement path.
     void requestReplacementAuthorization(const QString& localId,
         std::function<void(services::VaultReplacementAuthorization, QString)> completion);
+#ifdef Q_OS_LINUX
+    // Internal pilot API, no restore GUI. Only an authority issued by THIS
+    // MainWindow can be consumed. Returned facade remains owned by the window.
+    services::RestoreJob* startReplacementOperation(services::VaultReplacementAuthorization,
+        const QString& source, core::SecureBuffer password, const QString& precaution);
+#endif
     [[nodiscard]] native::NativeRequestResponse handleNativeRequest(
         const QJsonObject& request);
 
@@ -119,6 +130,7 @@ private:
     void updateSessionAccessUi();
     [[nodiscard]] bool isFullyLocked() const;
     [[nodiscard]] bool recoveryAllowsCurrentSession() const noexcept;
+    void revokeReplacement() noexcept;
     void updateInactivityTimer();
     [[nodiscard]] bool beginUnlockedSession() noexcept;
     [[nodiscard]] native::VaultAccessResult leaseFailureResult(
@@ -167,6 +179,12 @@ private:
     bool externalLockClosing_ = false;
     bool replacementTransition_ = false;
     std::weak_ptr<services::VaultReplacementAuthorization::State> replacement_;
+    std::uint64_t replacementGeneration_ = 1; // Also changes on repeated locks.
+#ifdef Q_OS_LINUX
+    QPointer<services::RestoreJob> restoreJob_;
+    bool restoreSecretsPending_ = false;
+    void completeRestoreCleanup();
+#endif
     struct LifecycleProtectionValidator {
         std::function<bool()> check;
         std::function<void()> invalidate;

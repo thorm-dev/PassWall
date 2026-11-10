@@ -3,6 +3,7 @@
 #include "services/credential_service.hpp"
 #include "storage/sqlite_connection_config.hpp"
 #include "storage/vault_storage.hpp"
+#include "posix_test_io.hpp"
 
 #include <gtest/gtest.h>
 #include <sqlite3.h>
@@ -364,10 +365,11 @@ extern "C" int __wrap_linkat(int from, const char* oldName, int to, const char* 
     }
     if (inject(Fault::DestinationRace)) {
         const int fd = ::openat(to, newName, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        EXPECT_GE(fd, 0) << "Fictitious destination collision setup failed.";
         if (fd >= 0) {
             constexpr char marker[] = "external-test-file";
-            (void)::write(fd, marker, sizeof(marker) - 1);
-            ::close(fd);
+            EXPECT_TRUE(passwall::test_io::writeAll(fd, marker, sizeof(marker) - 1));
+            EXPECT_EQ(::close(fd), 0);
         }
     }
     const int code = __real_linkat(from, oldName, to, newName, flags);

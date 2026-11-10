@@ -2,6 +2,7 @@
 #include "storage/vault_storage.hpp"
 #include "services/vault_lifecycle_service.hpp"
 #include "services/credential_service.hpp"
+#include "posix_test_io.hpp"
 #include <gtest/gtest.h>
 #include <sodium.h>
 #include <QFile>
@@ -198,14 +199,14 @@ TEST_F(VaultOperationGuardTest, ChildRetainsKernelReservationAfterParentDropsIts
     const auto child = ::fork(); ASSERT_GE(child, 0);
     if (child == 0) {
         ::close(channel[1]); char byte;
-        (void)::read(channel[0], &byte, 1);
-        ::_exit(0); // OS closes the inherited open file descriptions.
+        const bool released = passwall::test_io::readSome(channel[0], &byte, 1) == 1 && byte == 'x';
+        ::_exit(released ? 0 : 1); // OS closes the inherited open file descriptions.
     }
     ::close(channel[0]);
     reservation.reset();
     VaultOperationGuard access;
     EXPECT_FALSE(access.tryAccess(path, error));
-    EXPECT_EQ(::write(channel[1], "x", 1), 1);
+    EXPECT_TRUE(passwall::test_io::writeAll(channel[1], "x", 1));
     ::close(channel[1]); int status;
     ASSERT_EQ(::waitpid(child, &status, 0), child);
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);

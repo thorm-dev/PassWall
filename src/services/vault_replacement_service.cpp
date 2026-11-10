@@ -147,6 +147,7 @@ struct Authentication {
     const StableSource& source;
     const QByteArray& expectedVaultId;
     QByteArray authenticatedDigest;
+    bool failed = false;
     static bool check(void* value, SnapshotCheckpoint) noexcept {
         auto& context = *static_cast<Authentication*>(value);
         try {
@@ -157,6 +158,7 @@ struct Authentication {
     }
     static bool verify(void* value, const std::string& path, std::string& error) {
         auto& context = *static_cast<Authentication*>(value);
+        context.failed = true;
         struct WipePassword {
             core::SecureBuffer& value;
             ~WipePassword() noexcept { value = core::SecureBuffer(0); }
@@ -170,7 +172,8 @@ struct Authentication {
         if (code != core::CryptoError::None) {
             error = "Mot de passe maître incorrect ou authentification du coffre impossible."; return false;
         }
-        if (!CredentialService::authenticateAll(path, key, error)) return false;
+        if (!CredentialService::authenticateAll(path, key, error,
+            [](void* p) noexcept { return check(p, SnapshotCheckpoint::BeforeValidation); }, &context)) return false;
         QString failure;
         if (!context.authority.valid(failure) || !context.source.unchanged(failure)) {
             error = "Source ou autorisation modifiée pendant l'authentification."; return false;
@@ -182,6 +185,7 @@ struct Authentication {
             error = "Empreinte du candidat authentifié non confirmée."; return false;
         }
         context.authenticatedDigest = hash.result();
+        context.failed = false;
         // No DEK/credential/password survives this hook, before private candidate
         // publication by the snapshot engine, let alone the principal exchange.
         return true;
@@ -250,6 +254,7 @@ bool VaultReplacementAuthorization::replacePrincipal(const QString& requestedPri
         SnapshotResult snapshot;
         const bool copied = VaultSnapshotService::createSnapshot(source.toStdString(), candidatePath.toStdString(),
             snapshot, {&Authentication::check, &authentication}, {&Authentication::verify, &authentication});
+        result.sourceAuthenticationFailed = authentication.failed;
         password = core::SecureBuffer(0); // also when a pre-authentication snapshot check failed
         struct stat candidateFile {};
         if (::fstatat(candidate.directory.value, "candidate.db", &candidateFile, AT_SYMLINK_NOFOLLOW) == 0) {

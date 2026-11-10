@@ -1,6 +1,7 @@
 #include "gui/credential_editor_context.hpp"
 #include "gui/main_window.hpp"
 #include "services/credential_service.hpp"
+#include "services/restore_protocol.hpp"
 #include "storage/vault_operation_guard.hpp"
 #include "services/vault_lifecycle_service.hpp"
 #ifdef Q_OS_LINUX
@@ -34,6 +35,76 @@
 #include <QTemporaryDir>
 #include <QTextEdit>
 #include <QTimer>
+#include <QScopeGuard>
+#include <cstring>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
+#ifdef Q_OS_LINUX
+extern "C" QString wrappedRestoreWorkerPath() asm("__wrap__ZN8passwall8services10RestoreJob17siblingWorkerPathEv");
+extern "C" QString wrappedRestoreWorkerPath() { return QString::fromUtf8(RESTORE_TEST_WORKER); }
+namespace {
+std::atomic<bool> pausePreparationSync{false}, preparationSyncEntered{false}, releasePreparationSync{false};
+std::atomic<bool> failPreparationSync{false};
+std::mutex preparationSyncMutex;
+std::condition_variable preparationSyncCondition;
+const auto guiTestThread = std::this_thread::get_id();
+}
+extern "C" int __real_fsync(int);
+extern "C" int __wrap_fsync(int fd) {
+    if (std::this_thread::get_id() != guiTestThread && failPreparationSync.exchange(false)) {
+        errno = EIO; return -1;
+    }
+    if (pausePreparationSync && std::this_thread::get_id() != guiTestThread) {
+        preparationSyncEntered = true;
+        std::unique_lock lock(preparationSyncMutex);
+        preparationSyncCondition.wait(lock, [] { return releasePreparationSync.load(); });
+    }
+    return __real_fsync(fd);
+}
+namespace {
+thread_local QString restoreGrantFault;
+thread_local int restoreSendSlice = 0, restoreSendInterruptions = 0;
+thread_local bool restorePasswordHeaderSent = false;
+}
+extern "C" ssize_t __real_send(int, const void*, size_t, int);
+extern "C" ssize_t __wrap_send(int fd, const void* data, size_t size, int flags) {
+    namespace wire = passwall::services::restore_protocol;
+    const auto* bytes = static_cast<const char*>(data);
+    if (size >= 5 && static_cast<unsigned char>(bytes[4]) == wire::Password
+        && qFromLittleEndian<quint32>(bytes) <= wire::passwordLimit) restorePasswordHeaderSent = true;
+    if (size > 5 && static_cast<unsigned char>(bytes[4]) == wire::Begin && !restoreGrantFault.isEmpty()) {
+        const auto original = QByteArray::fromRawData(bytes + 5, size - 5);
+        auto message = QJsonDocument::fromJson(original).object(); auto grant = message["grant"].toObject();
+        const auto different = [](QString value) { value[0] = value[0] == '0' ? '1' : '0'; return value; };
+        if (restoreGrantFault == "uuid") grant["operation"] = message["operation"] = different(message["operation"].toString());
+        if (restoreGrantFault == "principal") grant["principal"] = grant["principal"].toString() + ".other";
+        if (restoreGrantFault == "vault") grant["vault"] = different(grant["vault"].toString());
+        if (restoreGrantFault == "inode") grant["inode"] = "0";
+        if (restoreGrantFault == "session") message["session"] = different(message["session"].toString());
+        if (restoreGrantFault == "protocol") message["v"] = 2;
+        message["grant"] = grant;
+        auto changed = QJsonDocument(message).toJson(QJsonDocument::Compact);
+        const auto header = wire::header(wire::Begin, changed.size());
+        changed.prepend(header.data(), header.size());
+        if (restoreGrantFault == "duplicate") changed += changed;
+        const auto sent = __real_send(fd, changed.constData(), changed.size(), flags);
+        return sent == changed.size() ? ssize_t(size) : -1;
+    }
+    if (restoreSendInterruptions > 0) { errno = restoreSendInterruptions-- == 2 ? EINTR : EAGAIN; return -1; }
+    return __real_send(fd, data, restoreSendSlice ? std::min<size_t>(size, restoreSendSlice) : size, flags);
+}
+namespace passwall::tests {
+void suppressGuiStopsForRestore(bool);
+bool guiRestoreStopWasRequested();
+void releaseGuiRestoreStop();
+}
+#endif
 
 #include <functional>
 #include <array>
@@ -242,8 +313,9 @@ protected:
     static void SetUpTestSuite()
     {
         ASSERT_GE(sodium_init(), 0);
-        suiteDirectory = std::make_unique<QTemporaryDir>(
-            QStringLiteral("/tmp/passwall-editor-lock-suite-XXXXXX"));
+        const auto root = qEnvironmentVariable("PW_RESTORE_PARENT_ROOT");
+        suiteDirectory = std::make_unique<QTemporaryDir>(root.isEmpty()
+            ? QStringLiteral("/tmp/passwall-editor-lock-suite-XXXXXX") : root + "/suite-XXXXXX");
         ASSERT_TRUE(suiteDirectory->isValid());
         QSettings::setDefaultFormat(QSettings::IniFormat);
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope,
@@ -272,8 +344,9 @@ protected:
 
     void SetUp() override
     {
-        testDirectory = std::make_unique<QTemporaryDir>(
-            QStringLiteral("/tmp/passwall-editor-lock-case-XXXXXX"));
+        const auto root = qEnvironmentVariable("PW_RESTORE_PARENT_ROOT");
+        testDirectory = std::make_unique<QTemporaryDir>(root.isEmpty()
+            ? QStringLiteral("/tmp/passwall-editor-lock-case-XXXXXX") : root + "/case-XXXXXX");
         ASSERT_TRUE(testDirectory->isValid());
         vaultPath = testDirectory->filePath(QStringLiteral("vault.pwdb"));
         ASSERT_TRUE(QFile::copy(
@@ -449,6 +522,52 @@ protected:
             vaultPath.toStdString(), verificationKey, summaries, error));
         EXPECT_EQ(summaries.size(), expected);
     }
+#ifdef Q_OS_LINUX
+    passwall::services::VaultReplacementAuthorization prepareReplacement()
+    {
+        using namespace passwall::services;
+        QVector<VaultRegistration> records; QString error;
+        if (!VaultPreferencesStore().list(records, error) || records.size() != 1) { ADD_FAILURE(); return {}; }
+        std::optional<VaultReplacementAuthorization> authority;
+        window->requestReplacementAuthorization(records[0].localId,
+            [&](VaultReplacementAuthorization value, QString failure) {
+                error = failure; authority.emplace(std::move(value));
+            });
+        if (!passwall::tests::waitFor([&] { return authority.has_value(); }, 10000)) { ADD_FAILURE(); return {}; }
+        EXPECT_TRUE(authority->valid(error)) << error.toStdString();
+        return std::move(*authority);
+    }
+    QString restoreSource()
+    {
+        const auto path = testDirectory->filePath("selected-restore.db");
+        EXPECT_TRUE(QFile::copy(vaultPath, path)); return path;
+    }
+    static QByteArray encryptedBytes(const QString& path)
+    {
+        QFile file(path); if (!file.open(QIODevice::ReadOnly)) { ADD_FAILURE(); return {}; }
+        return file.readAll();
+    }
+    struct RestoreObservation {
+        passwall::services::RestoreResult result;
+        passwall::services::RestoreCleanup cleanup = passwall::services::RestoreCleanup::Pending;
+        bool finished = false, terminated = false, received = false;
+    };
+    passwall::services::RestoreJob* startRestore(RestoreObservation& o, const QString& source, bool wrong = false)
+    {
+        auto authority = prepareReplacement();
+        const std::string_view text = wrong ? "fictitious-wrong-master" : "fictitious-master-password";
+        SecureBuffer password(text.size()); std::memcpy(password.data(), text.data(), text.size());
+        auto* job = window->startReplacementOperation(std::move(authority), source, std::move(password),
+            testDirectory->filePath("exceptional-precaution.db"));
+        if (!job) { ADD_FAILURE(); return nullptr; }
+        using Job = passwall::services::RestoreJob;
+        QObject::connect(job, &Job::finished, window.get(), [&](auto r) { o.result = r; o.finished = true; });
+        QObject::connect(job, &Job::resultReceived, window.get(), [&](auto) { o.received = true; });
+        QObject::connect(job, &Job::secretsCleared, window.get(), [&](auto p) { o.cleanup = p; });
+        QObject::connect(job, &Job::processTerminated, window.get(), [&] { o.terminated = true; });
+        return job;
+    }
+#endif
 
     void rejectInvalidRequiredFields(bool adding)
     {
@@ -609,6 +728,469 @@ protected:
 };
 
 #ifdef Q_OS_LINUX
+TEST_F(MainWindowEditorLockTest, ReplacementPreparationDoesNotBlockGuiAndLateResultCannotAuthorizeAfterRepeatedLock)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error;
+    ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    preparationSyncEntered = false; releasePreparationSync = false; pausePreparationSync = true;
+    bool complete = false, authorized = true;
+    const auto release = qScopeGuard([&] {
+        releasePreparationSync = true; preparationSyncCondition.notify_all(); pausePreparationSync = false;
+        passwall::tests::waitFor([&] { return complete; }, 10000);
+    });
+    int ticks = 0; QTimer heartbeat;
+    QObject::connect(&heartbeat, &QTimer::timeout, [&] { ++ticks; }); heartbeat.start(0);
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+        authorized = a.valid(error); complete = true;
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([] { return preparationSyncEntered.load(); }, 10000));
+    EXPECT_FALSE(complete); EXPECT_GT(ticks, 0); EXPECT_FALSE(window->acquireLease().unlocked);
+    bool cleaned = false;
+    window->requestExternalLock([&](bool value) { cleaned = value; });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return cleaned; }));
+    window->requestExternalLock([](bool) {}); // Already locked: still invalidates preparation generation.
+    releasePreparationSync = true; preparationSyncCondition.notify_all();
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return complete; }, 10000)); EXPECT_FALSE(authorized);
+}
+TEST_F(MainWindowEditorLockTest, RestoreRealWorkerUsesIssuedAuthorityAndCleansBeforePublication)
+{
+    using namespace passwall::services;
+    const auto source = restoreSource(); const auto oldLease = window->acquireLease();
+    const auto before = encryptedBytes(vaultPath);
+    RestoreObservation o; auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    bool cleanBeforeCandidate = false; int ticks = 0; QTimer heartbeat;
+    QObject::connect(&heartbeat, &QTimer::timeout, [&] { ++ticks; }); heartbeat.start(0);
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto phase) {
+        if (phase == ReplacementCheckpoint::CandidateStaged) {
+            cleanBeforeCandidate = o.cleanup == RestoreCleanup::ConfirmedByWorker;
+            passwall::storage::VaultOperationGuard access; std::string error;
+            EXPECT_FALSE(access.tryAccess(vaultPath.toStdString(), error));
+        }
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 15000));
+    ASSERT_TRUE(o.finished); EXPECT_TRUE(o.received); EXPECT_GT(ticks, 1);
+    ASSERT_EQ(o.result.outcome, RestoreOutcome::EngineResult) << o.result.diagnostic.toStdString();
+    ASSERT_EQ(o.result.replacement.outcome, ReplacementOutcome::Replaced) << o.result.replacement.diagnostic.toStdString();
+    EXPECT_TRUE(cleanBeforeCandidate); EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_FALSE(window->isLeaseCurrent(oldLease));
+    EXPECT_TRUE(QFile::exists(o.result.replacement.recoveryArtifact));
+    EXPECT_TRUE(encryptedBytes(o.result.replacement.recoveryArtifact) == before);
+    EXPECT_TRUE(QFile::exists(testDirectory->filePath("exceptional-precaution.db")));
+    expectEntryCount(1); runBounded([&] { unlock(); });
+    EXPECT_TRUE(window->acquireLease().unlocked); EXPECT_FALSE(window->isLeaseCurrent(oldLease));
+}
+TEST_F(MainWindowEditorLockTest, ReplacementAsyncPersistenceErrorCannotIssueAuthorityOrKeepReservation)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    failPreparationSync = true;
+    const auto reset = qScopeGuard([] { failPreparationSync = false; });
+    bool complete = false, authorized = true;
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString e) {
+        authorized = a.valid(error); EXPECT_FALSE(e.isEmpty()); complete = true;
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return complete; }, 10000)); EXPECT_FALSE(authorized);
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    passwall::storage::VaultOperationGuard reserve; std::string failure;
+    EXPECT_TRUE(reserve.tryReserve(vaultPath.toStdString(), failure));
+}
+TEST_F(MainWindowEditorLockTest, ReplacementOwnerRefusesFileIdentityChangedDuringPreparationIo)
+{
+    using namespace passwall::services;
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    preparationSyncEntered = false; releasePreparationSync = false; pausePreparationSync = true;
+    bool complete = false, authorized = true;
+    const auto release = qScopeGuard([&] {
+        releasePreparationSync = true; preparationSyncCondition.notify_all(); pausePreparationSync = false;
+        passwall::tests::waitFor([&] { return complete; }, 10000);
+    });
+    window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+        authorized = a.valid(error); complete = true;
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([] { return preparationSyncEntered.load(); }, 10000));
+    const auto displaced = testDirectory->filePath("externally-moved-principal.db");
+    ASSERT_TRUE(QFile::rename(vaultPath, displaced)); ASSERT_TRUE(QFile::copy(displaced, vaultPath));
+    releasePreparationSync = true; preparationSyncCondition.notify_all();
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return complete; }, 10000)); EXPECT_FALSE(authorized);
+    EXPECT_TRUE(QFile::exists(displaced)); EXPECT_FALSE(window->acquireLease().unlocked);
+}
+TEST_F(MainWindowEditorLockTest, RestoreWrongPasswordDoesNotReplaceOrPublishSession)
+{
+    using namespace passwall::services;
+    const auto source = restoreSource(); const auto before = encryptedBytes(vaultPath);
+    RestoreObservation o; ASSERT_NE(startRestore(o, source, true), nullptr);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 15000));
+    EXPECT_EQ(o.result.outcome, RestoreOutcome::SourceAuthenticationFailed);
+    EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::NotReplaced);
+    EXPECT_EQ(o.cleanup, RestoreCleanup::ConfirmedByWorker);
+    EXPECT_TRUE(encryptedBytes(vaultPath) == before); EXPECT_FALSE(window->acquireLease().unlocked);
+}
+TEST_F(MainWindowEditorLockTest, RestoreSecurityLockWaitsForRemoteCleanupNotCancellationRequest)
+{
+    using namespace passwall::services;
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    bool ack = false, requested = false;
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto p) {
+        if (p != ReplacementCheckpoint::BeforeWork) return;
+        requested = true; EXPECT_EQ(o.cleanup, RestoreCleanup::Pending);
+        window->requestExternalLock([&](bool value) {
+            EXPECT_NE(o.cleanup, RestoreCleanup::Pending); ack = value;
+        });
+        EXPECT_FALSE(ack); EXPECT_FALSE(window->acquireLease().unlocked);
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated && ack; }, 15000));
+    EXPECT_TRUE(requested); EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::CancelledBeforeEngagement);
+}
+TEST_F(MainWindowEditorLockTest, RestoreLinuxProtectionLossDefersInhibitorAcknowledgementUntilCleanup)
+{
+    using namespace passwall::services;
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    bool ack = false, requested = false;
+    QObject::connect(window.get(), &MainWindow::lifecycleSecretsCleared, window.get(), [&] {
+        EXPECT_NE(o.cleanup, RestoreCleanup::Pending); ack = true;
+    });
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto p) {
+        if (p != ReplacementCheckpoint::BeforeWork) return;
+        requested = true; window->setLifecycleProtectionAvailable(false); EXPECT_FALSE(ack);
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated && ack; }, 15000));
+    EXPECT_TRUE(requested); EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::CancelledBeforeEngagement);
+}
+TEST_F(MainWindowEditorLockTest, RestoreSleepPreparationRetainsActualInhibitorUntilRemoteSecretProof)
+{
+    using namespace passwall::services;
+    passwall::tests::FakeLogin1Backend* backend;
+    auto monitor = attachMonitor(backend); establishProtection(*backend);
+    runBounded([&] { unlock(); });
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr); bool proof = false, requested = false;
+    QObject::connect(job, &RestoreJob::secretsCleared, window.get(), [&](auto) {
+        proof = true; EXPECT_TRUE(backend->inhibitorHeld(0));
+    });
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto p) {
+        if (p != ReplacementCheckpoint::BeforeWork) return;
+        requested = true; emit backend->prepareForSleep(true);
+        EXPECT_TRUE(backend->inhibitorHeld(0)); EXPECT_FALSE(proof); EXPECT_FALSE(monitor->protectionAvailable());
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated && proof && !backend->inhibitorHeld(0); }, 15000));
+    EXPECT_TRUE(requested); EXPECT_FALSE(window->acquireLease().unlocked);
+}
+TEST_F(MainWindowEditorLockTest, RestoreControl1OverPrivateBusCannotReplyBeforeGlobalCleanup)
+{
+    using namespace passwall::services;
+    ControlHarness control(*window); ASSERT_TRUE(control.ready());
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    std::optional<QDBusPendingReply<>> reply;
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto p) {
+        if (p == ReplacementCheckpoint::BeforeWork) reply.emplace(control.request());
+    });
+    bool premature = false; QTimer watch;
+    QObject::connect(&watch, &QTimer::timeout, [&] {
+        if (reply && reply->isFinished() && !reply->isError() && o.cleanup == RestoreCleanup::Pending) premature = true;
+    });
+    watch.start(0);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated && reply && reply->isFinished(); }, 15000));
+    EXPECT_FALSE(reply->isError()); EXPECT_EQ(control.received, 1); EXPECT_FALSE(premature);
+    EXPECT_NE(o.cleanup, RestoreCleanup::Pending); EXPECT_FALSE(window->acquireLease().unlocked);
+}
+TEST_F(MainWindowEditorLockTest, RestoreCancellationBeforeArmKeepsPreparedRecoveryAndPrincipal)
+{
+    using namespace passwall::services;
+    const auto source = restoreSource(); const auto before = encryptedBytes(vaultPath);
+    RestoreObservation o; auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [job](auto p) {
+        if (p == ReplacementCheckpoint::BeforeArm) job->cancel();
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 15000));
+    EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::CancelledBeforeEngagement);
+    EXPECT_TRUE(encryptedBytes(vaultPath) == before);
+    QString error; EXPECT_EQ(VaultPreferencesStore().recoveryAccess(vaultPath, error), VaultRecoveryAccess::RecoveryRequired);
+}
+TEST_F(MainWindowEditorLockTest, RestoreCancellationAfterArmCannotClaimNoEngagement)
+{
+    using namespace passwall::services;
+    const auto source = restoreSource(); const auto before = encryptedBytes(vaultPath);
+    RestoreObservation o; auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [job](auto p) {
+        if (p == ReplacementCheckpoint::Armed) job->cancel();
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 15000));
+    EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::EngagedRecoveryRequired);
+    EXPECT_TRUE(encryptedBytes(vaultPath) == before); EXPECT_TRUE(QFile::exists(o.result.replacement.recoveryArtifact));
+}
+TEST_F(MainWindowEditorLockTest, RestoreCancellationAfterExchangePreservesActualReplacement)
+{
+    using namespace passwall::services;
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [job](auto p) {
+        if (p == ReplacementCheckpoint::AfterExchange) job->cancel();
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 15000));
+    EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::ReplacedDurabilityUnconfirmed);
+    EXPECT_TRUE(QFile::exists(o.result.replacement.recoveryArtifact)); EXPECT_FALSE(window->acquireLease().unlocked);
+}
+TEST_F(MainWindowEditorLockTest, RestoreSourceMutationAfterAuthenticationRefusesExchange)
+{
+    using namespace passwall::services;
+    const auto source = restoreSource(); const auto before = encryptedBytes(vaultPath);
+    RestoreObservation o; auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto p) {
+        if (p == ReplacementCheckpoint::SourceAuthenticated) {
+            QFile f(source); ASSERT_TRUE(f.open(QIODevice::WriteOnly | QIODevice::Append)); ASSERT_EQ(f.write("!", 1), 1);
+        }
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 15000));
+    EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::NotReplaced); EXPECT_TRUE(encryptedBytes(vaultPath) == before);
+}
+TEST_F(MainWindowEditorLockTest, RestoreCannotIssueASecondAuthorityOrReuseTheMovedOne)
+{
+    using namespace passwall::services;
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    bool refused = false;
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto p) {
+        if (p != ReplacementCheckpoint::BeforeWork) return;
+        QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+        window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
+            refused = !a.valid(error);
+        });
+        job->cancel();
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 15000)); EXPECT_TRUE(refused);
+}
+TEST_F(MainWindowEditorLockTest, RestorePartialWritesEintrAndEagainDoNotCopyPasswordIntoQt)
+{
+    using namespace passwall::services;
+    const auto reset = qScopeGuard([] { restoreSendSlice = 0; restoreSendInterruptions = 0; });
+    restoreSendSlice = 1; restoreSendInterruptions = 2;
+    const auto source = restoreSource(); RestoreObservation o;
+    ASSERT_NE(startRestore(o, source), nullptr);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 20000));
+    EXPECT_EQ(o.result.outcome, RestoreOutcome::EngineResult);
+    EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::Replaced);
+    EXPECT_EQ(o.cleanup, RestoreCleanup::ConfirmedByWorker);
+}
+class RestoreDelegationRejectTest : public MainWindowEditorLockTest, public ::testing::WithParamInterface<const char*> {};
+TEST_P(RestoreDelegationRejectTest, CorruptedDelegationNeverReceivesPasswordOrChangesPrincipal)
+{
+    using namespace passwall::services;
+    const auto reset = qScopeGuard([] { restoreGrantFault.clear(); restorePasswordHeaderSent = false; });
+    restoreGrantFault = QString::fromLatin1(GetParam()); restorePasswordHeaderSent = false;
+    const auto source = restoreSource(); const auto before = encryptedBytes(vaultPath);
+    RestoreObservation o; ASSERT_NE(startRestore(o, source), nullptr);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 10000));
+    EXPECT_FALSE(restorePasswordHeaderSent); EXPECT_TRUE(encryptedBytes(vaultPath) == before);
+    EXPECT_TRUE(o.result.outcome == RestoreOutcome::Unknown || o.result.outcome == RestoreOutcome::Refused);
+    EXPECT_FALSE(window->acquireLease().unlocked);
+}
+INSTANTIATE_TEST_SUITE_P(PrivateProtocol, RestoreDelegationRejectTest,
+    ::testing::Values("uuid", "principal", "vault", "inode", "session", "protocol", "duplicate"));
+class RestoreTerminalRejectTest : public MainWindowEditorLockTest, public ::testing::WithParamInterface<const char*> {};
+TEST_P(RestoreTerminalRejectTest, DataAfterTerminalResultCannotBecomeFullSuccess)
+{
+    using namespace passwall::services;
+    const auto reset = qScopeGuard([] { qunsetenv("PW_RESTORE_TRAILING_RESULT"); });
+    qputenv("PW_RESTORE_TRAILING_RESULT", GetParam());
+    const auto source = restoreSource(); RestoreObservation o;
+    ASSERT_NE(startRestore(o, source), nullptr);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 15000));
+    EXPECT_EQ(o.result.outcome, RestoreOutcome::Unknown);
+    EXPECT_TRUE(o.result.diagnostic.contains(QStringLiteral("protocole invalide")));
+    EXPECT_TRUE(o.result.replacementStatusKnown); // The first valid business record is not retracted.
+    EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::Replaced);
+    EXPECT_TRUE(QFile::exists(o.result.replacement.recoveryArtifact));
+}
+INSTANTIATE_TEST_SUITE_P(TerminalProtocol, RestoreTerminalRejectTest, ::testing::Values("byte", "duplicate"));
+
+TEST_F(MainWindowEditorLockTest, RestoreResultDoesNotReleaseNewInodeReservationBeforeActualExit)
+{
+    using namespace passwall::services;
+    const auto fifo = testDirectory->filePath("result-release.fifo");
+    ASSERT_EQ(::mkfifo(QFile::encodeName(fifo), 0600), 0);
+    const int releaseFd = ::open(QFile::encodeName(fifo), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    ASSERT_GE(releaseFd, 0);
+    const auto release = qScopeGuard([&] {
+        char byte = '!'; const auto sent = ::write(releaseFd, &byte, 1); EXPECT_EQ(sent, 1);
+        ::close(releaseFd); qunsetenv("PW_RESTORE_HOLD_RESULT");
+    });
+    qputenv("PW_RESTORE_HOLD_RESULT", QFile::encodeName(fifo));
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.received; }, 15000));
+    EXPECT_TRUE(job->isActive()); EXPECT_FALSE(o.finished); EXPECT_FALSE(o.terminated);
+    EXPECT_EQ(o.cleanup, RestoreCleanup::ConfirmedByWorker);
+    passwall::storage::VaultOperationGuard access; std::string error;
+    EXPECT_FALSE(access.tryAccess(vaultPath.toStdString(), error));
+    // A hard-link alias is rejected for a separate reason. Reserve the new
+    // inode's recovery-name counterpart too: both participating names stay held.
+    QVector<VaultRegistration> records; QString failure;
+    ASSERT_TRUE(VaultPreferencesStore().list(records, failure)); ASSERT_TRUE(records[0].resolvedReplacement);
+    const auto artifact = records[0].resolvedReplacement->recoveryArtifacts[0];
+    EXPECT_FALSE(access.tryAccess(artifact.toStdString(), error));
+    const auto alias = testDirectory->filePath("new-inode-alias.db");
+    ASSERT_EQ(::link(QFile::encodeName(vaultPath), QFile::encodeName(alias)), 0);
+    EXPECT_FALSE(access.tryAccess(alias.toStdString(), error)); EXPECT_TRUE(access.contended());
+    ASSERT_TRUE(QFile::remove(alias));
+    char byte = '!'; ASSERT_EQ(::write(releaseFd, &byte, 1), 1);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }));
+    EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::Replaced);
+    EXPECT_TRUE(access.tryAccess(vaultPath.toStdString(), error));
+}
+TEST_F(MainWindowEditorLockTest, RestoreUnknownWithLiveSensitiveWorkerCannotAcknowledgeCleanupOrReleaseLocks)
+{
+    using namespace passwall::services;
+    const auto fifo = testDirectory->filePath("sensitive-release.fifo");
+    ASSERT_EQ(::mkfifo(QFile::encodeName(fifo), 0600), 0);
+    const int releaseFd = ::open(QFile::encodeName(fifo), O_RDWR | O_NONBLOCK | O_CLOEXEC); ASSERT_GE(releaseFd, 0);
+    const auto release = qScopeGuard([&] {
+        passwall::tests::releaseGuiRestoreStop();
+        char byte = '!'; const auto sent = ::write(releaseFd, &byte, 1); EXPECT_EQ(sent, 1); ::close(releaseFd);
+        qunsetenv("PW_RESTORE_HOLD_PHASE"); qunsetenv("PW_RESTORE_HOLD_FIFO");
+    });
+    qputenv("PW_RESTORE_HOLD_PHASE", "0"); qputenv("PW_RESTORE_HOLD_FIFO", QFile::encodeName(fifo));
+    passwall::tests::suppressGuiStopsForRestore(true);
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr); bool ack = false;
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto phase) {
+        if (phase == ReplacementCheckpoint::BeforeWork) window->requestExternalLock([&](bool value) { ack = value; });
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.finished; }, 10000));
+    EXPECT_EQ(o.result.outcome, RestoreOutcome::Unknown); EXPECT_TRUE(job->isActive()); EXPECT_FALSE(o.terminated);
+    EXPECT_FALSE(o.result.replacementStatusKnown); // Default NotReplaced proves nothing.
+    EXPECT_EQ(o.cleanup, RestoreCleanup::Pending); EXPECT_FALSE(ack); EXPECT_TRUE(passwall::tests::guiRestoreStopWasRequested());
+    passwall::storage::VaultOperationGuard access; std::string error;
+    EXPECT_FALSE(access.tryAccess(vaultPath.toStdString(), error));
+    passwall::tests::releaseGuiRestoreStop();
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated && ack; }));
+    EXPECT_EQ(o.cleanup, RestoreCleanup::ConfirmedProcessTermination);
+}
+TEST_F(MainWindowEditorLockTest, RestoreAbnormalExitAfterResultPreservesKnownReplacementInsteadOfInventingNoReplacement)
+{
+    using namespace passwall::services;
+    const auto fifo = testDirectory->filePath("terminal-release.fifo");
+    ASSERT_EQ(::mkfifo(QFile::encodeName(fifo), 0600), 0);
+    const int releaseFd = ::open(QFile::encodeName(fifo), O_RDWR | O_NONBLOCK | O_CLOEXEC); ASSERT_GE(releaseFd, 0);
+    const auto release = qScopeGuard([&] {
+        char byte = '!'; const auto n = ::write(releaseFd, &byte, 1); EXPECT_EQ(n, 1); ::close(releaseFd);
+        qunsetenv("PW_RESTORE_HOLD_RESULT");
+    });
+    qputenv("PW_RESTORE_HOLD_RESULT", QFile::encodeName(fifo));
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.received; }, 15000));
+    job->cancel();
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 10000));
+    EXPECT_EQ(o.result.outcome, RestoreOutcome::Unknown);
+    EXPECT_TRUE(o.result.replacementStatusKnown);
+    EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::Replaced);
+    EXPECT_TRUE(QFile::exists(o.result.replacement.recoveryArtifact));
+}
+
+class RestoreCrashTest : public MainWindowEditorLockTest, public ::testing::WithParamInterface<int> {};
+TEST_P(RestoreCrashTest, ActualWorkerExitPreservesFenceAndNeverRepeatsExchange)
+{
+    using namespace passwall::services;
+    const int phase = GetParam();
+    const auto reset = qScopeGuard([] { qunsetenv("PW_RESTORE_CRASH_PHASE"); qunsetenv("PW_RESTORE_LOSE_RESULT"); });
+    if (phase < 0) qputenv("PW_RESTORE_LOSE_RESULT", "1");
+    else qputenv("PW_RESTORE_CRASH_PHASE", QByteArray::number(phase));
+    const auto source = restoreSource(); const auto before = encryptedBytes(vaultPath);
+    RestoreObservation o; ASSERT_NE(startRestore(o, source), nullptr);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 15000));
+    EXPECT_EQ(o.result.outcome, RestoreOutcome::Unknown); EXPECT_FALSE(window->acquireLease().unlocked);
+    QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    ASSERT_EQ(records.size(), 1); const auto& record = records[0];
+    const auto intent = record.replacement ? record.replacement : record.resolvedReplacement; ASSERT_TRUE(intent);
+    const auto recovery = VaultReplacementAuthorization::recoverReplacement(VaultPreferencesStore(), record.localId,
+        intent->operationId, ReplacementRecoveryAction::Inspect);
+    if (phase == int(ReplacementCheckpoint::BeforeWork)) {
+        EXPECT_EQ(recovery.layout, ReplacementLayout::PreparedIntact); EXPECT_TRUE(encryptedBytes(vaultPath) == before);
+        EXPECT_EQ(o.cleanup, RestoreCleanup::ConfirmedProcessTermination);
+    } else if (phase == int(ReplacementCheckpoint::Armed)) {
+        EXPECT_EQ(recovery.layout, ReplacementLayout::ArmedBeforeExchange); EXPECT_TRUE(encryptedBytes(vaultPath) == before);
+    } else if (phase == int(ReplacementCheckpoint::AfterExchange) || phase == int(ReplacementCheckpoint::AfterDirectorySync)) {
+        EXPECT_EQ(recovery.layout, ReplacementLayout::ArmedAfterExchange);
+        EXPECT_TRUE(encryptedBytes(intent->recoveryArtifacts[0]) == before);
+    } else EXPECT_EQ(recovery.layout, ReplacementLayout::Resolved);
+    // Inspection never substitutes/clears recovery or deletes the old principal.
+    EXPECT_TRUE(QFile::exists(vaultPath));
+}
+INSTANTIATE_TEST_SUITE_P(WorkerInterruptions, RestoreCrashTest, ::testing::Values(
+    int(passwall::services::ReplacementCheckpoint::BeforeWork),
+    int(passwall::services::ReplacementCheckpoint::Armed),
+    int(passwall::services::ReplacementCheckpoint::AfterExchange),
+    int(passwall::services::ReplacementCheckpoint::AfterDirectorySync), -1));
+TEST_F(MainWindowEditorLockTest, RestoreParentExitProbe)
+{
+    const auto root = qEnvironmentVariable("PW_RESTORE_PARENT_ROOT");
+    if (root.isEmpty()) GTEST_SKIP() << "Subprocess helper only";
+    using namespace passwall::services;
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr);
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto p) {
+        if (p != ReplacementCheckpoint::Armed) return;
+        QVector<VaultRegistration> records; QString error; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+        ASSERT_EQ(records.size(), 1); ASSERT_TRUE(records[0].replacement);
+        const QJsonObject object{{"config", VaultPreferencesStore().fileName()}, {"local", records[0].localId},
+            {"principal", vaultPath}, {"operation", records[0].replacement->operationId}};
+        QFile metadata(root + "/probe.json"); ASSERT_TRUE(metadata.open(QIODevice::WriteOnly));
+        const auto bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
+        ASSERT_EQ(metadata.write(bytes), bytes.size()); metadata.close(); ::_exit(88);
+    });
+    passwall::tests::waitFor([&] { return o.terminated; }, 15000);
+    FAIL() << "Parent crash checkpoint not reached";
+}
+TEST_F(MainWindowEditorLockTest, RestoreFacadeDestructionDoesNotLoseGlobalCleanupObservation)
+{
+    using namespace passwall::services;
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr); bool ack = false, destroyed = false;
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto p) {
+        if (p != ReplacementCheckpoint::BeforeWork) return;
+        delete job; destroyed = true;
+        window->requestExternalLock([&](bool value) { ack = value; }); EXPECT_FALSE(ack);
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return destroyed && ack; }, 10000));
+    passwall::storage::VaultOperationGuard access; std::string error;
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return access.tryAccess(vaultPath.toStdString(), error); }));
+    EXPECT_FALSE(window->acquireLease().unlocked);
+}
+TEST_F(MainWindowEditorLockTest, RestoreWindowCloseRequestsCancellationWithoutWaitingInGui)
+{
+    using namespace passwall::services;
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr); bool closed = false, eventProcessed = false;
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto p) {
+        if (p != ReplacementCheckpoint::BeforeWork) return;
+        closed = window->close(); EXPECT_FALSE(o.terminated);
+        QTimer::singleShot(0, window.get(), [&] { eventProcessed = true; });
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated && eventProcessed; }, 15000));
+    EXPECT_TRUE(closed); EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_EQ(o.result.replacement.outcome, ReplacementOutcome::CancelledBeforeEngagement);
+}
+TEST_F(MainWindowEditorLockTest, RestoreReservationDoesNotBlockBusinessOperationsOfAnotherVault)
+{
+    using namespace passwall::services;
+    const auto other = testDirectory->filePath("independent.db"); SecureBuffer otherKey(0); std::string failure;
+    ASSERT_TRUE(VaultLifecycleService::createVault(other.toStdString(), "fictitious-independent-master", otherKey, failure));
+    const auto source = restoreSource(); RestoreObservation o;
+    auto* job = startRestore(o, source); ASSERT_NE(job, nullptr); bool exercised = false;
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto p) {
+        if (p != ReplacementCheckpoint::BeforeWork) return;
+        auto credential = makeCredential(); const auto wipe = qScopeGuard([&] { wipeCredential(credential); });
+        EXPECT_TRUE(CredentialService::add(other.toStdString(), otherKey, credential, failure));
+        EXPECT_TRUE(CredentialService::update(other.toStdString(), otherKey, credential, failure));
+        EXPECT_TRUE(CredentialService::remove(other.toStdString(), otherKey, credential.id, failure));
+        exercised = true; job->cancel();
+    });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return o.terminated; }, 15000)); EXPECT_TRUE(exercised);
+}
 // These cases exercise the production issuer and real accessible cleanup,
 // unlike the isolated acknowledgement simulator in test_vault_replacement.cpp.
 TEST_F(MainWindowEditorLockTest, ReplacementAuthorizationFollowsRealCleanupAndNativeInvalidation)
@@ -659,7 +1241,7 @@ TEST_F(MainWindowEditorLockTest, ReplacementRefusesBusyReservationWithoutBlockin
     window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
         complete = true; EXPECT_FALSE(a.valid(error));
     });
-    EXPECT_TRUE(complete); EXPECT_TRUE(window->acquireLease().unlocked);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return complete; })); EXPECT_TRUE(window->acquireLease().unlocked);
 }
 TEST_F(MainWindowEditorLockTest, ReplacementDoesNotLockAnUnrelatedActiveVault)
 {
@@ -672,7 +1254,7 @@ TEST_F(MainWindowEditorLockTest, ReplacementDoesNotLockAnUnrelatedActiveVault)
     window->requestReplacementAuthorization(record.localId, [&](VaultReplacementAuthorization a, QString failure) {
         complete = true; EXPECT_FALSE(a.valid(error)); EXPECT_FALSE(failure.isEmpty());
     });
-    EXPECT_TRUE(complete); EXPECT_TRUE(window->isLeaseCurrent(lease));
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return complete; })); EXPECT_TRUE(window->isLeaseCurrent(lease));
 }
 TEST_F(MainWindowEditorLockTest, ReplacementBlocksReentrantAuthenticationBeforeAcknowledgement)
 {
@@ -749,7 +1331,7 @@ TEST_F(MainWindowEditorLockTest, ReplacementWindowDestructionCannotAcknowledgeOr
     window->requestReplacementAuthorization(records[0].localId, [&](VaultReplacementAuthorization a, QString) {
         complete = true; EXPECT_FALSE(a.valid(error));
     });
-    window.reset(); EXPECT_TRUE(complete); QApplication::processEvents();
+    window.reset(); ASSERT_TRUE(passwall::tests::waitFor([&] { return complete; })); QApplication::processEvents();
     passwall::storage::VaultOperationGuard reserve; std::string failure;
     EXPECT_TRUE(reserve.tryReserve(vaultPath.toStdString(), failure));
 }
@@ -2015,7 +2597,8 @@ int main(int argc, char** argv)
     // Explicit organization/application constructors use NativeFormat in Qt
     // 6.8.2, regardless of setDefaultFormat(). Isolate that format too, BEFORE
     // any fixture/window can read or write the user's personal configuration.
-    QTemporaryDir nativeSettings;
+    const auto probeRoot = qEnvironmentVariable("PW_RESTORE_PARENT_ROOT");
+    QTemporaryDir nativeSettings(probeRoot.isEmpty() ? QDir::tempPath() + "/pw-native-XXXXXX" : probeRoot + "/native-XXXXXX");
     if (!nativeSettings.isValid())
         return 1;
     QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, nativeSettings.path());

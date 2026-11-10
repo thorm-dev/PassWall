@@ -1126,6 +1126,12 @@ bool CredentialService::listSummaries(
 bool CredentialService::authenticateAll(
     const std::string& databasePath, const SecureBuffer& dataKey, std::string& error)
 {
+    return authenticateAll(databasePath, dataKey, error, nullptr, nullptr);
+}
+bool CredentialService::authenticateAll(
+    const std::string& databasePath, const SecureBuffer& dataKey, std::string& error,
+    bool (*cancelled)(void*) noexcept, void* context)
+{
     error.clear();
     if (!validKey(dataKey)) {
         error = "La clé du coffre est invalide ou le coffre est verrouillé.";
@@ -1139,6 +1145,10 @@ bool CredentialService::authenticateAll(
     if (!prepare(database.handle, "SELECT entry_id FROM entries ORDER BY entry_id;", statement, error))
         return false;
     for (;;) {
+        if (cancelled && cancelled(context)) {
+            error = "Authentification interrompue.";
+            return false;
+        }
         const int code = sqlite3_step(statement.handle);
         if (code == SQLITE_DONE) return true;
         if (code != SQLITE_ROW)

@@ -8,6 +8,7 @@
 #include <QFileInfo>
 #include <QUuid>
 #include <utility>
+#include <atomic>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -84,7 +85,8 @@ struct VaultReplacementAuthorization::State {
     VaultReplacementIntent intent;
     storage::VaultOperationGuard reservation, candidateReservation;
     std::function<bool()> cleanupStillValid;
-    bool live = true, acknowledged = false, persisted = false;
+    std::atomic<bool> live{true};
+    bool preparing = false, delegated = false, acknowledged = false, persisted = false;
     explicit State(VaultPreferencesStore value) : store(std::move(value)) {}
 };
 
@@ -102,6 +104,9 @@ void VaultReplacementAuthorization::revoke(const std::shared_ptr<State>& state) 
 {
     if (!state) return;
     state->live = false;
+    // The owner can revoke during secretless I/O, but must not close descriptors
+    // underneath that I/O. The task retains the state until finishPreparation.
+    if (state->preparing || state->delegated) return;
     state->reservation.reset();
     state->candidateReservation.reset();
 }
@@ -117,6 +122,61 @@ QString VaultReplacementAuthorization::operationId() const
 { return state_ ? state_->intent.operationId : QString{}; }
 QString VaultReplacementAuthorization::localId() const
 { return state_ ? state_->registration.localId : QString{}; }
+
+bool VaultReplacementAuthorization::delegationCurrent() const noexcept
+{
+    try {
+        return active(state_) && state_->acknowledged && state_->persisted
+            && state_->cleanupStillValid && state_->cleanupStillValid() && active(state_);
+    } catch (...) { return false; }
+}
+std::array<int, 2> VaultReplacementAuthorization::delegationHandles() const noexcept
+{ return state_ ? state_->reservation.inheritedHandles() : std::array<int, 2>{-1, -1}; }
+QJsonObject VaultReplacementAuthorization::delegate(QString& error)
+{
+    if (!delegationCurrent() || state_->delegated || state_->intent.phase != "prepared"
+        || state_->intent.candidate) {
+        fail(error, "Autorisation non délégable ou déjà consommée."); return {};
+    }
+    const auto& f = state_->registration.file;
+    QJsonObject result{{"config", state_->store.fileName()}, {"local", localId()}, {"operation", operationId()},
+        {"principal", f.path}, {"device", QString::number(f.device)}, {"inode", QString::number(f.inode)},
+        {"vault", QString::fromLatin1(f.vaultId.toHex())},
+        {"digest", QString::fromLatin1(state_->intent.previousDigest.toHex())}};
+    state_->delegated = true; // Only this session may now consume the grant.
+    return result;
+}
+VaultReplacementAuthorization VaultReplacementAuthorization::receiveDelegation(
+    const QJsonObject& message, std::array<int, 2> handles, std::function<bool()> check, QString& error)
+{
+    // Called only AFTER RestoreWorker verifies its OS parent/channel provenance.
+    // A registry record, FD or JSON object alone never reaches this private API.
+    const VaultPreferencesStore store(message["config"].toString());
+    QVector<VaultRegistration> records;
+    if (!check || !check() || !store.list(records, error)) return {};
+    for (const auto& r : records) {
+        if (r.localId != message["local"].toString()) continue;
+        if (!r.replacement || r.replacement->phase != "prepared" || r.replacement->candidate
+            || r.replacement->operationId != message["operation"].toString()
+            || r.file.path != message["principal"].toString()
+            || QString::number(r.file.device) != message["device"].toString()
+            || QString::number(r.file.inode) != message["inode"].toString()
+            || QString::fromLatin1(r.file.vaultId.toHex()) != message["vault"].toString()
+            || QString::fromLatin1(r.replacement->previousDigest.toHex()) != message["digest"].toString()) break;
+        auto state = std::make_shared<State>(store);
+        state->registration = r; state->intent = *r.replacement;
+        state->cleanupStillValid = std::move(check);
+        std::string failure;
+        if (!state->reservation.adoptReservation(r.file.path.toStdString(), handles, failure)) {
+            error = QString::fromStdString(failure); return {};
+        }
+        state->acknowledged = state->persisted = state->delegated = true;
+        VaultReplacementAuthorization authority(std::move(state));
+        if (authority.valid(error)) return authority;
+        return {};
+    }
+    fail(error, "Délégation et intention persistante incompatibles."); return {};
+}
 
 std::shared_ptr<VaultReplacementAuthorization::State> VaultReplacementAuthorization::reserve(
     const VaultPreferencesStore& store, const QString& localId,
@@ -145,27 +205,59 @@ std::shared_ptr<VaultReplacementAuthorization::State> VaultReplacementAuthorizat
 VaultReplacementAuthorization VaultReplacementAuthorization::acknowledge(
     std::shared_ptr<State> state, QString& error)
 {
-    if (!active(state) || !state->cleanupStillValid || !state->cleanupStillValid()) {
-        revoke(state); fail(error, "Préparation de remplacement invalidée."); return {};
+    if (!beginPreparation(state, error)) return {};
+    try { prepare(state, error); }
+    catch (...) { state->preparing = false; revoke(state); throw; }
+    return finishPreparation(std::move(state), error);
+}
+bool VaultReplacementAuthorization::beginPreparation(const std::shared_ptr<State>& state, QString& error)
+{
+    if (!active(state) || state->preparing || state->acknowledged || state->persisted
+        || !state->cleanupStillValid || !state->cleanupStillValid()) {
+        revoke(state); return fail(error, "Préparation de remplacement invalidée.");
     }
+    state->preparing = true;
+    return true;
+}
+bool VaultReplacementAuthorization::prepare(const std::shared_ptr<State>& state, QString& error)
+{
+    if (!active(state)) return fail(error, "Préparation de remplacement révoquée.");
     VaultFileIdentity current;
     if (!VaultPreferencesStore::inspectReserved(state->registration.file.path,
         state->reservation, current, error) || current != state->registration.file) {
-        revoke(state); return {};
+        return false;
     }
     // Potentially slow SQL/hash I/O happens only AFTER the real cleanup ack,
     // never while an old GUI session still owns its data key.
-    if (!digest(current, state->intent.previousDigest, error)) { revoke(state); return {}; }
+    if (!digest(current, state->intent.previousDigest, error)) return false;
     // Only MainWindow can reach this boundary after real cleanup. Persist before
     // issuing anything that could later authorize publication. Failure (even
     // after an uncertain QSettings publication) never yields a capability.
-    state->acknowledged = true;
+    if (!active(state)) return fail(error, "Préparation de remplacement révoquée.");
     if (!state->store.writeReplacementIntent(state->registration.localId,
-        state->registration.file, state->intent, error)) { revoke(state); return {}; }
-    if (!state->cleanupStillValid()) {
-        revoke(state); fail(error, "Protection ou nettoyage devenus invalides ; récupération requise."); return {};
-    }
+        state->registration.file, state->intent, error)) return false;
     state->persisted = true;
+    return true;
+}
+VaultReplacementAuthorization VaultReplacementAuthorization::finishPreparation(
+    std::shared_ptr<State> state, QString& error)
+{
+    if (!state) return {};
+    state->preparing = false;
+    // Last owner-thread physical check, no SQL/hash/fsync. Full persistent
+    // proofs are checked again by the execution context before using them.
+    struct stat identity {};
+    const auto named = QFile::encodeName(state->registration.file.path);
+    const bool sameFile = ::lstat(named.constData(), &identity) == 0 && S_ISREG(identity.st_mode)
+        && identity.st_nlink == 1 && identity.st_uid == ::geteuid() && !(identity.st_mode & 0022)
+        && quint64(identity.st_dev) == state->registration.file.device
+        && quint64(identity.st_ino) == state->registration.file.inode;
+    if (!sameFile || !active(state) || !state->persisted || !state->cleanupStillValid || !state->cleanupStillValid()) {
+        revoke(state);
+        if (error.isEmpty()) fail(error, "Protection ou nettoyage devenus invalides ; récupération requise.");
+        return {};
+    }
+    state->acknowledged = true;
     return VaultReplacementAuthorization(std::move(state));
 }
 bool VaultReplacementAuthorization::valid(QString& error) const
@@ -189,7 +281,16 @@ bool VaultReplacementAuthorization::valid(QString& error) const
     for (const auto& record : records)
         if (record.localId == localId() && record.file == (state_->intent.confirmed
                 ? *state_->intent.confirmed : state_->registration.file)
-            && record.replacement && *record.replacement == state_->intent) return true;
+            && record.replacement && *record.replacement == state_->intent) {
+            // Registry/descriptor inspection can take time. Revalidate live
+            // owner protection AFTER it too, especially immediately before an
+            // exchange in the delegated execution context. The final permit is
+            // an admission, not a promise to recall a syscall already admitted.
+            try {
+                if (active(state_) && state_->cleanupStillValid && state_->cleanupStillValid() && active(state_)) return true;
+            } catch (...) {}
+            break;
+        }
     revoke(state_);
     return fail(error, "Intention de remplacement non confirmée.");
 }

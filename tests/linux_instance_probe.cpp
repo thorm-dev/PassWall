@@ -1,5 +1,6 @@
 #include "platform/linux_instance_lock.hpp"
 #include "platform/session_lock_service.hpp"
+#include "posix_test_io.hpp"
 
 #include <QCoreApplication>
 #include <QLocalServer>
@@ -43,8 +44,10 @@ int main(int argc, char** argv)
     QSocketNotifier input(STDIN_FILENO, QSocketNotifier::Read);
     QObject::connect(&input, &QSocketNotifier::activated, &application, [&] {
         char data[16];
-        (void)::read(STDIN_FILENO, data, sizeof(data));
-        application.quit();
+        const auto count = passwall::test_io::readSome(STDIN_FILENO, data, sizeof(data));
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        input.setEnabled(false);
+        application.exit(count < 0 ? 5 : 0); // Data or parent EOF requests a normal exit.
     });
     return application.exec();
 }

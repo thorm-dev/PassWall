@@ -1,5 +1,6 @@
 // Isolated child-side linker injections: exercise the REAL worker/engine IPC.
 // Test barriers are bounded and use only files in a private fictitious directory.
+#include "posix_test_io.hpp"
 #include <sqlite3.h>
 #include <cerrno>
 #include <cstring>
@@ -131,9 +132,11 @@ extern "C" int __wrap_linkat(int from, const char* oldName, int to, const char* 
         std::snprintf(descriptor, sizeof(descriptor), "/proc/self/fd/%d", to);
         const auto n = ::readlink(descriptor, path, sizeof(path));
         if (n > 0 && readSmall(std::string(path, n) + "/.publication-swap") == "swap") {
-            (void)::unlinkat(to, name, 0);
+            if (::unlinkat(to, name, 0) != 0) ::_exit(93);
             const int replacement = ::openat(to, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-            if (replacement >= 0) { (void)::write(replacement, "unknown", 7); ::close(replacement); }
+            if (replacement < 0) ::_exit(93);
+            const bool written = passwall::test_io::writeAll(replacement, "unknown", 7);
+            if (::close(replacement) != 0 || !written) ::_exit(93);
         }
         if (mode("after.pwdb")) barrier();
         if (mode("crash.pwdb")) ::_exit(7);
@@ -166,9 +169,11 @@ extern "C" int __wrap_fstatat(int fd, const char* name, struct stat* output, int
         if (rotationMode == "pause" || rotationMode == "ignore"
             || rotationMode == "cancel" || rotationMode == "queued-cancel") rotationBarrier();
         if (rotationMode == "swap") {
-            (void)::renameat(fd, name, fd, (std::string(name) + ".preserved").c_str());
+            if (::renameat(fd, name, fd, (std::string(name) + ".preserved").c_str()) != 0) ::_exit(93);
             const int replacement = ::openat(fd, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-            if (replacement >= 0) { (void)::write(replacement, "unknown", 7); ::close(replacement); }
+            if (replacement < 0) ::_exit(93);
+            const bool written = passwall::test_io::writeAll(replacement, "unknown", 7);
+            if (::close(replacement) != 0 || !written) ::_exit(93);
         }
     }
     return __real_fstatat(fd, name, output, flags);

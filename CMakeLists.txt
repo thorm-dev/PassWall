@@ -27,6 +27,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(passwall_linux_session PUBLIC Qt6::DBus)
 endif()
 find_package(SQLite3 REQUIRED)
+if(NOT TARGET SQLite3::SQLite3)
+    add_library(SQLite3::SQLite3 ALIAS SQLite::SQLite3)
+endif()
 find_package(GTest REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -44,7 +47,7 @@ add_executable(passwall_env_check
 )
 target_link_libraries(passwall_env_check PRIVATE
     PkgConfig::SODIUM
-    SQLite::SQLite3
+    SQLite3::SQLite3
 )
 
 # Tests automatises
@@ -80,7 +83,7 @@ target_link_libraries(passwall_tests PRIVATE
     Qt6::Core
     Qt6::Network
     PkgConfig::SODIUM
-    SQLite::SQLite3
+    SQLite3::SQLite3
 )
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -105,7 +108,7 @@ gtest_discover_tests(passwall_tests)
 add_library(passwall_vault_preferences STATIC src/services/vault_preferences_store.cpp
     src/services/vault_replacement_authorization.cpp)
 target_include_directories(passwall_vault_preferences PUBLIC src)
-target_link_libraries(passwall_vault_preferences PUBLIC Qt6::Core SQLite::SQLite3 passwall_vault_operations)
+target_link_libraries(passwall_vault_preferences PUBLIC Qt6::Core SQLite3::SQLite3 passwall_vault_operations)
 target_link_libraries(passwall_tests PRIVATE passwall_vault_preferences)
 add_executable(passwall_preferences_tests
     tests/isolated_vault_settings.cpp
@@ -133,7 +136,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         src/core/crypto_engine.cpp)
     target_include_directories(passwall_storage_tests PRIVATE src)
     target_link_libraries(passwall_storage_tests PRIVATE
-        GTest::gtest_main Qt6::Core SQLite::SQLite3 PkgConfig::SODIUM passwall_vault_preferences)
+        GTest::gtest_main Qt6::Core SQLite3::SQLite3 PkgConfig::SODIUM passwall_vault_preferences)
     target_link_options(passwall_storage_tests PRIVATE
         -Wl,--wrap=_Znwm
         -Wl,--wrap=sqlite3_open_v2
@@ -156,7 +159,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         src/storage/sqlite_connection_config.cpp
         src/storage/vault_storage.cpp)
     target_include_directories(passwall_vault_snapshot PUBLIC src)
-    target_link_libraries(passwall_vault_snapshot PUBLIC SQLite::SQLite3 passwall_vault_operations)
+    target_link_libraries(passwall_vault_snapshot PUBLIC SQLite3::SQLite3 passwall_vault_operations)
     target_link_libraries(passwall_vault_preferences PUBLIC passwall_vault_snapshot)
     # Recovery gate before every storage/snapshot SQL open. Static libraries
     # form a small strongly-connected component; CMake repeats it for linking.
@@ -207,11 +210,40 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         -Wl,--wrap=sqlite3_backup_step -Wl,--wrap=fsync -Wl,--wrap=linkat -Wl,--wrap=unlinkat)
     gtest_discover_tests(passwall_restore_tests)
 
-    # Synchronous capability-scoped principal replacement, no GUI/worker API.
+    # Single capability-scoped engine shared by direct and delegated execution.
     # Deliberately separate from the keyless snapshot/backup binaries.
     add_library(passwall_vault_replacement STATIC src/services/vault_replacement_service.cpp)
     target_include_directories(passwall_vault_replacement PUBLIC src)
     target_link_libraries(passwall_vault_replacement PUBLIC passwall_vault_restore)
+
+    # Restore-only secret transport and supervisor; keyless backup stays separate.
+    add_library(passwall_restore_driver STATIC src/services/restore_job.hpp src/services/restore_job.cpp)
+    target_include_directories(passwall_restore_driver PUBLIC src)
+    target_link_libraries(passwall_restore_driver PUBLIC passwall_vault_replacement Qt6::Core)
+    add_executable(passwall_restore_worker src/services/restore_worker_main.cpp)
+    target_link_libraries(passwall_restore_worker PRIVATE passwall_restore_driver)
+
+    # Separate worker for isolated test parents; NEVER linked into production.
+    add_executable(passwall_restore_worker_test src/services/restore_worker_main.cpp tests/restore_worker_memory_probe.cpp)
+    target_link_libraries(passwall_restore_worker_test PRIVATE passwall_restore_driver)
+    target_link_options(passwall_restore_worker_test PRIVATE
+        -Wl,--wrap=sodium_malloc -Wl,--wrap=sodium_free -Wl,--wrap=send)
+    target_compile_definitions(passwall_restore_worker_test PRIVATE PASSWALL_RESTORE_WORKER_TESTING
+        RESTORE_TEST_PARENT="$<TARGET_FILE:passwall_restore_job_tests>"
+        RESTORE_GUI_PARENT="$<TARGET_FILE:passwall_gui_tests>")
+    add_executable(passwall_restore_job_tests tests/test_restore_job.cpp tests/isolated_vault_settings.cpp)
+    # Compile-only boundary assertions, deliberately not linked (stand-in names).
+    add_library(passwall_restore_issuer_probe OBJECT tests/restore_issuer_boundary_probe.cpp)
+    target_include_directories(passwall_restore_issuer_probe PRIVATE src)
+    target_link_libraries(passwall_restore_issuer_probe PRIVATE Qt6::Core)
+    target_link_libraries(passwall_restore_job_tests PRIVATE passwall_restore_driver GTest::gtest Qt6::Core)
+    target_link_options(passwall_restore_job_tests PRIVATE -Wl,--wrap=sodium_malloc -Wl,--wrap=sodium_free)
+    target_compile_definitions(passwall_restore_job_tests PRIVATE
+        RESTORE_REAL_WORKER="$<TARGET_FILE:passwall_restore_worker>"
+        RESTORE_GUI_TEST_PROGRAM="$<TARGET_FILE:passwall_gui_tests>"
+        RESTORE_TEST_WORKER="$<TARGET_FILE:passwall_restore_worker_test>")
+    add_dependencies(passwall_restore_job_tests passwall_restore_worker passwall_restore_worker_test passwall_restore_issuer_probe)
+    gtest_discover_tests(passwall_restore_job_tests)
 
     # Isolated contract issuer, compiled only into this executable. Production
     # authorization has no public factory or boolean cleanup assertion.
@@ -344,7 +376,7 @@ target_link_libraries(passwall_app PRIVATE
     Qt6::Widgets
     Qt6::Network
     PkgConfig::SODIUM
-    SQLite::SQLite3
+    SQLite3::SQLite3
 )
 
 # Tests GUI isoles : memes implementations que l'application, donnees fictives
@@ -376,7 +408,7 @@ target_link_libraries(passwall_gui_tests PRIVATE
     Qt6::Widgets
     Qt6::Network
     PkgConfig::SODIUM
-    SQLite::SQLite3
+    SQLite3::SQLite3
 )
 gtest_discover_tests(passwall_gui_tests)
 
@@ -386,8 +418,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     foreach(gui_target passwall_app passwall_gui_tests)
         target_sources(${gui_target} PRIVATE src/gui/main_window_export.cpp
             src/gui/vault_export_dialog.hpp src/gui/vault_export_dialog.cpp)
-        target_link_libraries(${gui_target} PRIVATE passwall_backup_driver passwall_automatic_backup)
-        add_dependencies(${gui_target} passwall_backup_worker)
+        target_link_libraries(${gui_target} PRIVATE passwall_backup_driver passwall_automatic_backup passwall_restore_driver)
+        add_dependencies(${gui_target} passwall_backup_worker passwall_restore_worker)
     endforeach()
     target_sources(passwall_gui_tests PRIVATE
         tests/test_manual_vault_export.cpp
@@ -398,6 +430,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         tests/test_session_lock_service.cpp
     )
     add_dependencies(passwall_gui_tests passwall_fake_backup_worker)
+    add_dependencies(passwall_gui_tests passwall_restore_worker_test)
+    add_dependencies(passwall_restore_job_tests passwall_gui_tests)
+    target_compile_definitions(passwall_gui_tests PRIVATE
+        RESTORE_TEST_WORKER="$<TARGET_FILE:passwall_restore_worker_test>")
+    target_link_options(passwall_gui_tests PRIVATE
+        -Wl,--wrap=_ZN8passwall8services10RestoreJob17siblingWorkerPathEv -Wl,--wrap=fsync -Wl,--wrap=send)
     target_compile_definitions(passwall_gui_tests PRIVATE
         EXPORT_FAKE_WORKER="$<TARGET_FILE:passwall_fake_backup_worker>")
     target_link_options(passwall_gui_tests PRIVATE

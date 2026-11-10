@@ -2,6 +2,7 @@
 #include "services/vault_lifecycle_service.hpp"
 #include "services/credential_service.hpp"
 #include "storage/vault_storage.hpp"
+#include "posix_test_io.hpp"
 
 #include <gtest/gtest.h>
 #include <sqlite3.h>
@@ -279,7 +280,11 @@ extern "C" int __wrap_linkat(int from, const char* oldName, int to, const char* 
             && active->opened == active->closed && active->prepared == active->finalized;
         if (inject(Fault::LinkCollision)) {
             const int fd = ::openat(to, name, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
-            if (fd >= 0) { (void)::write(fd, "fictitious-existing", 19); ::close(fd); }
+            EXPECT_GE(fd, 0) << "Fictitious destination collision setup failed.";
+            if (fd >= 0) {
+                EXPECT_TRUE(passwall::test_io::writeAll(fd, "fictitious-existing", 19));
+                EXPECT_EQ(::close(fd), 0);
+            }
         }
     }
     const int code = __real_linkat(from, oldName, to, name, flags);

@@ -15,6 +15,7 @@
 #include <sqlite3.h>
 #include <cerrno>
 #ifdef Q_OS_UNIX
+#include "posix_test_io.hpp"
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -324,24 +325,24 @@ TEST_F(VaultPreferencesStoreTest, AnotherProcessHoldingRegistryLockPreventsLostU
     if (child == 0) {
         ::close(ready[0]);
         ::close(release[1]);
-        bool locked = false;
+        bool locked = false, exchanged = false;
         {
             QLockFile lock(config + ".registry-lock");
             locked = lock.tryLock(0);
             const char result = locked ? '1' : '0';
-            (void)::write(ready[1], &result, 1);
             char finish;
-            (void)::read(release[0], &finish, 1);
+            exchanged = passwall::test_io::writeAll(ready[1], &result, 1)
+                && passwall::test_io::readSome(release[0], &finish, 1) == 1 && finish == 'x';
         }
-        ::_exit(locked ? 0 : 1);
+        ::_exit(locked && exchanged ? 0 : 1);
     }
     ::close(ready[1]);
     ::close(release[0]);
     char result = '0';
-    EXPECT_EQ(::read(ready[0], &result, 1), 1);
+    EXPECT_EQ(passwall::test_io::readSome(ready[0], &result, 1), 1);
     EXPECT_EQ(result, '1');
     EXPECT_FALSE(VaultPreferencesStore(config).updatePreferences(record.localId, enabled(), error));
-    EXPECT_EQ(::write(release[1], "x", 1), 1);
+    EXPECT_TRUE(passwall::test_io::writeAll(release[1], "x", 1));
     ::close(ready[0]);
     ::close(release[1]);
     int status = 0;

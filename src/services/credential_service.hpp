@@ -43,6 +43,9 @@ public:
         const std::string& databasePath,
         const core::SecureBuffer& dataKey,
         std::string& error);
+    [[nodiscard]] static bool authenticateAll(
+        const std::string& databasePath, const core::SecureBuffer& dataKey,
+        std::string& error, bool (*cancelled)(void*) noexcept, void* context);
 
     [[nodiscard]] static bool get(
         const std::string& databasePath,

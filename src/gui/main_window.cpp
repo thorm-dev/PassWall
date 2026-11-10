@@ -654,7 +654,7 @@ namespace passwall::gui
     }
     MainWindow::~MainWindow()
     {
-        services::VaultReplacementAuthorization::revoke(replacement_.lock());
+        revokeReplacement();
 #ifdef Q_OS_LINUX
         if (automaticBackup_) automaticBackup_->shutdown();
         exportCloseRequested_ = true;
@@ -682,6 +682,9 @@ namespace passwall::gui
             return true;
 #endif
         return replacementTransition_ || services::VaultReplacementAuthorization::active(replacement_.lock()) ||
+#ifdef Q_OS_LINUX
+            (restoreJob_ && restoreJob_->isActive()) || restoreSecretsPending_ ||
+#endif
             externalLockClosing_ || externalLockFailed_ ||
             externalLockReplyInProgress_ || !externalLockRequests_.empty();
     }
@@ -695,7 +698,7 @@ namespace passwall::gui
             qFatal("External locking must run on the vault owner's thread");
         // Reentry must revoke BEFORE joining an already-running cleanup.
         if (reason == LockReason::Security)
-            services::VaultReplacementAuthorization::revoke(replacement_.lock());
+            revokeReplacement();
         if (!completion)
             return;
         if (externalLockClosing_ || externalLockFailed_)
@@ -715,6 +718,9 @@ namespace passwall::gui
     }
     void MainWindow::scheduleExternalLockCompletion()
     {
+#ifdef Q_OS_LINUX
+        if (restoreSecretsPending_) return;
+#endif
         if (externalLockRequests_.empty() || externalLockCompletionQueued_ || externalLockClosing_)
             return;
         externalLockCompletionQueued_ = true;
@@ -747,6 +753,9 @@ namespace passwall::gui
     void MainWindow::completeExternalLockRequests()
     {
         externalLockCompletionQueued_ = false;
+#ifdef Q_OS_LINUX
+        if (restoreSecretsPending_) return;
+#endif
         if (vaultLockInProgress_ || externalLockReplyInProgress_)
             return; // A nested event loop must wait for its outer operation.
         const QPointer<MainWindow> guarded(this);
@@ -1623,7 +1632,7 @@ namespace passwall::gui
         // The deliberate preparation lock is the only exception, never a
         // change in Control1.Lock() or system/manual/idle locking semantics.
         if (reason == LockReason::Security)
-            services::VaultReplacementAuthorization::revoke(replacement_.lock());
+            revokeReplacement();
         if (vaultLockInProgress_)
             return;
 #ifdef Q_OS_LINUX
@@ -1670,7 +1679,11 @@ namespace passwall::gui
             wipeQString(searchText);
             ui_->stackedWidget->setCurrentWidget(ui_->pageWelcome);
         }
-        if (lifecycleLockPending_)
+        if (lifecycleLockPending_
+#ifdef Q_OS_LINUX
+            && !restoreSecretsPending_
+#endif
+        )
         {
             lifecycleLockPending_ = false;
             emit lifecycleSecretsCleared();

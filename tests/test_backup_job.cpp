@@ -3,6 +3,7 @@
 #include "services/credential_service.hpp"
 #include "storage/vault_storage.hpp"
 #include "storage/vault_operation_guard.hpp"
+#include "posix_test_io.hpp"
 
 #include <gtest/gtest.h>
 #include <sodium.h>
@@ -401,8 +402,9 @@ TEST_F(BackupJobTest, ExecChildRetainsReservationAfterUnexpectedParentExit)
     ASSERT_EQ(::prctl(PR_GET_CHILD_SUBREAPER, &previous), 0);
     ASSERT_EQ(::prctl(PR_SET_CHILD_SUBREAPER, 1), 0);
     const auto restore = qScopeGuard([&] {
-        QFile exit(destination + ".exit"); exit.open(QIODevice::WriteOnly);
-        ::prctl(PR_SET_CHILD_SUBREAPER, previous);
+        QFile exit(destination + ".exit");
+        EXPECT_TRUE(exit.open(QIODevice::WriteOnly));
+        EXPECT_EQ(::prctl(PR_SET_CHILD_SUBREAPER, previous), 0);
     });
     QFile mode(source + ".fake-mode");
     ASSERT_TRUE(mode.open(QIODevice::WriteOnly)); mode.write("orphan"); mode.close();
@@ -498,7 +500,7 @@ int main(int argc, char** argv)
         const auto pid = QByteArray::number(process.processId()) + '\n';
         process.write(backup_protocol::request(source, destination));
         if (!until([&] { return QFile::exists(source + ".checkpoint"); })) return 2;
-        (void)::write(1, pid.constData(), pid.size());
+        if (!passwall::test_io::writeAll(1, pid.constData(), pid.size())) ::_exit(3);
         ::_exit(0); // Real parent loss, no QProcess destructor/terminate/cancel.
     }
     ::testing::InitGoogleTest(&argc, argv);

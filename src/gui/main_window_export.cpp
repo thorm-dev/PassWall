@@ -208,6 +208,10 @@ void MainWindow::queueExportClose()
 void MainWindow::closeEvent(QCloseEvent* event)
 {
     exportCloseRequested_ = true; // Fail-closed while asynchronous close runs.
+    // The independent restore supervisor outlives this facade/window. Closing
+    // requests cancellation, never waits in a QProcess destructor or reports a
+    // positive cleanup acknowledgement while an unconfirmed child holds secrets.
+    if (restoreJob_) restoreJob_->cancel();
     if (automaticBackup_ && !automaticBackup_->canClose()) {
         automaticBackup_->shutdown();
         if (!automaticBackup_->canClose()) {

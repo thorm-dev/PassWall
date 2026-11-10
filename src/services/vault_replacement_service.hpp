@@ -26,6 +26,7 @@ struct ReplacementControl {
 };
 struct ReplacementResult {
     ReplacementOutcome outcome = ReplacementOutcome::NotReplaced;
+    bool sourceAuthenticationFailed = false; // No secret/error-text parsing by supervisor.
     ReplacementFinalizationResult finalization;
     SnapshotResult precaution;
     QString operationId;
