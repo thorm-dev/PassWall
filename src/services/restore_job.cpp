@@ -1,6 +1,7 @@
 #include "services/restore_job.hpp"
 #include "services/restore_protocol.hpp"
 #include "services/restore_delegation.hpp"
+#include "services/restore_executable_trust.hpp"
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
@@ -69,6 +70,8 @@ public:
                 if (!reported_) {
                     if (!invalid_ && terminal_ && code == 0 && status == QProcess::NormalExit)
                         report(result_);
+                    else if (status == QProcess::NormalExit && code == 77 && !protocolBytesReceived_)
+                        report(unknown(QStringLiteral("Admission locale du worker refusée [exit=77] ; vérifier les permissions 0755 et redémarrer PassWall après compilation ou déploiement."), false));
                     else report(unknown(QStringLiteral("Supervision de restauration incertaine [exit=%1, crash=%2] ; inspecter la récupération.")
                         .arg(code).arg(status == QProcess::CrashExit)));
                 }
@@ -113,9 +116,9 @@ public:
         if (process_.state() != QProcess::NotRunning) escalation_.start(wire::cooperativeMs);
     }
 private:
-    RestoreResult unknown(QString diagnostic) const {
+    RestoreResult unknown(QString diagnostic, bool appendProtocol = true) const {
         auto r = result_; // Preserve an already received business result/artifact.
-        if (invalid_) diagnostic += QStringLiteral(" [protocole invalide]");
+        if (invalid_ && appendProtocol) diagnostic += QStringLiteral(" [protocole invalide]");
         r.outcome = RestoreOutcome::Unknown; r.diagnostic = std::move(diagnostic);
         if (r.replacement.operationId.isEmpty()) r.replacement.operationId = operation_;
         return r;
@@ -195,6 +198,7 @@ private:
                         return;
                     }
                     if (terminal_) { broken(); return; } // Even a one-byte tail is invalid.
+                    protocolBytesReceived_ = true;
                     incoming_.append(bytes, n);
                 }
                 if (incoming_.size() < 5) continue;
@@ -282,9 +286,22 @@ private:
     RestoreResult result_;
     bool ready_ = false, received_ = false, cleaned_ = false, terminal_ = false;
     bool sendingPassword_ = false, cancelled_ = false, cancelReceived_ = false, invalid_ = false, reported_ = false;
+    bool protocolBytesReceived_ = false;
 };
 
 QString RestoreJob::siblingWorkerPath() { return QCoreApplication::applicationDirPath() + "/passwall_restore_worker"; }
+QString RestoreJob::siblingApplicationPath() { return QCoreApplication::applicationDirPath() + "/passwall_app"; }
+bool RestoreJob::validateInstallation(const QString& worker, const QString& application, QString& error)
+{
+    using namespace restore_executable_trust;
+    if (const auto failure = executable(worker); failure != Failure::None) {
+        error = diagnostic(failure, QStringLiteral("L'auxiliaire de restauration")); return false;
+    }
+    if (const auto failure = processExecutable(::getpid(), application); failure != Failure::None) {
+        error = diagnostic(failure, QStringLiteral("PassWall")); return false;
+    }
+    error.clear(); return true;
+}
 RestoreJob::RestoreJob(QObject* parent) : RestoreJob(siblingWorkerPath(), parent) {}
 RestoreJob::RestoreJob(QString worker, QObject* parent) : QObject(parent), worker_(std::move(worker)) {}
 RestoreJob::~RestoreJob() { cancel(); }
@@ -299,12 +316,15 @@ try {
     if (started_) return false;
     started_ = true;
     const auto path = [](const QString& p) { return QDir::isAbsolutePath(p) && !p.contains(QChar::Null) && p.toUtf8().size() <= 4096; };
-    struct stat program{};
+    using namespace restore_executable_trust;
+    const auto workerTrust = executable(worker_);
     if (!path(worker_) || !path(source) || (!precaution.isEmpty() && !path(precaution))
         || password.empty() || password.size() > wire::passwordLimit
-        || ::lstat(QFile::encodeName(worker_).constData(), &program) != 0 || !S_ISREG(program.st_mode)
-        || program.st_uid != ::geteuid() || (program.st_mode & 0022) || !(program.st_mode & 0100)) {
-        startError_ = QStringLiteral("Auxiliaire, chemins ou taille de mot de passe invalides."); return false;
+        || workerTrust != Failure::None) {
+        if (workerTrust != Failure::None)
+            startError_ = diagnostic(workerTrust, QStringLiteral("L'auxiliaire de restauration"));
+        else startError_ = QStringLiteral("Chemins ou taille de mot de passe invalides.");
+        return false;
     }
     int pair[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) != 0) {

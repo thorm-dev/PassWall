@@ -14,6 +14,7 @@
 #include "gui/vault_export_dialog.hpp"
 #include "gui/vault_restore_controller.hpp"
 #include "gui/vault_backup_settings_controller.hpp"
+#include "gui/vault_recovery_controller.hpp"
 #include "services/backup_job.hpp"
 #endif
 #include <sodium.h>
@@ -55,6 +56,7 @@
 #include <QVBoxLayout>
 #include <QWidget>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -65,6 +67,12 @@ namespace passwall::gui
     {
         using detail::wipeCredential;
         using detail::wipeString;
+        constexpr std::array autoLockDurations{1, 5, 15, 30, 60};
+        bool validAutoLockDuration(int minutes) noexcept
+        {
+            return std::find(autoLockDurations.begin(), autoLockDurations.end(), minutes)
+                != autoLockDurations.end();
+        }
         void wipeQString(QString &value);
         std::uint64_t clipboardCopyGeneration = 0;
         QString lastPassWallClipboardText;
@@ -530,18 +538,35 @@ namespace passwall::gui
             this, [this](bool) { updateExportAction(); });
 #endif
         inactivityTimer_.setObjectName(QStringLiteral("vaultInactivityTimer"));
-        // Charger le délai de verrouillage automatique.
+        // An absent preference uses one minute. A legacy/invalid preference
+        // cannot disable protection, even if its migration cannot be saved.
         QSettings settings("PassWall", "PassWall");
-        autoLockMinutes_ =
-            settings.value("security/autoLockMinutes", 5).toInt();
-        const QList<int> allowedMinutes = {0, 1, 5, 10, 15, 30};
-        if (!allowedMinutes.contains(autoLockMinutes_))
+        settings.setFallbacksEnabled(false);
+        const bool storedDuration = settings.contains("security/autoLockMinutes");
+        bool durationIsInteger = false;
+        // Parse the text instead of QVariant::toInt(): a fractional double
+        // must not be rounded into an allowed duration.
+        const int storedMinutes = settings.value("security/autoLockMinutes", 1)
+            .toString().toInt(&durationIsInteger);
+        const bool migrateDuration = settings.status() != QSettings::NoError
+            || (storedDuration && (!durationIsInteger || !validAutoLockDuration(storedMinutes)));
+        autoLockMinutes_ = migrateDuration ? 1 : storedMinutes;
+        inactivityTimer_.setTimerType(Qt::PreciseTimer);
+        inactivityTimer_.setInterval(autoLockMinutes_ * 60 * 1000);
+        if (migrateDuration)
         {
-            autoLockMinutes_ = 5;
-        }
-        if (autoLockMinutes_ > 0)
-        {
-            inactivityTimer_.setInterval(autoLockMinutes_ * 60 * 1000);
+            const bool saved = persistUiPreference("security/autoLockMinutes", 1);
+            QTimer::singleShot(0, this, [this, saved] {
+                auto* notice = new QMessageBox(QMessageBox::Information,
+                    tr("Verrouillage automatique obligatoire"),
+                    tr("L'ancienne préférence de verrouillage automatique a été remplacée par 1 minute.")
+                        + (saved ? QString{} : tr("\nEnregistrement impossible : la protection à 1 minute reste appliquée pour cette exécution.")),
+                    QMessageBox::Ok, this);
+                notice->setObjectName(QStringLiteral("autoLockMigrationNotice"));
+                notice->setTextFormat(Qt::PlainText);
+                notice->setAttribute(Qt::WA_DeleteOnClose);
+                notice->setModal(false); notice->show();
+            });
         }
         connect(
             &inactivityTimer_,
@@ -560,6 +585,7 @@ namespace passwall::gui
         QAction *autoLockAction =
             securityMenu->addAction(
                 tr("Délai de verrouillage automatique..."));
+        autoLockAction->setObjectName(QStringLiteral("autoLockDurationAction"));
         connect(
             autoLockAction,
             &QAction::triggered,
@@ -567,44 +593,34 @@ namespace passwall::gui
             [this]()
             {
                 const QStringList options = {
-                    tr("Désactivé"),
                     tr("1 minute"),
                     tr("5 minutes"),
-                    tr("10 minutes"),
                     tr("15 minutes"),
-                    tr("30 minutes")};
-                QString currentOption = tr("Désactivé");
-                if (autoLockMinutes_ > 0)
-                {
-                    currentOption = tr("%1 minute%2")
-                                        .arg(autoLockMinutes_)
-                                        .arg(autoLockMinutes_ == 1 ? "" : "s");
-                }
-                const int currentIndex =
-                    options.indexOf(currentOption);
-                bool accepted = false;
-                const QString selected = QInputDialog::getItem(
-                    this,
-                    tr("Verrouillage automatique"),
-                    tr("Verrouiller le coffre après :"),
-                    options,
-                    currentIndex >= 0 ? currentIndex : 2,
-                    false,
-                    &accepted);
-                if (!accepted)
-                {
+                    tr("30 minutes"),
+                    tr("60 minutes")};
+                const auto current = std::find(autoLockDurations.begin(), autoLockDurations.end(), autoLockMinutes_);
+                const auto index = current == autoLockDurations.end() ? 0 : int(current - autoLockDurations.begin());
+                const QPointer<MainWindow> owner(this);
+                QPointer<QInputDialog> dialog = new QInputDialog(this);
+                const auto cleanup = qScopeGuard([dialog] { delete dialog.data(); });
+                dialog->setObjectName(QStringLiteral("autoLockDurationDialog"));
+                dialog->setWindowTitle(tr("Verrouillage automatique"));
+                dialog->setLabelText(tr("Verrouiller le coffre après :"));
+                dialog->setComboBoxItems(options);
+                dialog->setComboBoxEditable(false);
+                dialog->setTextValue(options.at(index));
+                const auto result = dialog->exec();
+                if (!owner || !dialog || result != QDialog::Accepted)
                     return;
-                }
-                int minutes = 0;
-                if (selected != tr("Désactivé"))
-                {
-                    minutes = selected.section(' ', 0, 0).toInt();
-                }
-                autoLockMinutes_ = minutes;
+                const int selected = options.indexOf(dialog->textValue());
+                if (selected < 0) return;
+                autoLockMinutes_ = autoLockDurations.at(selected);
                 updateInactivityTimer();
-                persistUiPreference(
-                    "security/autoLockMinutes",
-                    autoLockMinutes_);
+                if (!persistUiPreference("security/autoLockMinutes", autoLockMinutes_))
+                {
+                    autoLockMinutes_ = 1;
+                    updateInactivityTimer();
+                }
             });
         ui_->stackedWidget->setCurrentWidget(ui_->pageWelcome);
         // Restaurer le dernier chemin de coffre utilisé.
@@ -640,6 +656,13 @@ namespace passwall::gui
         auto* restoreAction = restoreMenu->addAction(tr("Restaurer depuis une sauvegarde…"));
         restoreAction->setObjectName(QStringLiteral("restoreVaultAction"));
         connect(restoreAction, &QAction::triggered, this, &MainWindow::restoreVault);
+        auto* recoveryAction = restoreMenu->addAction(tr("Récupérer une restauration interrompue…"));
+        recoveryAction->setObjectName(QStringLiteral("recoverVaultAction"));
+        connect(recoveryAction, &QAction::triggered, this, [this] {
+            if (externalLockClosing_ || exportCloseRequested_) return;
+            if (!recoveryController_) recoveryController_ = new VaultRecoveryController(*this);
+            recoveryController_->open();
+        });
         auto* backupSettings = restoreMenu->addAction(tr("Sauvegardes automatiques…"));
         backupSettings->setObjectName(QStringLiteral("backupSettingsAction"));
         connect(backupSettings, &QAction::triggered, this, [this] {
@@ -689,6 +712,7 @@ namespace passwall::gui
 #ifdef Q_OS_LINUX
         delete std::exchange(restoreController_, nullptr);
         delete std::exchange(backupSettingsController_, nullptr);
+        delete std::exchange(recoveryController_, nullptr);
 #endif
         delete ui_;
     }
@@ -700,7 +724,7 @@ namespace passwall::gui
 #endif
         return replacementTransition_ || services::VaultReplacementAuthorization::active(replacement_.lock()) ||
 #ifdef Q_OS_LINUX
-            (restoreJob_ && restoreJob_->isActive()) || restoreSecretsPending_ ||
+            (restoreJob_ && restoreJob_->isActive()) || restoreSecretsPending_ || !recoveryUnconfirmed_.isEmpty() ||
 #endif
             externalLockClosing_ || externalLockFailed_ ||
             externalLockReplyInProgress_ || !externalLockRequests_.empty();
@@ -905,7 +929,8 @@ namespace passwall::gui
     }
     void MainWindow::updateInactivityTimer()
     {
-        if (!ensureLifecycleProtection() || autoLockMinutes_ <= 0 || vaultLockInProgress_ ||
+        if (!validAutoLockDuration(autoLockMinutes_)) autoLockMinutes_ = 1;
+        if (!ensureLifecycleProtection() || vaultLockInProgress_ ||
             vaultPath_.isEmpty() || dataKey_.empty() || sessionGeneration_ == 0)
         {
             inactivityTimer_.stop();
@@ -933,7 +958,7 @@ namespace passwall::gui
             const native::VaultLease lease{true, sessionGeneration_};
             // Armer avant tout callback Native ou changement de page Qt :
             // une boucle modale ne doit pas publier une session sans protection.
-            // Le choix explicite « Désactivé » reste toutefois respecté.
+            // La durée obligatoire a été validée avant l'accès à la session.
             updateInactivityTimer();
             if (!isLeaseCurrent(lease))
             {
@@ -1266,7 +1291,7 @@ namespace passwall::gui
         notice->setModal(false);
         notice->show();
     }
-    void MainWindow::persistUiPreference(const QString& key, const QVariant& value)
+    bool MainWindow::persistUiPreference(const QString& key, const QVariant& value)
     {
         // Legacy UI settings share the registry's file. A pending setValue()
         // must not silently rewrite a malformed INI before registry validation.
@@ -1287,7 +1312,7 @@ namespace passwall::gui
                     settings.setValue(key, value);
                     settings.sync();
                     if (settings.status() == QSettings::NoError)
-                        return;
+                        return true;
                 }
             }
         }
@@ -1295,6 +1320,7 @@ namespace passwall::gui
         // Nonmodal; runtime inactivity policy still applies even if saving it
         // fails. Do not include values/paths in diagnostics.
         statusBar()->showMessage(tr("Préférences non enregistrées : configuration illisible, occupée ou inaccessible."));
+        return false;
     }
     void MainWindow::showUnlockedVault()
     {

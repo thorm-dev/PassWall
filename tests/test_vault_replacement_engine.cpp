@@ -3,6 +3,7 @@
 #include "services/credential_service.hpp"
 #include "storage/vault_storage.hpp"
 #include "storage/vault_operation_guard.hpp"
+#include "posix_test_io.hpp"
 #include <gtest/gtest.h>
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -32,7 +33,9 @@ using namespace passwall::services;
 using passwall::core::SecureBuffer;
 using passwall::storage::VaultOperationGuard;
 VaultReplacementAuthorization issueReplacementEngineTest(const VaultPreferencesStore&, const QString&, QString&);
+ReplacementRecoveryResult recoverPreparedReplacementForTest(const VaultPreferencesStore&, const QString&, const QString&);
 void replacementRegistrySyncFaultForTest(const QString&, int ordinal);
+void replacementCrashAfterRegistrySyncForTest(const QString&);
 
 namespace {
 constexpr std::string_view master = "fictitious-replacement-master-v1";
@@ -163,6 +166,36 @@ protected:
         ASSERT_TRUE(WIFEXITED(status)); ASSERT_EQ(WEXITSTATUS(status), 71);
         blocked();
     }
+    void heldOldArtifactRefusesRecoveryUntilExit() {
+        const auto before = read(); ASSERT_TRUE(before.replacement); ASSERT_TRUE(before.replacement->candidate);
+        const auto op = before.replacement->operationId, oldPath = before.replacement->candidate->path;
+        const auto newBytes = bytes(principal), oldBytes = bytes(oldPath);
+        int ready[2], release[2]; ASSERT_EQ(::pipe2(ready, O_CLOEXEC), 0); ASSERT_EQ(::pipe2(release, O_CLOEXEC), 0);
+        const auto child = ::fork(); ASSERT_GE(child, 0);
+        if (child == 0) {
+            ::close(ready[0]); ::close(release[1]);
+            VaultOperationGuard reservation; std::string failure;
+            const bool held = reservation.tryReserve(oldPath.toStdString(), failure);
+            if (!passwall::test_io::writeAll(ready[1], held ? "r" : "e", 1)) ::_exit(83);
+            char byte = 0; const auto eof = passwall::test_io::readSome(release[0], &byte, 1);
+            ::_exit(held && eof == 0 ? 0 : 84);
+        }
+        ::close(ready[1]); ::close(release[0]); char response = 0;
+        const auto count = passwall::test_io::readSome(ready[0], &response, 1); ::close(ready[0]);
+        EXPECT_EQ(count, 1); EXPECT_EQ(response, 'r');
+        const auto previousExchanges = probe.exchanges;
+        active = &probe;
+        const auto refused = VaultReplacementAuthorization::recoverReplacement(store(), registered.localId, op,
+            ReplacementRecoveryAction::FinalizeExchanged);
+        EXPECT_NE(refused.finalization.state, ReplacementFinalizationState::Resolved);
+        EXPECT_TRUE(read().replacement); blocked();
+        EXPECT_EQ(bytes(principal), newBytes); EXPECT_EQ(bytes(oldPath), oldBytes); EXPECT_EQ(probe.exchanges, previousExchanges);
+        ::close(release[1]); // EOF, not a signal or timeout, releases the simulated holder.
+        int status = 0; ASSERT_EQ(::waitpid(child, &status, 0), child); ASSERT_TRUE(WIFEXITED(status)); ASSERT_EQ(WEXITSTATUS(status), 0);
+        active = nullptr;
+        newProcessRecovery(ReplacementLayout::Resolved);
+        EXPECT_FALSE(read().replacement); EXPECT_EQ(bytes(principal), newBytes); EXPECT_EQ(bytes(oldPath), oldBytes);
+    }
 };
 } // namespace
 
@@ -261,8 +294,11 @@ TEST_F(VaultReplacementEngineTest, AuthenticatesEveryEntryAndReplacesWholeVault)
     EXPECT_EQ(store().recoveryAccess(principal, error), VaultRecoveryAccess::Allowed);
 }
 TEST_F(VaultReplacementEngineTest, WrongPasswordNeverArmsOrChangesPrincipal) {
-    EXPECT_FALSE(run(nullptr, "wrong-fictitious-master")); unchanged(); blocked();
+    EXPECT_FALSE(run(nullptr, "wrong-fictitious-master"));
+    SCOPED_TRACE(result.diagnostic.toStdString());
+    unchanged(); blocked();
     EXPECT_EQ(probe.exchanges, 0); EXPECT_EQ(result.outcome, ReplacementOutcome::NotReplaced);
+    EXPECT_TRUE(result.sourceAuthenticationFailed);
     EXPECT_EQ(read().replacement->phase, "prepared");
 }
 TEST_F(VaultReplacementEngineTest, EmptyOwnedPasswordRefused) {
@@ -278,12 +314,16 @@ TEST_F(VaultReplacementEngineTest, UnsupportedFormatRefused) {
 }
 TEST_F(VaultReplacementEngineTest, DifferentVaultLineageRefusedBeforeUnwrap) {
     sql(source, "UPDATE vault_metadata SET vault_id=randomblob(16);"); EXPECT_FALSE(run());
-    EXPECT_EQ(probe.decryptions, 0); EXPECT_TRUE(bytes(principal) == original);
+    EXPECT_EQ(probe.decryptions, 0); EXPECT_FALSE(result.sourceAuthenticationFailed);
+    EXPECT_TRUE(bytes(principal) == original);
 }
 TEST_F(VaultReplacementEngineTest, LastCorruptedEntryAfterValidEntryPreventsExchange) {
     sql(source, "UPDATE entries SET ciphertext=zeroblob(length(ciphertext)) WHERE entry_id="
         "(SELECT entry_id FROM entries ORDER BY entry_id LIMIT 1 OFFSET 1);");
-    EXPECT_FALSE(run()); EXPECT_EQ(probe.decryptions, 3); EXPECT_EQ(probe.exchanges, 0);
+    EXPECT_FALSE(run());
+    SCOPED_TRACE(result.diagnostic.toStdString());
+    EXPECT_EQ(probe.decryptions, 3); EXPECT_EQ(probe.exchanges, 0);
+    EXPECT_FALSE(result.sourceAuthenticationFailed);
     EXPECT_TRUE(bytes(principal) == original); blocked();
 }
 TEST_F(VaultReplacementEngineTest, ExceptionDuringAuthenticationCleansOwnedSecrets) {
@@ -525,6 +565,33 @@ TEST_F(VaultReplacementEngineTest, FailedAuthenticationRetainsLiveCapabilityForE
     ASSERT_TRUE(authority.valid(error)); ASSERT_TRUE(authority.abandonPreparation(error));
     EXPECT_EQ(store().recoveryAccess(principal, error), VaultRecoveryAccess::Allowed); unchanged();
 }
+TEST_F(VaultReplacementEngineTest, PreparedRecoveryAfterWrongMasterInFreshProcessAllowsNormalAuthentication) {
+    ASSERT_FALSE(run(nullptr, "wrong-fictitious-master")); ASSERT_TRUE(result.sourceAuthenticationFailed);
+    ASSERT_TRUE(read().replacement); EXPECT_EQ(read().replacement->phase, "prepared");
+    const auto op = read().replacement->operationId;
+    SecureBuffer key(0); std::string failure;
+    EXPECT_FALSE(VaultLifecycleService::unlockVault(principal.toStdString(), std::string(master), key, failure)); EXPECT_TRUE(key.empty());
+    QProcess fresh;
+    fresh.start(QCoreApplication::applicationFilePath(), {"--prepared-recover", config, registered.localId, op});
+    ASSERT_TRUE(fresh.waitForFinished(10000)); ASSERT_EQ(fresh.exitStatus(), QProcess::NormalExit); ASSERT_EQ(fresh.exitCode(), 0);
+    EXPECT_TRUE(key.empty()); EXPECT_FALSE(read().replacement); unchanged();
+    EXPECT_FALSE(VaultLifecycleService::unlockVault(principal.toStdString(), "wrong-fictitious-master", key, failure)); EXPECT_TRUE(key.empty());
+    ASSERT_TRUE(VaultLifecycleService::unlockVault(principal.toStdString(), std::string(master), key, failure));
+    std::vector<passwall::models::CredentialSummary> summaries;
+    ASSERT_TRUE(CredentialService::listSummaries(principal.toStdString(), key, summaries, failure)); EXPECT_EQ(summaries.size(), 3U);
+}
+TEST_F(VaultReplacementEngineTest, PreparedRecoveryAfterCancellationPreservesCandidateAndRequiresNewAuthentication) {
+    Control cancellation{[](auto point) { return point == ReplacementCheckpoint::BeforeArm; }};
+    ASSERT_FALSE(run(&cancellation)); ASSERT_EQ(result.outcome, ReplacementOutcome::CancelledBeforeEngagement);
+    const auto pending = read(); ASSERT_TRUE(pending.replacement); ASSERT_TRUE(pending.replacement->candidate);
+    const auto artifact = pending.replacement->candidate->path; const auto artifactBytes = bytes(artifact);
+    const auto recovered = recoverPreparedReplacementForTest(store(), registered.localId, pending.replacement->operationId);
+    ASSERT_EQ(recovered.finalization.state, ReplacementFinalizationState::Resolved) << recovered.diagnostic.toStdString();
+    EXPECT_EQ(bytes(artifact), artifactBytes); unchanged(); EXPECT_FALSE(read().replacement);
+    SecureBuffer key(0); EXPECT_TRUE(key.empty()); std::string failure;
+    ASSERT_TRUE(VaultLifecycleService::unlockVault(principal.toStdString(), std::string(master), key, failure));
+    EXPECT_EQ(store().recoveryAccess(artifact, error), VaultRecoveryAccess::RecoveryRequired);
+}
 TEST_F(VaultReplacementEngineTest, LateCancellationAfterExchangeNeverClaimsCancellation) {
     Control c{[](auto p) { return p == ReplacementCheckpoint::AfterExchange; }};
     EXPECT_FALSE(run(&c)); EXPECT_EQ(result.outcome, ReplacementOutcome::ReplacedDurabilityUnconfirmed);
@@ -600,5 +667,71 @@ TEST_F(VaultReplacementEngineTest, UnreadableRegistryNeverPermitsRecovery) {
         r.replacement->operationId, ReplacementRecoveryAction::FinalizeExchanged);
     EXPECT_EQ(result.layout, ReplacementLayout::Unrecognized);
     EXPECT_EQ(store().recoveryAccess(principal, error), VaultRecoveryAccess::Unavailable);
+}
+TEST_F(VaultReplacementEngineTest, EngagedRecoveryArmedRefusesChildStillOwningOldArtifact) {
+    crashAt(ReplacementCheckpoint::AfterExchange);
+    heldOldArtifactRefusesRecoveryUntilExit();
+}
+TEST_F(VaultReplacementEngineTest, EngagedRecoveryConfirmedRefusesChildStillOwningOldArtifact) {
+    Control fault{[&](auto point) { if (point == ReplacementCheckpoint::AfterDirectorySync)
+        replacementRegistrySyncFaultForTest(config, 1); return false; }};
+    ASSERT_FALSE(run(&fault)); ASSERT_TRUE(read().replacement);
+    ASSERT_EQ(read().replacement->phase, "identity-confirmed");
+    heldOldArtifactRefusesRecoveryUntilExit();
+}
+TEST_F(VaultReplacementEngineTest, EngagedRecoveryCrashAfterProtectedConfirmationResumesIdempotentlyInFreshProcess) {
+    crashAt(ReplacementCheckpoint::AfterExchange); const auto pending = read(); ASSERT_TRUE(pending.replacement);
+    const auto op = pending.replacement->operationId, artifact = pending.replacement->candidate->path;
+    const auto newBytes = bytes(principal), oldBytes = bytes(artifact);
+    const auto child = ::fork(); ASSERT_GE(child, 0);
+    if (child == 0) {
+        replacementCrashAfterRegistrySyncForTest(config);
+        const auto recovered = VaultReplacementAuthorization::recoverReplacement(store(), registered.localId, op,
+            ReplacementRecoveryAction::FinalizeExchanged);
+        ::_exit(recovered.finalization.state == ReplacementFinalizationState::Resolved ? 85 : 86);
+    }
+    int status = 0; ASSERT_EQ(::waitpid(child, &status, 0), child); ASSERT_TRUE(WIFEXITED(status)); ASSERT_EQ(WEXITSTATUS(status), 74);
+    ASSERT_TRUE(read().replacement); EXPECT_EQ(read().replacement->phase, "identity-confirmed"); blocked();
+    newProcessRecovery(ReplacementLayout::Resolved);
+    newProcessRecovery(ReplacementLayout::Resolved); // A new process again, no cached authority or result.
+    EXPECT_FALSE(read().replacement); EXPECT_EQ(read().resolvedReplacement->operationId, op);
+    EXPECT_EQ(bytes(principal), newBytes); EXPECT_EQ(bytes(artifact), oldBytes); EXPECT_EQ(oldBytes, original);
+}
+TEST_F(VaultReplacementEngineTest, EngagedRecoveryConfirmedRejectsChangedCandidateDigest) {
+    Control fault{[&](auto point) { if (point == ReplacementCheckpoint::AfterDirectorySync)
+        replacementRegistrySyncFaultForTest(config, 1); return false; }};
+    ASSERT_FALSE(run(&fault)); const auto pending = read(); ASSERT_TRUE(pending.replacement);
+    ASSERT_EQ(pending.replacement->phase, "identity-confirmed"); ASSERT_EQ(pending.replacement->candidateDigest.size(), 32);
+    const auto artifact = pending.replacement->candidate->path;
+    QFile changed(principal); ASSERT_TRUE(changed.open(QIODevice::Append)); ASSERT_EQ(changed.write("x"), 1); changed.close();
+    const auto refused = VaultReplacementAuthorization::resumeFinalization(store(), registered.localId, pending.replacement->operationId);
+    EXPECT_EQ(refused.state, ReplacementFinalizationState::RecoveryRequired);
+    newProcessRecovery(ReplacementLayout::Unrecognized);
+    blocked(); EXPECT_EQ(bytes(artifact), original); EXPECT_EQ(*read().replacement, *pending.replacement);
+}
+TEST_F(VaultReplacementEngineTest, EngagedRecoveryUnconfirmedReceiptNeedsFreshDurabilityBeforeAuthentication) {
+    crashAt(ReplacementCheckpoint::AfterExchange); const auto pending = read(); ASSERT_TRUE(pending.replacement);
+    const auto op = pending.replacement->operationId, artifact = pending.replacement->candidate->path;
+    const auto newBytes = bytes(principal), oldBytes = bytes(artifact);
+    replacementRegistrySyncFaultForTest(config, 2); // Confirmed identity durable; final receipt fsync fails.
+    const auto unconfirmed = VaultReplacementAuthorization::recoverReplacement(store(), registered.localId, op,
+        ReplacementRecoveryAction::FinalizeExchanged);
+    ASSERT_EQ(unconfirmed.finalization.state, ReplacementFinalizationState::SafeResolutionUnconfirmed);
+    ASSERT_TRUE(read().resolvedReplacement); EXPECT_FALSE(read().replacement);
+    SecureBuffer key(0); std::string failure;
+    replacementRegistrySyncFaultForTest(config, 1);
+    EXPECT_FALSE(VaultLifecycleService::unlockVault(principal.toStdString(), std::string(master), key, failure));
+    EXPECT_TRUE(key.empty()); EXPECT_NE(failure.find("Durabilité"), std::string::npos);
+    QProcess fresh;
+    fresh.start(QCoreApplication::applicationFilePath(), {"--registry-probe", config, principal, registered.localId, op, "read-no-durability", "blocked"});
+    ASSERT_TRUE(fresh.waitForFinished(10000)); ASSERT_EQ(fresh.exitStatus(), QProcess::NormalExit); ASSERT_EQ(fresh.exitCode(), 0);
+    EXPECT_TRUE(read().resolvedReplacement); EXPECT_TRUE(key.empty());
+    const auto resumed = VaultReplacementAuthorization::resumeFinalization(store(), registered.localId, op);
+    ASSERT_EQ(resumed.state, ReplacementFinalizationState::Resolved);
+    ASSERT_TRUE(VaultLifecycleService::unlockVault(principal.toStdString(), std::string(master), key, failure));
+    QProcess revalidated;
+    revalidated.start(QCoreApplication::applicationFilePath(), {"--registry-probe", config, principal, registered.localId, op, "read", "allowed"});
+    ASSERT_TRUE(revalidated.waitForFinished(10000)); ASSERT_EQ(revalidated.exitStatus(), QProcess::NormalExit); ASSERT_EQ(revalidated.exitCode(), 0);
+    EXPECT_EQ(bytes(principal), newBytes); EXPECT_EQ(bytes(artifact), oldBytes); EXPECT_EQ(oldBytes, original);
 }
 } // namespace

@@ -158,7 +158,6 @@ struct Authentication {
     }
     static bool verify(void* value, const std::string& path, std::string& error) {
         auto& context = *static_cast<Authentication*>(value);
-        context.failed = true;
         struct WipePassword {
             core::SecureBuffer& value;
             ~WipePassword() noexcept { value = core::SecureBuffer(0); }
@@ -170,6 +169,10 @@ struct Authentication {
         core::SecureBuffer key(0);
         const auto code = VaultKeyService::unlock({context.password.data(), context.password.size()}, metadata, key);
         if (code != core::CryptoError::None) {
+            // Structured classification for the supervisor: lineage, I/O and
+            // entry-authentication failures must not be presented as an
+            // ordinary rejected master password.
+            context.failed = true;
             error = "Mot de passe maître incorrect ou authentification du coffre impossible."; return false;
         }
         if (!CredentialService::authenticateAll(path, key, error,

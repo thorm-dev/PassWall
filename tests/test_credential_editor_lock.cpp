@@ -18,6 +18,8 @@
 #include <sqlite3.h>
 
 #include <QAbstractItemModel>
+#include <QAction>
+#include <QComboBox>
 #include <QApplication>
 #include <QClipboard>
 #include <QDialog>
@@ -25,18 +27,23 @@
 #include <QEventLoop>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QInputDialog>
+#include <QKeyEvent>
 #include <QLineEdit>
 #include <QJsonDocument>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QLockFile>
 #include <QPushButton>
 #include <QSettings>
 #include <QStackedWidget>
+#include <QStatusBar>
 #include <QTemporaryDir>
 #include <QTextEdit>
 #include <QTimer>
 #include <QScopeGuard>
 #include <cstring>
+#include <cstdio>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -46,17 +53,56 @@
 #include <thread>
 
 #ifdef Q_OS_LINUX
+namespace passwall::tests {
+QString restoreWorkerPathOverride;
+QString restoreApplicationPathOverride;
+void overrideRestoreExecutablePaths(const QString& worker, const QString& application)
+{
+    restoreWorkerPathOverride = worker;
+    restoreApplicationPathOverride = application;
+}
+}
 extern "C" QString wrappedRestoreWorkerPath() asm("__wrap__ZN8passwall8services10RestoreJob17siblingWorkerPathEv");
-extern "C" QString wrappedRestoreWorkerPath() { return QString::fromUtf8(RESTORE_TEST_WORKER); }
+extern "C" QString wrappedRestoreWorkerPath() {
+    return passwall::tests::restoreWorkerPathOverride.isEmpty()
+        ? QString::fromUtf8(RESTORE_TEST_WORKER) : passwall::tests::restoreWorkerPathOverride;
+}
+extern "C" QString wrappedRestoreApplicationPath() asm("__wrap__ZN8passwall8services10RestoreJob22siblingApplicationPathEv");
+extern "C" QString wrappedRestoreApplicationPath() {
+    return passwall::tests::restoreApplicationPathOverride.isEmpty()
+        ? QCoreApplication::applicationFilePath() : passwall::tests::restoreApplicationPathOverride;
+}
 namespace {
 std::atomic<bool> pausePreparationSync{false}, preparationSyncEntered{false}, releasePreparationSync{false};
 std::atomic<bool> failPreparationSync{false};
 std::mutex preparationSyncMutex;
 std::condition_variable preparationSyncCondition;
+std::mutex phaseSyncMutex;
+QString phaseSyncPath;
+QByteArray phaseSyncMarker;
+std::atomic<bool> phaseSyncFailed{false};
 const auto guiTestThread = std::this_thread::get_id();
 }
 extern "C" int __real_fsync(int);
 extern "C" int __wrap_fsync(int fd) {
+    // GUI recovery tests only: fail the actual registry fsync AFTER the
+    // requested phase is visible, not an unrelated vault/directory sync.
+    {
+        std::lock_guard lock(phaseSyncMutex);
+        if (!phaseSyncPath.isEmpty() && std::this_thread::get_id() != guiTestThread) {
+            char link[64], path[4096];
+            const int length = std::snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+            const auto size = length > 0 && length < int(sizeof(link)) ? ::readlink(link, path, sizeof(path)) : -1;
+            const auto expected = QFile::encodeName(phaseSyncPath);
+            if (size == expected.size() && std::memcmp(path, expected.constData(), size) == 0) {
+                QFile file(phaseSyncPath);
+                if (file.open(QIODevice::ReadOnly) && file.readAll().contains(phaseSyncMarker)) {
+                    phaseSyncPath.clear(); phaseSyncFailed = true;
+                    errno = EIO; return -1;
+                }
+            }
+        }
+    }
     if (std::this_thread::get_id() != guiTestThread && failPreparationSync.exchange(false)) {
         errno = EIO; return -1;
     }
@@ -109,6 +155,11 @@ void releaseSettingsSync() {
     releasePreparationSync = true; pausePreparationSync = false; preparationSyncCondition.notify_all();
 }
 void failSettingsSync() { failPreparationSync = true; }
+void failSettingsSyncWhenPublished(const QString& path, const QByteArray& marker) {
+    std::lock_guard lock(phaseSyncMutex);
+    phaseSyncPath = path; phaseSyncMarker = marker; phaseSyncFailed = false;
+}
+bool publishedSettingsSyncFailed() { return phaseSyncFailed.load(); }
 void suppressGuiStopsForRestore(bool);
 bool guiRestoreStopWasRequested();
 void releaseGuiRestoreStop();
@@ -116,7 +167,9 @@ void releaseGuiRestoreStop();
 #endif
 
 #include <functional>
+#include <algorithm>
 #include <array>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -425,11 +478,39 @@ protected:
         window.reset();
         QSettings settings("PassWall", "PassWall");
         settings.setValue("security/autoLockMinutes", autoLockMinutes);
+        settings.sync();
+        newLockedWindow();
+    }
+
+    void newLockedWindow()
+    {
         window = std::make_unique<MainWindow>();
         window->setLifecycleProtectionValidator([] { return true; }, [] {});
         window->setLifecycleProtectionAvailable(true);
         window->show();
         EXPECT_FALSE(window->acquireLease().unlocked);
+    }
+
+    QMessageBox* migrationNotice() const
+    {
+        return window->findChild<QMessageBox*>(QStringLiteral("autoLockMigrationNotice"));
+    }
+
+    void chooseInactivityDuration(int minutes, bool accept = true)
+    {
+        QTimer::singleShot(0, window.get(), [&, minutes, accept] {
+            auto* dialog = window->findChild<QInputDialog*>("autoLockDurationDialog");
+            ASSERT_NE(dialog, nullptr);
+            auto* combo = dialog->findChild<QComboBox*>(); ASSERT_NE(combo, nullptr);
+            EXPECT_FALSE(combo->isEditable());
+            EXPECT_EQ(dialog->comboBoxItems(), (QStringList{"1 minute", "5 minutes", "15 minutes", "30 minutes", "60 minutes"}));
+            constexpr std::array durations{1, 5, 15, 30, 60};
+            const auto found = std::find(durations.begin(), durations.end(), minutes);
+            ASSERT_NE(found, durations.end());
+            combo->setCurrentIndex(int(found - durations.begin()));
+            if (accept) dialog->accept(); else dialog->reject();
+        });
+        runBounded([&] { window->findChild<QAction*>("autoLockDurationAction")->trigger(); });
     }
 
     QTimer* inactivityTimer() const
@@ -1015,6 +1096,20 @@ TEST_P(RestoreTerminalRejectTest, DataAfterTerminalResultCannotBecomeFullSuccess
     EXPECT_TRUE(QFile::exists(o.result.replacement.recoveryArtifact));
 }
 INSTANTIATE_TEST_SUITE_P(TerminalProtocol, RestoreTerminalRejectTest, ::testing::Values("byte", "duplicate"));
+
+TEST_F(MainWindowEditorLockTest, RestoreAdmissionRefusalIsNotReportedAsInvalidProtocol)
+{
+    using namespace passwall::services;
+    const auto reset = qScopeGuard([] { qunsetenv("PW_RESTORE_TEST_ADMISSION_REFUSAL"); });
+    qputenv("PW_RESTORE_TEST_ADMISSION_REFUSAL", "1");
+    const auto source = restoreSource(); RestoreObservation observation;
+    ASSERT_NE(startRestore(observation, source), nullptr);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return observation.terminated; }, 10000));
+    EXPECT_EQ(observation.result.outcome, RestoreOutcome::Unknown);
+    EXPECT_TRUE(observation.result.diagnostic.contains(QStringLiteral("Admission locale")));
+    EXPECT_FALSE(observation.result.diagnostic.contains(QStringLiteral("protocole invalide")));
+    EXPECT_FALSE(window->acquireLease().unlocked);
+}
 
 TEST_F(MainWindowEditorLockTest, RestoreResultDoesNotReleaseNewInodeReservationBeforeActualExit)
 {
@@ -2022,9 +2117,11 @@ TEST_F(MainWindowEditorLockTest, LinuxLifecycleReentrantEventWaitsForManualLockC
     expectLockedAfterRefresh();
 }
 
-TEST_F(MainWindowEditorLockTest, LinuxLifecycleLocksInsideRefreshErrorWithInactivityDisabled)
+TEST_F(MainWindowEditorLockTest, LinuxLifecycleLocksInsideRefreshErrorAfterDisabledPreferenceMigration)
 {
     restartLockedWindow(0);
+    QApplication::processEvents();
+    ASSERT_NE(migrationNotice(), nullptr); migrationNotice()->accept();
     passwall::tests::FakeLogin1Backend* backend;
     auto monitor = attachMonitor(backend);
     establishProtection(*backend);
@@ -2550,7 +2647,161 @@ TEST_F(MainWindowEditorLockTest, InactivityLockDuringPageChangeSkipsTheRefresh)
     EXPECT_TRUE(window->findChildren<QMessageBox*>().isEmpty());
 }
 
-TEST_F(MainWindowEditorLockTest, InactivityDisabledPolicyDoesNotArmTheTimer)
+TEST_F(MainWindowEditorLockTest, InactivityMandatoryChoicesPersistAndReloadWithoutMigrationNotice)
+{
+    QSettings("PassWall", "PassWall").setValue("unrelated/value", "keep");
+    for (const int minutes : {1, 5, 15, 30, 60}) {
+        SCOPED_TRACE(minutes);
+        chooseInactivityDuration(minutes);
+        EXPECT_TRUE(inactivityTimer()->isActive());
+        EXPECT_EQ(inactivityTimer()->interval(), minutes * 60'000);
+        EXPECT_EQ(QSettings("PassWall", "PassWall").value("security/autoLockMinutes").toInt(), minutes);
+        window.reset(); newLockedWindow(); QApplication::processEvents();
+        EXPECT_EQ(migrationNotice(), nullptr);
+        EXPECT_FALSE(inactivityTimer()->isActive());
+        EXPECT_EQ(inactivityTimer()->interval(), minutes * 60'000);
+        runBounded([&] { unlock(); });
+        EXPECT_TRUE(inactivityTimer()->isActive());
+        EXPECT_EQ(inactivityTimer()->interval(), minutes * 60'000);
+        EXPECT_EQ(QSettings("PassWall", "PassWall").value("unrelated/value").toString(), "keep");
+    }
+}
+
+TEST_F(MainWindowEditorLockTest, InactivityMissingPreferenceDefaultsToOneMinuteWithoutNotification)
+{
+    window.reset();
+    { QSettings settings("PassWall", "PassWall"); settings.remove("security/autoLockMinutes"); settings.sync(); }
+    newLockedWindow(); QApplication::processEvents();
+    EXPECT_EQ(migrationNotice(), nullptr); EXPECT_EQ(inactivityTimer()->interval(), 60'000);
+    runBounded([&] { unlock(); });
+    EXPECT_TRUE(inactivityTimer()->isActive()); EXPECT_EQ(inactivityTimer()->interval(), 60'000);
+}
+
+TEST_F(MainWindowEditorLockTest, InactivityInvalidPreferencesMigrateUniformlyWithoutDisablingProtection)
+{
+    const QList<QVariant> invalid{0, 10, -1, 2, 61, std::numeric_limits<int>::max(),
+        QStringLiteral("disabled"), QStringLiteral("1.5"), QStringLiteral("999999999999999999999"),
+        QString{}, 1.5, true};
+    for (const auto& value : invalid) {
+        SCOPED_TRACE(value.toString().toStdString());
+        window.reset();
+        { QSettings settings("PassWall", "PassWall"); settings.setValue("security/autoLockMinutes", value); settings.sync(); }
+        newLockedWindow(); QApplication::processEvents();
+        ASSERT_NE(migrationNotice(), nullptr);
+        EXPECT_FALSE(migrationNotice()->isModal());
+        EXPECT_EQ(QApplication::activeModalWidget(), nullptr);
+        EXPECT_EQ(QSettings("PassWall", "PassWall").value("security/autoLockMinutes").toInt(), 1);
+        migrationNotice()->accept(); QApplication::processEvents();
+        runBounded([&] { unlock(); });
+        ASSERT_TRUE(window->acquireLease().unlocked);
+        EXPECT_TRUE(inactivityTimer()->isActive()); EXPECT_EQ(inactivityTimer()->interval(), 60'000);
+        window.reset(); newLockedWindow(); QApplication::processEvents();
+        EXPECT_EQ(migrationNotice(), nullptr); // The durable migration is not announced again.
+    }
+}
+
+TEST_F(MainWindowEditorLockTest, InactivityMigrationPersistenceFailureStillUsesOneMinuteAndCanRetry)
+{
+    window.reset();
+    QSettings settings("PassWall", "PassWall");
+    settings.setValue("security/autoLockMinutes", 0); settings.sync();
+    QLockFile writer(settings.fileName() + ".registry-lock"); ASSERT_TRUE(writer.tryLock(0));
+    newLockedWindow(); QApplication::processEvents();
+    ASSERT_NE(migrationNotice(), nullptr); EXPECT_FALSE(migrationNotice()->isModal());
+    EXPECT_TRUE(migrationNotice()->text().contains("Enregistrement impossible"));
+    EXPECT_EQ(inactivityTimer()->interval(), 60'000);
+    EXPECT_EQ(settings.value("security/autoLockMinutes").toInt(), 0);
+    writer.unlock(); migrationNotice()->accept();
+    runBounded([&] { unlock(); });
+    EXPECT_TRUE(inactivityTimer()->isActive()); EXPECT_EQ(inactivityTimer()->interval(), 60'000);
+    window.reset(); newLockedWindow(); QApplication::processEvents();
+    ASSERT_NE(migrationNotice(), nullptr);
+    EXPECT_FALSE(migrationNotice()->text().contains("Enregistrement impossible"));
+    EXPECT_EQ(QSettings("PassWall", "PassWall").value("security/autoLockMinutes").toInt(), 1);
+}
+
+TEST_F(MainWindowEditorLockTest, InactivityMigrationNeverRewritesAnInvalidVaultRegistry)
+{
+    window.reset();
+    { QSettings settings("PassWall", "PassWall");
+      settings.setValue("security/autoLockMinutes", 0);
+      settings.setValue("vaultRegistry/data", "invalid-registry"); settings.sync(); }
+    const auto path = QSettings("PassWall", "PassWall").fileName();
+    QFile file(path); ASSERT_TRUE(file.open(QIODevice::ReadOnly)); const auto before = file.readAll(); file.close();
+    newLockedWindow(); QApplication::processEvents();
+    EXPECT_EQ(inactivityTimer()->interval(), 60'000);
+    ASSERT_NE(migrationNotice(), nullptr);
+    EXPECT_TRUE(migrationNotice()->text().contains("Enregistrement impossible"));
+    ASSERT_TRUE(file.open(QIODevice::ReadOnly)); EXPECT_EQ(file.readAll(), before);
+    EXPECT_FALSE(window->acquireLease().unlocked);
+}
+
+TEST_F(MainWindowEditorLockTest, InactivityFailedGuiPreferenceSaveFallsBackToOneMinuteInMemory)
+{
+    QLockFile writer(QSettings("PassWall", "PassWall").fileName() + ".registry-lock");
+    ASSERT_TRUE(writer.tryLock(0)); chooseInactivityDuration(60);
+    EXPECT_TRUE(inactivityTimer()->isActive()); EXPECT_EQ(inactivityTimer()->interval(), 60'000);
+    EXPECT_TRUE(window->statusBar()->currentMessage().contains("non enregistrées"));
+    writer.unlock(); EXPECT_TRUE(window->acquireLease().unlocked);
+    EXPECT_EQ(QSettings("PassWall", "PassWall").value("security/autoLockMinutes").toInt(), 1);
+}
+
+TEST_F(MainWindowEditorLockTest, InactivityCancelledSettingPreservesPolicyAndTimer)
+{
+    restartLockedWindow(5); runBounded([&] { unlock(); });
+    const auto id = inactivityTimer()->timerId(); chooseInactivityDuration(60, false);
+    EXPECT_EQ(inactivityTimer()->interval(), 300'000); EXPECT_TRUE(inactivityTimer()->isActive());
+    EXPECT_EQ(inactivityTimer()->timerId(), id);
+    EXPECT_EQ(QSettings("PassWall", "PassWall").value("security/autoLockMinutes").toInt(), 5);
+}
+
+TEST_F(MainWindowEditorLockTest, InactivityExpirationRejectsSettingDialogAndCannotRearmVault)
+{
+    const auto lease = window->acquireLease();
+    QTimer::singleShot(0, window.get(), [&] {
+        auto* dialog = window->findChild<QInputDialog*>("autoLockDurationDialog"); ASSERT_NE(dialog, nullptr);
+        dialog->findChild<QComboBox*>()->setCurrentIndex(4);
+        inactivityTimer()->start(1); // The actual timeout rejects the modal setting, not an accept.
+    });
+    runBounded([&] { window->findChild<QAction*>("autoLockDurationAction")->trigger(); });
+    EXPECT_FALSE(window->isLeaseCurrent(lease)); expectLockedAfterRefresh();
+    EXPECT_EQ(QSettings("PassWall", "PassWall").value("security/autoLockMinutes").toInt(), 1);
+    runBounded([&] { unlock(); });
+    EXPECT_TRUE(inactivityTimer()->isActive()); EXPECT_EQ(inactivityTimer()->interval(), 60'000);
+}
+
+TEST_F(MainWindowEditorLockTest, InactivityUserInputRestartsOnlyAnActiveTimer)
+{
+    const auto original = inactivityTimer()->timerId();
+    auto* target = window->findChild<QLineEdit*>("credentialSearchEdit");
+    QKeyEvent key(QEvent::KeyPress, Qt::Key_Shift, Qt::ShiftModifier);
+    QApplication::sendEvent(target, &key);
+    EXPECT_TRUE(inactivityTimer()->isActive()); EXPECT_NE(inactivityTimer()->timerId(), original);
+    EXPECT_EQ(inactivityTimer()->interval(), 60'000);
+    lock(); QApplication::sendEvent(target, &key);
+    EXPECT_FALSE(inactivityTimer()->isActive()); EXPECT_FALSE(window->acquireLease().unlocked);
+}
+
+TEST_F(MainWindowEditorLockTest, InactivityOneRealMinuteExpiresWithoutSyntheticTimeoutOrIntervalChange)
+{
+    const auto lease = window->acquireLease();
+    ASSERT_TRUE(lease.unlocked); ASSERT_EQ(inactivityTimer()->interval(), 60'000);
+    ASSERT_GE(inactivityTimer()->remainingTime(), 59'000);
+    bool invalidated = false; QEventLoop idle; QTimer watchdog;
+    watchdog.setSingleShot(true);
+    QObject::connect(&watchdog, &QTimer::timeout, &idle, &QEventLoop::quit);
+    QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated, &idle, [&] { invalidated = true; idle.quit(); });
+    QElapsedTimer elapsed; elapsed.start();
+    watchdog.start(75'000); idle.exec();
+    ASSERT_TRUE(invalidated);
+    EXPECT_GE(elapsed.elapsed(), 59'000); // No accelerated clock or direct timeout signal in this case.
+    EXPECT_FALSE(window->isLeaseCurrent(lease)); expectLockedAfterRefresh();
+    std::vector<passwall::models::CredentialSummary> output;
+    EXPECT_NE(window->copySummaries(lease, output), passwall::native::VaultAccessResult::Success);
+    EXPECT_TRUE(output.empty());
+}
+
+TEST_F(MainWindowEditorLockTest, InactivityDisabledPreferenceMigratesAndArmsBeforePagePublication)
 {
     restartLockedWindow(0);
     ASSERT_NE(inactivityTimer(), nullptr);
@@ -2561,42 +2812,38 @@ TEST_F(MainWindowEditorLockTest, InactivityDisabledPolicyDoesNotArmTheTimer)
         if (pages->currentWidget() == window->findChild<QWidget*>(QStringLiteral("pageVault"))) {
             checked = true;
             EXPECT_TRUE(window->acquireLease().unlocked);
-            EXPECT_FALSE(inactivityTimer()->isActive());
+            EXPECT_TRUE(inactivityTimer()->isActive());
+            EXPECT_EQ(inactivityTimer()->interval(), 60'000);
         }
     });
     runBounded([&]() { unlock(); });
     EXPECT_TRUE(checked);
     EXPECT_TRUE(window->acquireLease().unlocked);
-    EXPECT_FALSE(inactivityTimer()->isActive());
+    EXPECT_TRUE(inactivityTimer()->isActive());
     QSettings settings("PassWall", "PassWall");
-    EXPECT_EQ(settings.value("security/autoLockMinutes").toInt(), 0);
+    EXPECT_EQ(settings.value("security/autoLockMinutes").toInt(), 1);
 }
 
-TEST_F(MainWindowEditorLockTest, InactivityDisabledPolicyIsRespectedInsideRefreshError)
+TEST_F(MainWindowEditorLockTest, InactivityMigratedPreferenceStillExpiresInsideRefreshError)
 {
     restartLockedWindow(0);
+    QApplication::processEvents();
+    ASSERT_NE(migrationNotice(), nullptr); migrationNotice()->accept();
     corruptEntryCiphertext();
     bool checked = false;
-    bool checkedAfterWait = false;
     QObject observer;
     duringRefreshError(observer, [&](QMessageBox& warning) {
         checked = true;
         EXPECT_TRUE(window->acquireLease().unlocked);
-        EXPECT_FALSE(inactivityTimer()->isActive());
-        QTimer::singleShot(20, &warning, [&]() {
-            checkedAfterWait = true;
-            EXPECT_TRUE(window->acquireLease().unlocked);
-            EXPECT_FALSE(inactivityTimer()->isActive());
-            warning.accept();
-        });
+        EXPECT_TRUE(inactivityTimer()->isActive());
+        inactivityTimer()->start(1); // Real timeout, accelerated only in this test.
+        (void)warning;
     });
     runBounded([&]() { unlock(); });
     EXPECT_TRUE(checked);
-    EXPECT_TRUE(checkedAfterWait);
-    EXPECT_TRUE(window->acquireLease().unlocked);
-    EXPECT_FALSE(inactivityTimer()->isActive());
+    expectLockedAfterRefresh();
     QSettings settings("PassWall", "PassWall");
-    EXPECT_EQ(settings.value("security/autoLockMinutes").toInt(), 0);
+    EXPECT_EQ(settings.value("security/autoLockMinutes").toInt(), 1);
 }
 
 } // namespace

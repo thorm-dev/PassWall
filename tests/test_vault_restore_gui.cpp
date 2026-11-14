@@ -1,6 +1,7 @@
 #include "gui/main_window.hpp"
 #include "gui/vault_restore_dialog.hpp"
 #include "gui/vault_restore_controller.hpp"
+#include "gui/vault_recovery_controller.hpp"
 #include "services/credential_service.hpp"
 #include "services/vault_lifecycle_service.hpp"
 #include "storage/vault_operation_guard.hpp"
@@ -14,6 +15,7 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QInputDialog>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
@@ -29,7 +31,13 @@
 #include <sodium.h>
 #include <sqlite3.h>
 
-namespace passwall::tests { void suppressGuiStopsForRestore(bool); void releaseGuiRestoreStop(); }
+namespace passwall::tests {
+void suppressGuiStopsForRestore(bool); void releaseGuiRestoreStop();
+void overrideRestoreExecutablePaths(const QString&, const QString&);
+void holdSettingsSync(); bool settingsSyncEntered(); void releaseSettingsSync(); void failSettingsSync();
+void failSettingsSyncWhenPublished(const QString&, const QByteArray&);
+bool publishedSettingsSyncFailed();
+}
 
 namespace {
 using namespace passwall::services;
@@ -37,6 +45,7 @@ using passwall::core::SecureBuffer;
 using passwall::gui::MainWindow;
 using passwall::gui::VaultRestoreDialog;
 using passwall::gui::VaultRestoreController;
+using passwall::storage::VaultOperationGuard;
 using passwall::tests::waitFor;
 constexpr auto master = "fictitious-gui-restore-master";
 QByteArray bytes(const QString& path) {
@@ -148,6 +157,17 @@ protected:
         ASSERT_TRUE(waitFor([&] { return dialog && widget<QProgressBar>("restoreActivity")->isHidden()
             && widget<QPushButton>("restoreCancelButton")->text() == "Fermer"; }, 20000));
     }
+    void leavePreparedForRecovery() {
+        // A real, non-authentication engine refusal leaves the 6A preparation
+        // intact without relying on the password-dialog cancellation policy.
+        QFile existing(precaution);
+        ASSERT_TRUE(existing.open(QIODevice::WriteOnly));
+        ASSERT_EQ(existing.write("keep"), 4);
+        existing.close();
+        choose(); prepare(); ASSERT_NE(execute(), nullptr); done();
+        ASSERT_TRUE(record().replacement);
+        ASSERT_EQ(record().replacement->phase, "prepared");
+    }
     QString status() { return widget<QLabel>("restoreStatusLabel")->text(); }
     VaultRegistration record() {
         QVector<VaultRegistration> records; QString error;
@@ -159,6 +179,28 @@ protected:
         window->findChild<QLineEdit*>("unlockPathEdit")->setText(principal);
         window->findChild<QLineEdit*>("unlockPasswordEdit")->setText(master);
         window->findChild<QPushButton*>("unlockVaultButton")->click(); ASSERT_TRUE(window->acquireLease().unlocked);
+    }
+    QPointer<QDialog> recovery;
+    template<class T> T* recoveryWidget(const char* name) { return recovery->findChild<T*>(QString::fromLatin1(name)); }
+    void openRecovery() {
+        window->findChild<QAction*>("recoverVaultAction")->trigger();
+        for (auto* w : QApplication::topLevelWidgets())
+            if (w->objectName() == "vaultRecoveryDialog") recovery = qobject_cast<QDialog*>(w);
+        ASSERT_TRUE(recovery);
+        ASSERT_TRUE(waitFor([&] { return !recoveryWidget<QProgressBar>("recoveryActivity")->isVisible(); }, 10000));
+        auto* combo = recoveryWidget<QComboBox>("recoveryVaultCombo");
+        ASSERT_EQ(combo->currentIndex(), -1);
+        const auto index = combo->findText(principal); ASSERT_GE(index, 0); combo->setCurrentIndex(index);
+    }
+    void examineRecovery() {
+        recoveryWidget<QPushButton>("recoveryInspectButton")->click();
+        ASSERT_TRUE(waitFor([&] { return !recoveryWidget<QProgressBar>("recoveryActivity")->isVisible(); }, 10000));
+    }
+    void resolveRecovery() {
+        recoveryWidget<QCheckBox>("recoveryConfirmationCheck")->setChecked(true);
+        ASSERT_TRUE(recoveryWidget<QPushButton>("recoveryResolveButton")->isEnabled());
+        recoveryWidget<QPushButton>("recoveryResolveButton")->click();
+        ASSERT_TRUE(waitFor([&] { return !recoveryWidget<QProgressBar>("recoveryActivity")->isVisible(); }, 10000));
     }
     struct Hold {
         QByteArray path, variable;
@@ -181,6 +223,48 @@ TEST_F(VaultRestoreGuiTest, SelectionAndMissingConfirmationCannotLockOrLaunch)
     EXPECT_TRUE(window->isLeaseCurrent(lease)); EXPECT_TRUE(bytes(principal) == before);
     EXPECT_FALSE(window->findChild<RestoreJob*>()); EXPECT_FALSE(record().replacement);
     EXPECT_FALSE(widget<QLineEdit>("restoreMasterPasswordEdit")->isEnabled());
+}
+TEST_F(VaultRestoreGuiTest, UnsafeWorkerPermissionsAreRefusedBeforeLockOrPersistentPreparation)
+{
+    const auto fakeWorker = directory.filePath("unsafe-restore-worker");
+    QFile file(fakeWorker); ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    ASSERT_EQ(file.write("not executed"), 12); file.close();
+    ASSERT_EQ(::chmod(QFile::encodeName(fakeWorker).constData(), 0775), 0);
+    passwall::tests::overrideRestoreExecutablePaths(fakeWorker, {});
+    const auto reset = qScopeGuard([] { passwall::tests::overrideRestoreExecutablePaths({}, {}); });
+    unlock(); const auto lease = window->acquireLease(); choose();
+    widget<QPushButton>("restorePrepareButton")->click();
+    ASSERT_TRUE(waitFor([&] { return status().contains("permissions non sûres"); }, 3000));
+    EXPECT_TRUE(window->isLeaseCurrent(lease)); EXPECT_FALSE(record().replacement);
+    EXPECT_FALSE(window->findChild<RestoreJob*>());
+}
+TEST_F(VaultRestoreGuiTest, ChangedApplicationInodeIsRefusedBeforeLockOrPersistentPreparation)
+{
+    const auto otherApplication = directory.filePath("different-passwall-app");
+    QFile file(otherApplication); ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    ASSERT_EQ(file.write("not executed"), 12); file.close();
+    ASSERT_EQ(::chmod(QFile::encodeName(otherApplication).constData(), 0755), 0);
+    passwall::tests::overrideRestoreExecutablePaths({}, otherApplication);
+    const auto reset = qScopeGuard([] { passwall::tests::overrideRestoreExecutablePaths({}, {}); });
+    unlock(); const auto lease = window->acquireLease(); choose();
+    widget<QPushButton>("restorePrepareButton")->click();
+    ASSERT_TRUE(waitFor([&] { return status().contains("ne correspond plus"); }, 3000));
+    EXPECT_TRUE(window->isLeaseCurrent(lease)); EXPECT_FALSE(record().replacement);
+    EXPECT_FALSE(window->findChild<RestoreJob*>());
+}
+TEST_F(VaultRestoreGuiTest, WorkerPermissionChangeAfterPreparationIsReportedByTheInterface)
+{
+    choose(); prepare(); ASSERT_TRUE(record().replacement);
+    const auto fakeWorker = directory.filePath("late-unsafe-restore-worker");
+    QFile file(fakeWorker); ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    ASSERT_EQ(file.write("not executed"), 12); file.close();
+    ASSERT_EQ(::chmod(QFile::encodeName(fakeWorker).constData(), 0775), 0);
+    passwall::tests::overrideRestoreExecutablePaths(fakeWorker, {});
+    const auto reset = qScopeGuard([] { passwall::tests::overrideRestoreExecutablePaths({}, {}); });
+    const QPointer<RestoreJob> rejected = execute();
+    ASSERT_TRUE(waitFor([&] { return status().contains("permissions non sûres"); }, 3000));
+    EXPECT_TRUE(!rejected || !rejected->isActive());
+    EXPECT_TRUE(record().replacement); EXPECT_FALSE(window->acquireLease().unlocked);
 }
 TEST_F(VaultRestoreGuiTest, ChangingAChosenPathInvalidatesTheConfirmation)
 {
@@ -233,10 +317,13 @@ TEST_F(VaultRestoreGuiTest, ExplicitOtherPrincipalDoesNotRedirectToTheCurrentlyO
 TEST_F(VaultRestoreGuiTest, WrongMasterCannotReplaceOrPublishAnUnlockedSession)
 {
     const auto before = bytes(principal); choose(); prepare(); ASSERT_NE(execute("fictitious-wrong-master"), nullptr); done();
-    EXPECT_TRUE(status().contains("Mot de passe maître incorrect")); EXPECT_TRUE(bytes(principal) == before);
-    EXPECT_FALSE(window->acquireLease().unlocked); EXPECT_TRUE(record().replacement);
+    EXPECT_EQ(status(), "Mot de passe maître incorrect") << status().toStdString();
+    EXPECT_TRUE(bytes(principal) == before);
+    EXPECT_FALSE(window->acquireLease().unlocked); EXPECT_FALSE(record().replacement);
+    ASSERT_TRUE(record().resolvedReplacement); EXPECT_EQ(record().resolvedReplacement->phase, "abandoned");
     EXPECT_TRUE(widget<QLineEdit>("restoreMasterPasswordEdit")->text().isEmpty());
     EXPECT_FALSE(status().contains("fictitious-wrong-master"));
+    unlock();
 }
 TEST_F(VaultRestoreGuiTest, InvalidSourceCannotReplacePrincipal)
 {
@@ -296,6 +383,29 @@ TEST_F(VaultRestoreGuiTest, SecurityLockWipesMasterBeforePositiveGlobalAcknowled
     ASSERT_TRUE(waitFor([&] { return acknowledged; }));
     EXPECT_FALSE(widget<QLineEdit>("restoreMasterPasswordEdit")->isEnabled());
     EXPECT_FALSE(window->findChild<RestoreJob*>()); EXPECT_TRUE(record().replacement);
+}
+TEST_F(VaultRestoreGuiTest, InactivitySettingDuringSensitiveWorkerNeitherReopensNorCancelsRestore)
+{
+    Hold hold(directory.filePath("policy-worker-fifo"), "PW_RESTORE_HOLD_PHASE", "0"); ASSERT_GE(hold.fd, 0);
+    choose(); prepare(); auto* job = execute(); ASSERT_NE(job, nullptr);
+    ASSERT_TRUE(job->isActive()) << status().toStdString();
+    bool sensitive = false;
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto phase) {
+        sensitive = phase == ReplacementCheckpoint::BeforeWork;
+    });
+    ASSERT_TRUE(waitFor([&] { return sensitive; }));
+    auto* timer = window->findChild<QTimer*>("vaultInactivityTimer"); ASSERT_NE(timer, nullptr);
+    ASSERT_FALSE(timer->isActive());
+    QTimer::singleShot(0, window.get(), [&] {
+        auto* setting = window->findChild<QInputDialog*>("autoLockDurationDialog"); ASSERT_NE(setting, nullptr);
+        setting->findChild<QComboBox*>()->setCurrentIndex(4); setting->accept();
+    });
+    window->findChild<QAction*>("autoLockDurationAction")->trigger();
+    EXPECT_FALSE(timer->isActive()); EXPECT_FALSE(window->acquireLease().unlocked); EXPECT_TRUE(job->isActive());
+    EXPECT_EQ(QSettings("PassWall", "PassWall").value("security/autoLockMinutes").toInt(), 60);
+    hold.release(); done();
+    EXPECT_TRUE(status().startsWith("Restauration confirmée")); EXPECT_FALSE(timer->isActive());
+    unlock(); EXPECT_TRUE(timer->isActive()); EXPECT_EQ(timer->interval(), 3'600'000);
 }
 TEST_F(VaultRestoreGuiTest, LatePreparationAfterSecurityLockCannotAuthorizeOrEnablePassword)
 {
@@ -419,6 +529,274 @@ TEST_F(VaultRestoreGuiTest, UnknownSupervisionCannotBeUpgradedByALateBusinessNot
     widget<QComboBox>("restorePrincipalCombo")->setCurrentIndex(widget<QComboBox>("restorePrincipalCombo")->findText(principal));
     EXPECT_FALSE(widget<QPushButton>("restorePrepareButton")->isEnabled());
     EXPECT_TRUE(widget<QLabel>("restorePolicyLabel")->text().contains("Récupération nécessaire"));
+}
+TEST_F(VaultRestoreGuiTest, WrongPasswordWaitsForActualWorkerTerminationBeforeAutomaticAbandon)
+{
+    Hold hold(directory.filePath("wrong-master-result-fifo"), "PW_RESTORE_HOLD_RESULT"); ASSERT_GE(hold.fd, 0);
+    const auto before = encryptedState(principal); choose(); prepare();
+    auto* job = execute("fictitious-wrong-master"); ASSERT_NE(job, nullptr); bool received = false;
+    QObject::connect(job, &RestoreJob::resultReceived, window.get(), [&](const auto& result) {
+        received = result.outcome == RestoreOutcome::SourceAuthenticationFailed;
+    });
+    ASSERT_TRUE(waitFor([&] { return received; }, 15000));
+    ASSERT_TRUE(job->isActive()); ASSERT_TRUE(record().replacement);
+    EXPECT_EQ(record().replacement->phase, "prepared");
+    VaultOperationGuard guard; std::string error;
+    EXPECT_FALSE(guard.tryReserve(principal.toStdString(), error));
+    EXPECT_FALSE(status().startsWith("Mot de passe maître incorrect"));
+    hold.release(); done();
+    EXPECT_EQ(status(), "Mot de passe maître incorrect"); EXPECT_FALSE(record().replacement);
+    EXPECT_EQ(encryptedState(principal), before); EXPECT_TRUE(guard.tryReserve(principal.toStdString(), error));
+}
+TEST_F(VaultRestoreGuiTest, CancellingPasswordEntryAutomaticallyAbandonsPreparedAndNeverOpensTheVault)
+{
+    const auto before = encryptedState(principal); choose(); prepare();
+    widget<QLineEdit>("restoreMasterPasswordEdit")->setText(master);
+    widget<QPushButton>("restoreCancelButton")->click(); done();
+    EXPECT_EQ(status(), "Restauration annulée"); EXPECT_FALSE(record().replacement);
+    ASSERT_TRUE(record().resolvedReplacement); EXPECT_EQ(record().resolvedReplacement->phase, "abandoned");
+    EXPECT_EQ(encryptedState(principal), before); EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_FALSE(window->findChild<RestoreJob*>()); unlock();
+}
+TEST_F(VaultRestoreGuiTest, AutomaticAbandonPersistenceFailureKeepsPreparedAndRequiresManualRecovery)
+{
+    choose(); prepare(); passwall::tests::failSettingsSync();
+    widget<QPushButton>("restoreCancelButton")->click(); done();
+    EXPECT_TRUE(status().contains("récupération manuelle nécessaire"));
+    ASSERT_TRUE(record().replacement); EXPECT_TRUE(record().replacement->phase == "prepared"
+        || record().replacement->phase == "abandon-confirmed");
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    openRecovery(); examineRecovery(); resolveRecovery();
+    EXPECT_FALSE(record().replacement); EXPECT_FALSE(window->acquireLease().unlocked); unlock();
+}
+TEST_F(VaultRestoreGuiTest, RecoveryRefusesLiveWorkerEvenAfterItHasSentItsBusinessResult)
+{
+    Hold hold(directory.filePath("recovery-result-fifo"), "PW_RESTORE_HOLD_RESULT"); ASSERT_GE(hold.fd, 0);
+    choose(); prepare(); auto* job = execute(); ASSERT_NE(job, nullptr); bool received = false;
+    QObject::connect(job, &RestoreJob::resultReceived, window.get(), [&](auto) { received = true; });
+    ASSERT_TRUE(waitFor([&] { return received; }, 15000)); ASSERT_TRUE(job->isActive());
+    openRecovery(); examineRecovery();
+    EXPECT_FALSE(recoveryWidget<QPushButton>("recoveryResolveButton")->isEnabled());
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("active"));
+    hold.release(); done();
+}
+TEST_F(VaultRestoreGuiTest, RecoveryChangedPrincipalHasNoActionAndDoesNotClearFence)
+{
+    leavePreparedForRecovery();
+    QFile file(principal); ASSERT_TRUE(file.open(QIODevice::Append)); ASSERT_EQ(file.write("x"), 1); file.close();
+    openRecovery(); examineRecovery(); EXPECT_FALSE(recoveryWidget<QPushButton>("recoveryResolveButton")->isEnabled());
+    EXPECT_TRUE(record().replacement);
+}
+TEST_F(VaultRestoreGuiTest, RecoveryArmedAfterExchangeFinalizesWithoutAnotherExchangeOrDeletingOldPrincipal)
+{
+    const auto before = bytes(principal); choose(); prepare(); auto* job = execute(); ASSERT_NE(job, nullptr);
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto phase) {
+        if (phase == ReplacementCheckpoint::AfterExchange) widget<QPushButton>("restoreCancelButton")->click();
+    });
+    done(); ASSERT_TRUE(record().replacement); EXPECT_EQ(record().replacement->phase, "armed");
+    const auto artifact = record().replacement->candidate->path;
+    ASSERT_EQ(bytes(artifact), before); const auto replaced = bytes(principal);
+    openRecovery(); examineRecovery();
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("déjà effectué"));
+    resolveRecovery(); EXPECT_FALSE(record().replacement); EXPECT_EQ(bytes(artifact), before);
+    EXPECT_EQ(bytes(principal), replaced); EXPECT_FALSE(window->acquireLease().unlocked); unlock();
+}
+TEST_F(VaultRestoreGuiTest, RecoverySyncFailureKeepsRestrictionAndExplicitRetryConfirmsDurability)
+{
+    leavePreparedForRecovery(); openRecovery(); examineRecovery();
+    passwall::tests::failSettingsSync(); resolveRecovery();
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("non confirmée"));
+    EXPECT_TRUE(record().replacement); EXPECT_FALSE(window->acquireLease().unlocked);
+    examineRecovery(); resolveRecovery();
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("durablement confirmée")); unlock();
+}
+TEST_F(VaultRestoreGuiTest, RecoveryArmedBeforeExchangeOffersNoActionAndPreservesBothFiles)
+{
+    qputenv("PW_RESTORE_CRASH_PHASE", "6"); // Real child exits at BeforeExchange, after durable arm.
+    const auto reset = qScopeGuard([] { qunsetenv("PW_RESTORE_CRASH_PHASE"); });
+    const auto original = bytes(principal);
+    choose(); prepare(); ASSERT_NE(execute(), nullptr); done();
+    ASSERT_TRUE(record().replacement); ASSERT_EQ(record().replacement->phase, "armed");
+    ASSERT_TRUE(record().replacement->candidate);
+    const auto artifact = record().replacement->candidate->path;
+    const auto candidate = bytes(artifact);
+    window.reset(); QApplication::processEvents(); newWindow();
+    openRecovery(); examineRecovery();
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("avant échange"));
+    recoveryWidget<QCheckBox>("recoveryConfirmationCheck")->setChecked(true);
+    EXPECT_FALSE(recoveryWidget<QPushButton>("recoveryResolveButton")->isEnabled());
+    recoveryWidget<QPushButton>("recoveryResolveButton")->click();
+    EXPECT_EQ(record().replacement->phase, "armed");
+    EXPECT_EQ(bytes(principal), original); EXPECT_EQ(bytes(artifact), candidate);
+    SecureBuffer key(0); std::string error;
+    EXPECT_FALSE(VaultLifecycleService::unlockVault(principal.toStdString(), master, key, error));
+    EXPECT_TRUE(key.empty()); EXPECT_FALSE(window->acquireLease().unlocked);
+}
+TEST_F(VaultRestoreGuiTest, RecoveryIdentityConfirmedAfterInterruptedSyncResumesAfterRestart)
+{
+    qputenv("PW_RESTORE_CRASH_PHASE", "7"); // Actual exchange, no finalization by the child.
+    const auto reset = qScopeGuard([] {
+        qunsetenv("PW_RESTORE_CRASH_PHASE"); passwall::tests::failSettingsSyncWhenPublished({}, {});
+    });
+    const auto original = bytes(principal);
+    choose(); prepare(); ASSERT_NE(execute(), nullptr); done();
+    ASSERT_TRUE(record().replacement); ASSERT_EQ(record().replacement->phase, "armed");
+    const auto artifact = record().replacement->candidate->path;
+    const auto restored = bytes(principal);
+    openRecovery(); examineRecovery();
+    passwall::tests::failSettingsSyncWhenPublished(VaultPreferencesStore().fileName(), "identity-confirmed");
+    resolveRecovery();
+    ASSERT_TRUE(passwall::tests::publishedSettingsSyncFailed());
+    ASSERT_TRUE(record().replacement); EXPECT_EQ(record().replacement->phase, "identity-confirmed");
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("non confirmée"));
+    window.reset(); QApplication::processEvents(); newWindow();
+    openRecovery(); examineRecovery();
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("déjà effectué"));
+    resolveRecovery();
+    EXPECT_FALSE(record().replacement); EXPECT_TRUE(record().resolvedReplacement);
+    EXPECT_EQ(bytes(principal), restored); EXPECT_EQ(bytes(artifact), original);
+    EXPECT_FALSE(window->acquireLease().unlocked); unlock();
+}
+TEST_F(VaultRestoreGuiTest, RecoveryVisibleAbandonedReceiptWithFailedLastSyncIsNotGuiSuccess)
+{
+    const auto reset = qScopeGuard([] { passwall::tests::failSettingsSyncWhenPublished({}, {}); });
+    choose(); prepare(); widget<QPushButton>("restoreCancelButton")->click();
+    const auto original = bytes(principal);
+    openRecovery(); examineRecovery();
+    passwall::tests::failSettingsSyncWhenPublished(VaultPreferencesStore().fileName(), "abandoned");
+    resolveRecovery();
+    ASSERT_TRUE(passwall::tests::publishedSettingsSyncFailed());
+    EXPECT_FALSE(record().replacement); ASSERT_TRUE(record().resolvedReplacement);
+    EXPECT_EQ(record().resolvedReplacement->phase, "abandoned");
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("non confirmée"));
+    // The button's visual state reflects logind availability, not this
+    // per-recovery latch. Exercise the real authentication entry point.
+    window->findChild<QLineEdit*>("unlockPathEdit")->setText(principal);
+    window->findChild<QLineEdit*>("unlockPasswordEdit")->setText(master);
+    window->findChild<QPushButton*>("unlockVaultButton")->click();
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    examineRecovery(); resolveRecovery();
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("durablement confirmée"));
+    EXPECT_EQ(bytes(principal), original); EXPECT_FALSE(window->acquireLease().unlocked); unlock();
+}
+TEST_F(VaultRestoreGuiTest, RecoveryRevokedInspectionCannotOfferActionOrPublishSession)
+{
+    leavePreparedForRecovery(); openRecovery();
+    recoveryWidget<QPushButton>("recoveryInspectButton")->click();
+    window->setLifecycleProtectionAvailable(false);
+    ASSERT_TRUE(waitFor([&] { return !recoveryWidget<QProgressBar>("recoveryActivity")->isVisible(); }, 10000));
+    recoveryWidget<QCheckBox>("recoveryConfirmationCheck")->setChecked(true);
+    EXPECT_FALSE(recoveryWidget<QPushButton>("recoveryResolveButton")->isEnabled());
+    EXPECT_TRUE(record().replacement); EXPECT_FALSE(window->acquireLease().unlocked);
+    window->setLifecycleProtectionAvailable(true); examineRecovery(); resolveRecovery(); unlock();
+}
+TEST_F(VaultRestoreGuiTest, RecoveryAsyncSyncKeepsGuiResponsiveAndDialogCloseDoesNotReleaseReservation)
+{
+    leavePreparedForRecovery(); openRecovery(); examineRecovery();
+    const auto release = qScopeGuard([] { passwall::tests::releaseSettingsSync(); });
+    passwall::tests::holdSettingsSync();
+    recoveryWidget<QCheckBox>("recoveryConfirmationCheck")->setChecked(true);
+    recoveryWidget<QPushButton>("recoveryResolveButton")->click();
+    ASSERT_TRUE(waitFor([] { return passwall::tests::settingsSyncEntered(); }, 10000));
+    bool heartbeat = false; QTimer::singleShot(0, [&] { heartbeat = true; });
+    ASSERT_TRUE(waitFor([&] { return heartbeat; }));
+    VaultOperationGuard guard; std::string error; EXPECT_FALSE(guard.tryReserve(principal.toStdString(), error));
+    QTimer::singleShot(0, window.get(), [&] {
+        auto* setting = window->findChild<QInputDialog*>("autoLockDurationDialog"); ASSERT_NE(setting, nullptr);
+        setting->findChild<QComboBox*>()->setCurrentIndex(1); setting->accept();
+    });
+    window->findChild<QAction*>("autoLockDurationAction")->trigger();
+    // Registry contention refuses persistence without blocking this GUI or
+    // releasing the recovery task's guards. A locked vault never rearms.
+    auto* timer = window->findChild<QTimer*>("vaultInactivityTimer");
+    ASSERT_NE(timer, nullptr); EXPECT_FALSE(timer->isActive());
+    EXPECT_FALSE(guard.tryReserve(principal.toStdString(), error));
+    recovery->reject(); QApplication::processEvents(); EXPECT_FALSE(guard.tryReserve(principal.toStdString(), error));
+    // Reopening does not consume the old delivery or turn it into a new offer.
+    window->findChild<QAction*>("recoverVaultAction")->trigger();
+    for (auto* w : QApplication::topLevelWidgets())
+        if (w->objectName() == "vaultRecoveryDialog") recovery = qobject_cast<QDialog*>(w);
+    ASSERT_TRUE(recovery); EXPECT_TRUE(recoveryWidget<QProgressBar>("recoveryActivity")->isVisible());
+    bool settled = false;
+    QObject observer;
+    QObject::connect(window->findChild<passwall::gui::VaultRecoveryController*>(), &passwall::gui::VaultRecoveryController::settled,
+        &observer, [&](bool current) { EXPECT_FALSE(current); settled = true; });
+    passwall::tests::releaseSettingsSync(); ASSERT_TRUE(waitFor([&] { return settled; }, 10000));
+    EXPECT_TRUE(guard.tryReserve(principal.toStdString(), error));
+    EXPECT_FALSE(recoveryWidget<QPushButton>("recoveryResolveButton")->isEnabled());
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("Ancienne opération"));
+    EXPECT_FALSE(window->acquireLease().unlocked);
+}
+TEST_F(VaultRestoreGuiTest, RecoverySecurityLockRevokesDeferredResolutionAndOldReplyCannotAuthorizeAccess)
+{
+    leavePreparedForRecovery(); openRecovery(); examineRecovery();
+    const auto release = qScopeGuard([] { passwall::tests::releaseSettingsSync(); }); passwall::tests::holdSettingsSync();
+    recoveryWidget<QCheckBox>("recoveryConfirmationCheck")->setChecked(true);
+    recoveryWidget<QPushButton>("recoveryResolveButton")->click();
+    ASSERT_TRUE(waitFor([] { return passwall::tests::settingsSyncEntered(); }, 10000));
+    bool locked = false; window->requestExternalLock([&](bool clean) { locked = clean; });
+    ASSERT_TRUE(waitFor([&] { return locked; })); passwall::tests::releaseSettingsSync();
+    ASSERT_TRUE(waitFor([&] { return !recoveryWidget<QProgressBar>("recoveryActivity")->isVisible(); }, 10000));
+    EXPECT_TRUE(record().replacement); EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("non confirmée"));
+    examineRecovery(); resolveRecovery(); unlock();
+}
+TEST_F(VaultRestoreGuiTest, RecoveryClosingMainWindowNeverWaitsForDiskSyncOrDropsItsExclusion)
+{
+    leavePreparedForRecovery(); openRecovery(); examineRecovery();
+    const auto release = qScopeGuard([] { passwall::tests::releaseSettingsSync(); }); passwall::tests::holdSettingsSync();
+    recoveryWidget<QCheckBox>("recoveryConfirmationCheck")->setChecked(true);
+    recoveryWidget<QPushButton>("recoveryResolveButton")->click();
+    ASSERT_TRUE(waitFor([] { return passwall::tests::settingsSyncEntered(); }, 10000));
+    QElapsedTimer time; time.start(); window.reset(); EXPECT_LT(time.elapsed(), 1000);
+    VaultOperationGuard guard; std::string error;
+    EXPECT_FALSE(guard.tryReserve(principal.toStdString(), error));
+    passwall::tests::releaseSettingsSync();
+    ASSERT_TRUE(waitFor([&] { return guard.tryReserve(principal.toStdString(), error); }, 10000)); guard.reset();
+    EXPECT_TRUE(record().replacement); newWindow(); openRecovery(); examineRecovery(); resolveRecovery(); unlock();
+}
+TEST_F(VaultRestoreGuiTest, RecoveryLateResultCannotActOnAnotherVaultSelection)
+{
+    leavePreparedForRecovery();
+    const auto other = directory.filePath("another-principal.db"); ASSERT_TRUE(QFile::copy(source, other));
+    VaultRegistration registered; QString error;
+    ASSERT_EQ(VaultPreferencesStore().recognizeOrRegister(other, registered, error), VaultRecognition::Registered);
+    bool prepared = false;
+    window->requestReplacementAuthorization(registered.localId, [&](auto authority, auto) { prepared = !authority.operationId().isEmpty(); });
+    ASSERT_TRUE(waitFor([&] { return prepared; }, 10000));
+    openRecovery(); examineRecovery();
+    const auto release = qScopeGuard([] { passwall::tests::releaseSettingsSync(); }); passwall::tests::holdSettingsSync();
+    recoveryWidget<QCheckBox>("recoveryConfirmationCheck")->setChecked(true);
+    recoveryWidget<QPushButton>("recoveryResolveButton")->click();
+    ASSERT_TRUE(waitFor([] { return passwall::tests::settingsSyncEntered(); }, 10000));
+    auto* combo = recoveryWidget<QComboBox>("recoveryVaultCombo"); const auto index = combo->findText(other); ASSERT_GE(index, 0);
+    combo->setCurrentIndex(index); // Deliberately force a stale delivery, despite the disabled user control.
+    passwall::tests::releaseSettingsSync();
+    ASSERT_TRUE(waitFor([&] { return !recoveryWidget<QProgressBar>("recoveryActivity")->isVisible(); }, 10000));
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("Ancienne opération"));
+    EXPECT_FALSE(recoveryWidget<QPushButton>("recoveryResolveButton")->isEnabled());
+    QVector<VaultRegistration> records; ASSERT_TRUE(VaultPreferencesStore().list(records, error));
+    for (const auto& r : records) if (r.localId == registered.localId) EXPECT_TRUE(r.replacement);
+}
+TEST_F(VaultRestoreGuiTest, RecoveryResolvedReplacementIsOnlyReconfirmedAndOldPrincipalIsRetained)
+{
+    const auto before = bytes(principal); choose(); prepare(); ASSERT_NE(execute(), nullptr); done();
+    ASSERT_TRUE(record().resolvedReplacement); const auto op = record().resolvedReplacement->operationId;
+    const auto artifact = record().resolvedReplacement->candidate->path; const auto replaced = bytes(principal);
+    openRecovery(); examineRecovery();
+    EXPECT_TRUE(recoveryWidget<QLabel>("recoveryStatusLabel")->text().contains("déjà résolu"));
+    resolveRecovery(); EXPECT_EQ(record().resolvedReplacement->operationId, op);
+    EXPECT_EQ(bytes(principal), replaced); EXPECT_EQ(bytes(artifact), before); EXPECT_FALSE(window->acquireLease().unlocked);
+}
+TEST_F(VaultRestoreGuiTest, RecoveryActualWorkerCrashBeforeArmLeavesPreparedForControlledRecovery)
+{
+    qputenv("PW_RESTORE_CRASH_PHASE", "0");
+    const auto reset = qScopeGuard([] { qunsetenv("PW_RESTORE_CRASH_PHASE"); });
+    choose(); prepare(); ASSERT_NE(execute(), nullptr); done(); ASSERT_TRUE(record().replacement);
+    EXPECT_EQ(record().replacement->phase, "prepared");
+    qunsetenv("PW_RESTORE_CRASH_PHASE");
+    window.reset(); QApplication::processEvents(); newWindow();
+    openRecovery(); examineRecovery(); resolveRecovery(); EXPECT_FALSE(record().replacement); unlock();
 }
 TEST(VaultRestoreDialogTest, Utf8PasswordIsExactAndGuiFieldIsClearedBeforeReturningOwnership)
 {

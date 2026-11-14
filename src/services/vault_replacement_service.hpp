@@ -26,17 +26,17 @@ struct ReplacementControl {
 };
 struct ReplacementResult {
     ReplacementOutcome outcome = ReplacementOutcome::NotReplaced;
-    bool sourceAuthenticationFailed = false; // No secret/error-text parsing by supervisor.
+    bool sourceAuthenticationFailed = false; // Master-key rejection; no diagnostic-text parsing by supervisor.
     ReplacementFinalizationResult finalization;
     SnapshotResult precaution;
     QString operationId;
     QString recoveryArtifact;
     QString diagnostic;
 };
-enum class ReplacementRecoveryAction { Inspect, FinalizeExchanged };
+enum class ReplacementRecoveryAction { Inspect, FinalizeExchanged, AbandonPrepared };
 enum class ReplacementLayout {
     Unrecognized, PreparedIntact, ArmedBeforeExchange, ArmedAfterExchange,
-    IdentityConfirmed, Resolved
+    IdentityConfirmed, Resolved, AbandonmentPending, Abandoned
 };
 struct ReplacementRecoveryResult {
     ReplacementLayout layout = ReplacementLayout::Unrecognized;

@@ -3,6 +3,7 @@
 #include "services/automatic_backup_coordinator.hpp"
 #ifdef Q_OS_LINUX
 #include "gui/vault_restore_controller.hpp"
+#include "services/vault_replacement_service.hpp"
 #endif
 #include <QScopeGuard>
 #include <QThread>
@@ -26,6 +27,9 @@ void prepareOffThread(std::function<void()> work, std::function<void()> complete
 namespace passwall::gui {
 void MainWindow::revokeReplacement() noexcept
 {
+#ifdef Q_OS_LINUX
+    if (recoveryAdmission_) *recoveryAdmission_ = false;
+#endif
     if (replacementGeneration_ != 0) ++replacementGeneration_; // zero stays fail-closed
     services::VaultReplacementAuthorization::revoke(replacement_.lock());
 #ifdef Q_OS_LINUX
@@ -116,6 +120,71 @@ void MainWindow::requestReplacementAuthorization(const QString& localId,
     }
 }
 #ifdef Q_OS_LINUX
+void MainWindow::requestReplacementRecovery(const QString& localId, const QString& operationId,
+    services::ReplacementRecoveryAction action,
+    std::function<void(services::ReplacementRecoveryResult)> completion)
+{
+    using namespace services;
+    if (!isSessionThread()) qFatal("Recovery must be admitted on the vault owner's thread");
+    if (!completion) return;
+    // Do not revoke a live authority/worker just to get a successful reservation.
+    // A prior uncertain recovery may be retried, but may not open a session.
+    if (replacementGeneration_ == 0 || replacementTransition_ || VaultReplacementAuthorization::active(replacement_.lock())
+        || externalLockClosing_ || externalLockFailed_ || vaultLockInProgress_
+        || externalLockReplyInProgress_ || !externalLockRequests_.empty()
+        || exportCloseRequested_ || exportInProgress_ || restoreSecretsPending_
+        || (restoreJob_ && restoreJob_->isActive()) || hasOpenCredentialEditor()
+        || (automaticBackup_ && automaticBackup_->isActive()) || !ensureLifecycleProtection()) {
+        ReplacementRecoveryResult result;
+        result.diagnostic = tr("Opération encore active ou protection indisponible ; récupération refusée.");
+        completion(std::move(result)); return;
+    }
+    replacementTransition_ = true;
+    auto admitted = std::make_shared<std::atomic<bool>>(true);
+    recoveryAdmission_ = admitted;
+    const auto generation = replacementGeneration_;
+    const QPointer<MainWindow> window(this);
+    const VaultPreferencesStore store;
+    requestLock([window, admitted, generation, store, localId, operationId, action,
+                 completion = std::move(completion)](bool cleaned) mutable {
+        if (!window) return;
+        if (!cleaned || !*admitted || window->replacementGeneration_ != generation
+            || !window->hasLifecycleProtection()) {
+            window->replacementTransition_ = false;
+            completion({}); return;
+        }
+        const auto lockedGeneration = window->sessionGeneration_;
+        auto result = std::make_shared<ReplacementRecoveryResult>();
+        prepareOffThread([store, localId, operationId, action, admitted, result] {
+            try {
+                *result = VaultReplacementAuthorization::recoverLocked(store, localId, operationId,
+                    action, [admitted] { return admitted->load(); });
+            } catch (...) { result->diagnostic = QStringLiteral("Récupération interrompue ; résultat non confirmé."); }
+        }, [window, admitted, generation, lockedGeneration, result, action, localId,
+            completion = std::move(completion)]() mutable {
+            if (!window) return;
+            const bool current = *admitted && window->replacementGeneration_ == generation
+                && window->sessionGeneration_ == lockedGeneration
+                && window->hasLifecycleProtection() && window->isFullyLocked();
+            window->replacementTransition_ = false;
+            if (!current) {
+                // An inspected layout is not an offer of action once its
+                // owner/session admission has been revoked.
+                result->layout = ReplacementLayout::Unrecognized;
+                result->finalization.state = ReplacementFinalizationState::RecoveryRequired;
+                result->diagnostic = tr("Retour de récupération obsolète ; aucune réussite confirmée.");
+            }
+            if (action != ReplacementRecoveryAction::Inspect) {
+                const bool resolved = current && result->finalization.state == ReplacementFinalizationState::Resolved;
+                if (resolved) window->recoveryUnconfirmed_.remove(localId);
+                else window->recoveryUnconfirmed_.insert(localId);
+                if (resolved && window->restoreController_) window->restoreController_->recoveryConfirmed(localId);
+            }
+            window->updateSessionAccessUi(); window->updateExportAction();
+            completion(std::move(*result));
+        });
+    }, LockReason::ReplacementPreparation);
+}
 void MainWindow::restoreVault()
 {
     if (externalLockClosing_ || exportCloseRequested_) return;
@@ -128,11 +197,14 @@ bool MainWindow::replacementMatchesSelection(const services::VaultReplacementAut
     return authority.state_ && authority.state_ == replacement_.lock() && authority.matchesSelection(selected);
 }
 services::RestoreJob* MainWindow::startReplacementOperation(services::VaultReplacementAuthorization authority,
-    const QString& source, core::SecureBuffer password, const QString& precaution)
+    const QString& source, core::SecureBuffer password, const QString& precaution, QString* startError)
 {
     if (!isSessionThread()) qFatal("Restoration must run on the owner's thread");
     if (!authority.state_ || authority.state_ != replacement_.lock() || !authority.delegationCurrent()
-        || (restoreJob_ && restoreJob_->isActive()) || restoreSecretsPending_) return nullptr;
+        || (restoreJob_ && restoreJob_->isActive()) || restoreSecretsPending_) {
+        if (startError) *startError = tr("Autorisation devenue obsolète ou opération incompatible encore active.");
+        return nullptr;
+    }
     auto* job = new services::RestoreJob(services::RestoreJob::siblingWorkerPath(), this);
     restoreJob_ = job;
     restoreSecretsPending_ = true; // Before any launch/reentrant observer.
@@ -150,6 +222,7 @@ services::RestoreJob* MainWindow::startReplacementOperation(services::VaultRepla
         window->updateSessionAccessUi(); window->updateExportAction();
     };
     if (!job->start(std::move(authority), source, std::move(password), precaution)) {
+        if (startError) *startError = job->startError();
         restoreSecretsPending_ = false; restoreJob_.clear(); job->deleteLater();
         completeRestoreCleanup(); return nullptr;
     }

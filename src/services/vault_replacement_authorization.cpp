@@ -450,6 +450,10 @@ ReplacementFinalizationResult VaultReplacementAuthorization::finalizePublication
 
 ReplacementFinalizationResult VaultReplacementAuthorization::resumeFinalization(
     const VaultPreferencesStore& store, const QString& localId, const QString& operationId)
+{ return resumeFinalizationImpl(store, localId, operationId, {}); }
+ReplacementFinalizationResult VaultReplacementAuthorization::resumeFinalizationImpl(
+    const VaultPreferencesStore& store, const QString& localId, const QString& operationId,
+    const std::function<bool()>& check)
 {
     ReplacementFinalizationResult result{ReplacementFinalizationState::RecoveryRequired, {}};
     auto& error = result.diagnostic;
@@ -492,11 +496,12 @@ ReplacementFinalizationResult VaultReplacementAuthorization::resumeFinalization(
                 }
                 result.state = ReplacementFinalizationState::IdentityUnconfirmed;
                 // Re-confirm even a visible phase from a failed previous fsync.
-                if (!store.confirmReplacementIdentity(localId, *intent, current, error)) return result;
+                if ((check && !check()) || !store.confirmReplacementIdentity(localId, *intent, current, error)) return result;
             }
             // This path never issues an authority and never swaps/deletes files.
             result.state = ReplacementFinalizationState::SafeResolutionUnconfirmed;
             RegistryPersistence persistence;
+            if (check && !check()) return result;
             if (!store.resolveReplacement(localId, *intent, current, true, error, &persistence)) {
                 if (persistence == RegistryPersistence::NotAttempted)
                     result.state = ReplacementFinalizationState::IdentityConfirmedResolutionPending;
@@ -517,6 +522,25 @@ ReplacementRecoveryResult VaultReplacementAuthorization::recoverReplacement(
     const VaultPreferencesStore& store, const QString& localId, const QString& operationId,
     ReplacementRecoveryAction action)
 {
+    // The old public inspection/finalization API is NOT an abort authority.
+    if (action == ReplacementRecoveryAction::AbandonPrepared) {
+        ReplacementRecoveryResult result;
+        result.diagnostic = QStringLiteral("Abandon réservé au parcours de nettoyage du propriétaire.");
+        return result;
+    }
+    return recoverImpl(store, localId, operationId, action, {});
+}
+ReplacementRecoveryResult VaultReplacementAuthorization::recoverLocked(
+    const VaultPreferencesStore& store, const QString& localId, const QString& operationId,
+    ReplacementRecoveryAction action, std::function<bool()> check)
+{
+    if (!check || !check()) return {};
+    return recoverImpl(store, localId, operationId, action, check);
+}
+ReplacementRecoveryResult VaultReplacementAuthorization::recoverImpl(
+    const VaultPreferencesStore& store, const QString& localId, const QString& operationId,
+    ReplacementRecoveryAction action, const std::function<bool()>& check)
+{
     ReplacementRecoveryResult result;
     auto& error = result.diagnostic;
     try {
@@ -527,9 +551,26 @@ ReplacementRecoveryResult VaultReplacementAuthorization::recoverReplacement(
             const auto intent = record.replacement ? record.replacement : record.resolvedReplacement;
             if (!intent || intent->operationId != operationId)
                 { fail(error, "UUID ou intention de récupération non confirmé."); return result; }
+            if (intent->phase == "abandoned") {
+                storage::VaultOperationGuard principal;
+                std::string failure; VaultFileIdentity current;
+                if (!principal.tryReserve(record.file.path.toStdString(), failure)
+                    || !VaultPreferencesStore::inspectReserved(record.file.path, principal, current, error)
+                    || !intent->confirmed || current != *intent->confirmed) {
+                    fail(error, "Principal abandonné absent, modifié ou encore réservé."); return result;
+                }
+                result.layout = ReplacementLayout::Abandoned;
+                if (action != ReplacementRecoveryAction::Inspect) {
+                    result.finalization.state = ReplacementFinalizationState::SafeResolutionUnconfirmed;
+                    if (!check || !check() || !syncIdentity(current, error)
+                        || !check() || !store.resolvePreparedAbandonment(localId, *intent, current, error)) return result;
+                    result.finalization.state = ReplacementFinalizationState::Resolved;
+                }
+                return result;
+            }
             if (intent->phase == "identity-confirmed" || intent->phase == "resolved") {
                 if (action == ReplacementRecoveryAction::FinalizeExchanged) {
-                    result.finalization = resumeFinalization(store, localId, operationId);
+                    result.finalization = resumeFinalizationImpl(store, localId, operationId, check);
                     if (result.finalization.state == ReplacementFinalizationState::Resolved)
                         result.layout = ReplacementLayout::Resolved;
                     error = result.finalization.diagnostic;
@@ -555,12 +596,38 @@ ReplacementRecoveryResult VaultReplacementAuthorization::recoverReplacement(
             QByteArray currentHash;
             if (!VaultPreferencesStore::inspectReserved(intent->previous.path, principal, current, error)
                 || !digest(current, currentHash, error)) return result;
-            if (intent->phase == "prepared") {
-                if (current == intent->previous && currentHash == intent->previousDigest)
-                    result.layout = ReplacementLayout::PreparedIntact;
-                else fail(error, "Principal préparé inattendu ; récupération requise.");
-                // No cleanup acknowledgement after restart: never abandon or
-                // authorize publication from a record alone.
+            if (intent->phase == "prepared" || intent->phase == "abandon-confirmed") {
+                if (current != intent->previous || currentHash != intent->previousDigest) {
+                    fail(error, "Principal préparé inattendu ; récupération requise."); return result;
+                }
+                // A staged candidate is not deleted, ignored or adopted as a
+                // replacement. Reserve and verify it too, if the intent has one.
+                if (intent->candidate) {
+                    VaultFileIdentity other; QByteArray hash;
+                    if (intent->candidateDigest.size() != 32
+                        || !intent->recoveryArtifacts.contains(intent->candidate->path)
+                        || !artifact.tryReserve(intent->candidate->path.toStdString(), failure)
+                        || !VaultPreferencesStore::inspectReserved(intent->candidate->path, artifact, other, error)
+                        || other != *intent->candidate || !digest(other, hash, error)
+                        || hash != intent->candidateDigest) {
+                        fail(error, "Candidat préparé non confirmé ; blocage conservé."); return result;
+                    }
+                } else if (!intent->recoveryArtifacts.isEmpty()) {
+                    fail(error, "Références de préparation non reconnues ; blocage conservé."); return result;
+                }
+                result.layout = intent->phase == "prepared" ? ReplacementLayout::PreparedIntact
+                    : ReplacementLayout::AbandonmentPending;
+                if (action != ReplacementRecoveryAction::AbandonPrepared) return result;
+                result.finalization.state = ReplacementFinalizationState::RecoveryRequired;
+                if (!check || !check() || !syncIdentity(current, error) || !check()) return result;
+                // The fence remains present throughout the first durable write.
+                if (!store.confirmPreparedAbandonment(localId, *intent, current, error)) return result;
+                auto confirmed = *intent; confirmed.phase = "abandon-confirmed"; confirmed.confirmed = current;
+                result.layout = ReplacementLayout::AbandonmentPending;
+                result.finalization.state = ReplacementFinalizationState::SafeResolutionUnconfirmed;
+                if (!check() || !store.resolvePreparedAbandonment(localId, confirmed, current, error)) return result;
+                result.layout = ReplacementLayout::Abandoned;
+                result.finalization.state = ReplacementFinalizationState::Resolved;
                 return result;
             }
             if (intent->phase != "armed" || !intent->candidate || intent->candidateDigest.size() != 32
@@ -586,9 +653,10 @@ ReplacementRecoveryResult VaultReplacementAuthorization::recoverReplacement(
                 fail(error, "Disposition ou contenu de récupération inattendus ; blocage conservé."); return result;
             }
             result.layout = ReplacementLayout::ArmedAfterExchange;
-            if (action == ReplacementRecoveryAction::Inspect) return result;
+            if (action != ReplacementRecoveryAction::FinalizeExchanged) return result;
+            if (check && !check()) return result;
             result.finalization.state = ReplacementFinalizationState::RecoveryRequired;
-            if (!syncIdentity(current, error) || !syncIdentity(other, error)) return result;
+            if (!syncIdentity(current, error) || !syncIdentity(other, error) || (check && !check())) return result;
             result.finalization.state = ReplacementFinalizationState::IdentityUnconfirmed;
             // Same two protected CAS/durability transitions as live finalization,
             // under both fresh exclusive reservations. No new phase or journal.
@@ -596,6 +664,7 @@ ReplacementRecoveryResult VaultReplacementAuthorization::recoverReplacement(
             result.finalization.state = ReplacementFinalizationState::IdentityConfirmedResolutionPending;
             auto confirmed = *intent; confirmed.phase = "identity-confirmed"; confirmed.confirmed = current;
             result.finalization.state = ReplacementFinalizationState::SafeResolutionUnconfirmed;
+            if (check && !check()) return result;
             RegistryPersistence persistence;
             if (!store.resolveReplacement(localId, confirmed, current, true, error, &persistence)) {
                 if (persistence == RegistryPersistence::NotAttempted)

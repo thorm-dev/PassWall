@@ -228,8 +228,7 @@ protected:
             if (auto* selection = window->findChild<QFileDialog*>("vaultExportDestinationDialog");
                 selection && selection->isVisible() && !selected) {
                 selected = true;
-                EXPECT_EQ(inactivity()->isActive(), QSettings("PassWall", "PassWall")
-                    .value("security/autoLockMinutes", 5).toInt() > 0);
+                EXPECT_TRUE(inactivity()->isActive());
                 EXPECT_FALSE(QFile::exists(destination));
                 if (selectionAction) selectionAction(*selection);
                 else {
@@ -436,6 +435,24 @@ TEST_F(ManualVaultExportTest, DifferentVaultCanOpenWhileSourceRemainsReserved)
     EXPECT_TRUE(window->acquireLease().unlocked);
 }
 
+TEST_F(ManualVaultExportTest, OtherVaultInactivityDoesNotCancelExportOrReleaseItsReservation)
+{
+    const auto other = directory.filePath("other-inactivity.pwdb");
+    ASSERT_TRUE(QFile::copy(source, other));
+    fake("cancel"); exportThroughDialogs(); waitForFake();
+    bounded([&] { unlock(other); });
+    const auto lease = window->acquireLease(); ASSERT_TRUE(lease.unlocked);
+    inactivity()->start(1); // Real Qt expiration; the source export remains keyless and independent.
+    ASSERT_TRUE(until([&] { return !window->acquireLease().unlocked; }));
+    EXPECT_FALSE(window->isLeaseCurrent(lease)); EXPECT_FALSE(inactivity()->isActive());
+    ASSERT_NE(progress(), nullptr); EXPECT_TRUE(progress()->isVisible());
+    EXPECT_FALSE(progress()->findChild<QProgressBar*>("vaultExportActivity")->isHidden());
+    passwall::storage::VaultOperationGuard access; std::string error;
+    EXPECT_FALSE(access.tryAccess(source.toStdString(), error));
+    progress()->reject(); waitForResult(); EXPECT_TRUE(status().contains("annulée"));
+    EXPECT_TRUE(access.tryAccess(source.toStdString(), error));
+}
+
 TEST_F(ManualVaultExportTest, ExistingDestinationIsPreservedAndClearlyRefused)
 {
     QFile file(destination); ASSERT_TRUE(file.open(QIODevice::WriteOnly));
@@ -595,7 +612,7 @@ TEST_F(ManualVaultExportTest, CancellationLosingThePublicationRaceShowsPublicati
     EXPECT_FALSE(status().contains("annulée avant publication"));
     EXPECT_FALSE(window->acquireLease().unlocked);
 }
-TEST_F(ManualVaultExportTest, DisabledInactivityPolicyIsNotChangedByExportDialogs)
+TEST_F(ManualVaultExportTest, MigratedMandatoryInactivityPolicyIsPreservedByExportDialogs)
 {
     window.reset();
     QSettings("PassWall", "PassWall").setValue("security/autoLockMinutes", 0);
@@ -604,10 +621,12 @@ TEST_F(ManualVaultExportTest, DisabledInactivityPolicyIsNotChangedByExportDialog
     window->setLifecycleProtectionAvailable(true); window->show();
     bounded([&] { unlock(source); });
     const auto lease = window->acquireLease();
-    ASSERT_TRUE(lease.unlocked); ASSERT_FALSE(inactivity()->isActive());
+    ASSERT_TRUE(lease.unlocked); ASSERT_TRUE(inactivity()->isActive());
+    EXPECT_EQ(inactivity()->interval(), 60'000);
     exportThroughDialogs(false);
-    expectNoLaunch(); EXPECT_TRUE(window->isLeaseCurrent(lease)); EXPECT_FALSE(inactivity()->isActive());
-    EXPECT_EQ(QSettings("PassWall", "PassWall").value("security/autoLockMinutes").toInt(), 0);
+    expectNoLaunch(); EXPECT_TRUE(window->isLeaseCurrent(lease)); EXPECT_TRUE(inactivity()->isActive());
+    EXPECT_EQ(inactivity()->interval(), 60'000);
+    EXPECT_EQ(QSettings("PassWall", "PassWall").value("security/autoLockMinutes").toInt(), 1);
 }
 TEST_F(ManualVaultExportTest, RelativeSourceIsCapturedAbsolutelyWithoutChangingItsAuthorization)
 {

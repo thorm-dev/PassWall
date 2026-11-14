@@ -1,6 +1,7 @@
 #include "services/restore_protocol.hpp"
 #include "services/restore_job.hpp"
 #include "services/restore_delegation.hpp"
+#include "services/restore_executable_trust.hpp"
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
@@ -20,14 +21,6 @@ volatile std::sig_atomic_t interrupted = 0;
 pid_t parentPid = 0;
 void interrupt(int) { interrupted = 1; }
 bool stopped() noexcept { return interrupted || ::getppid() != parentPid; }
-bool parentExecutable(const QString& expected) {
-    struct stat actual {}, trusted {};
-    const auto proc = QByteArray("/proc/") + QByteArray::number(parentPid) + "/exe";
-    const auto encoded = QFile::encodeName(expected);
-    return ::stat(proc.constData(), &actual) == 0 && ::lstat(encoded.constData(), &trusted) == 0
-        && S_ISREG(trusted.st_mode) && trusted.st_uid == ::geteuid() && !(trusted.st_mode & 0022)
-        && actual.st_dev == trusted.st_dev && actual.st_ino == trusted.st_ino;
-}
 bool canonicalUuid(const QString& value) {
     const QUuid uuid(value);
     return !uuid.isNull() && uuid.toString(QUuid::WithoutBraces) == value;
@@ -179,13 +172,19 @@ int main(int argc, char** argv) {
         || length != sizeof(peer) || peer.pid != parentPid || peer.uid != ::geteuid()
         || ::getsockopt(descriptors[0], SOL_SOCKET, SO_TYPE, &type, &typeLength) != 0
         || type != SOCK_STREAM) return 77;
-    bool trusted = parentExecutable(QCoreApplication::applicationDirPath() + "/passwall_app");
+    using passwall::services::restore_executable_trust::Failure;
+    using passwall::services::restore_executable_trust::processExecutable;
+    bool trusted = processExecutable(parentPid,
+        QCoreApplication::applicationDirPath() + "/passwall_app") == Failure::None;
 #ifdef PASSWALL_RESTORE_WORKER_TESTING
     // Separate executable only. No alternate parents in the production worker.
-    trusted = parentExecutable(QString::fromUtf8(RESTORE_TEST_PARENT))
-        || parentExecutable(QString::fromUtf8(RESTORE_GUI_PARENT));
+    trusted = processExecutable(parentPid, QString::fromUtf8(RESTORE_TEST_PARENT)) == Failure::None
+        || processExecutable(parentPid, QString::fromUtf8(RESTORE_GUI_PARENT)) == Failure::None;
 #endif
     if (!trusted || stopped() || sodium_init() < 0) return 77;
+#ifdef PASSWALL_RESTORE_WORKER_TESTING
+    if (qEnvironmentVariableIsSet("PW_RESTORE_TEST_ADMISSION_REFUSAL")) return 77;
+#endif
     passwall::services::RestoreWorker worker;
     return worker.run(descriptors[0], {descriptors[1], descriptors[2]});
 }

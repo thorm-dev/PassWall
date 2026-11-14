@@ -51,6 +51,8 @@ struct VaultFileIdentity {
 // "prepared"/"armed" block access. "identity-confirmed" still blocks access,
 // even after the new identity has been saved. A separate, bounded "resolved"
 // receipt can only be published AFTER that protected write was fsynced.
+// Recovery abort analog: active "abandon-confirmed" remains fenced; receipt
+// "abandoned" confirms the unchanged previous principal, NOT a replacement.
 struct VaultReplacementIntent {
     QString operationId;
     VaultFileIdentity previous;
@@ -85,7 +87,7 @@ struct VaultRegistration {
     // automatically reclaimed, even by a later successful backup.
     QString rotationAttempt, rotationState, rotationCandidate;
     std::optional<VaultReplacementIntent> replacement;
-    // Last resolved operation only, not an active guard or a second registry.
+    // Last resolved replacement OR abandoned preparation, not an active guard.
     // Retains recovery references; never authorizes a different physical file.
     std::optional<VaultReplacementIntent> resolvedReplacement;
 };
@@ -191,6 +193,12 @@ private:
     [[nodiscard]] bool confirmReplacementIdentity(const QString& localId,
         const VaultReplacementIntent& expected, const VaultFileIdentity& observed,
         QString& error, RegistryPersistence* persistence = nullptr) const;
+    // Recovery-only two-write abort: first persist the proved unchanged
+    // principal WITHOUT lifting the fence, then retain a bounded abort receipt.
+    [[nodiscard]] bool confirmPreparedAbandonment(const QString&, const VaultReplacementIntent&,
+        const VaultFileIdentity&, QString&) const;
+    [[nodiscard]] bool resolvePreparedAbandonment(const QString&, const VaultReplacementIntent&,
+        const VaultFileIdentity&, QString&) const;
     QString settingsFile_;
 };
 

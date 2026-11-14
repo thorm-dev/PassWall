@@ -34,6 +34,8 @@ public:
     [[nodiscard]] RestoreCleanup cleanup() const noexcept { return cleanup_; }
     [[nodiscard]] QString startError() const { return startError_; }
     static QString siblingWorkerPath();
+    static QString siblingApplicationPath();
+    static bool validateInstallation(const QString& worker, const QString& application, QString& error);
 signals:
     void phaseChanged(passwall::services::ReplacementCheckpoint phase);
     void cancellationReceived();

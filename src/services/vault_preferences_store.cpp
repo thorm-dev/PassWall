@@ -124,17 +124,9 @@ bool validPreferences(const VaultBackupPreferences& value)
         && (!value.automatic || !value.directory.isEmpty());
 }
 
-bool readRegistryOnDisk(const QString& path, QVariant& registry, QString& error)
+bool parseRegistrySnapshot(const QString& path, const QByteArray& bytes, QVariant& registry, QString& error)
 {
     registry = {};
-    QFile source(path);
-    if (!source.exists())
-        return true;
-    if (!source.open(QIODevice::ReadOnly) || source.size() > MaxConfigBytes)
-        return fail(error, "Lecture du fichier de configuration impossible.");
-    const QByteArray bytes = source.readAll();
-    if (source.error() != QFile::NoError)
-        return fail(error, "Lecture du fichier de configuration incomplète.");
     // QSettings shares a filename-based cache, but a parse error belongs to the
     // instance that first read the file. A new instance can lose that error and
     // silently normalize malformed INI. Validate physical bytes under a unique
@@ -151,6 +143,18 @@ bool readRegistryOnDisk(const QString& path, QVariant& registry, QString& error)
         return fail(error, "Configuration INI corrompue ; aucune réinitialisation effectuée.");
     registry = fresh.value(RegistryKey);
     return true;
+}
+bool readRegistryOnDisk(const QString& path, QVariant& registry, QString& error)
+{
+    registry = {};
+    QFile source(path);
+    if (!source.exists()) return true;
+    if (!source.open(QIODevice::ReadOnly) || source.size() > MaxConfigBytes)
+        return fail(error, "Lecture du fichier de configuration impossible.");
+    const QByteArray bytes = source.readAll();
+    if (source.error() != QFile::NoError)
+        return fail(error, "Lecture du fichier de configuration incomplète.");
+    return parseRegistrySnapshot(path, bytes, registry, error);
 }
 
 QJsonObject encodeIdentity(const VaultFileIdentity& file)
@@ -183,7 +187,9 @@ bool decodeIdentity(const QJsonObject& object, VaultFileIdentity& file)
         && unsignedNumber(object["inode"], file.inode) && file.inode != 0;
 }
 
-bool recoveryAllowed(const QVector<VaultRegistration>& records, const QString& path, QString& error)
+bool confirmResolvedAccess(const QString& settingsFile, const VaultRegistration& expected, QString& error);
+bool recoveryAllowed(const QVector<VaultRegistration>& records, const QString& path, QString& error,
+    const QString& settingsFile)
 {
     const auto normalized = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
     quint64 device = 0, inode = 0;
@@ -216,7 +222,13 @@ bool recoveryAllowed(const QVector<VaultRegistration>& records, const QString& p
 #else
                 return fail(error, "Identité résolue invérifiable sur cette plateforme.");
 #endif
+                // Visible content cannot establish that an earlier fsync worked.
+                // Revalidate NOW, even in a fresh process; no persisted/cache bit
+                // can substitute for this barrier. Caller holds the registry lock.
+                if (!confirmResolvedAccess(settingsFile, record, error)) return false;
             } else if ((inode && device == receipt.previous.device && inode == receipt.previous.inode)
+                || (receipt.phase == "abandoned" && receipt.candidate && inode
+                    && device == receipt.candidate->device && inode == receipt.candidate->inode)
                 || (receipt.candidate && normalized == receipt.candidate->path)) {
                 return fail(error, "Artefact technique de récupération ; accès ordinaire refusé.");
             }
@@ -242,7 +254,8 @@ bool decodeReplacement(const QJsonObject& r, VaultReplacementIntent& intent, QSt
     if (r["version"] != 1 || QUuid(intent.operationId).isNull()
         || QUuid(intent.operationId).toString(QUuid::WithoutBraces) != intent.operationId
         || (intent.phase != "prepared" && intent.phase != "armed"
-            && intent.phase != "identity-confirmed" && intent.phase != "resolved")
+            && intent.phase != "identity-confirmed" && intent.phase != "resolved"
+            && intent.phase != "abandon-confirmed" && intent.phase != "abandoned")
         || !decodeIdentity(r["previous"].toObject(), intent.previous)
         || intent.previousDigest.size() != 32
         || QString::fromLatin1(intent.previousDigest.toHex()) != digest || !r["artifacts"].isArray())
@@ -268,21 +281,22 @@ bool decodeReplacement(const QJsonObject& r, VaultReplacementIntent& intent, QSt
             return fail(error, "Référence de récupération invalide.");
         intent.recoveryArtifacts.append(artifact.toString());
     }
-    if (intent.phase != "prepared" && !intent.candidate)
+    const bool abandonment = intent.phase == "abandon-confirmed" || intent.phase == "abandoned";
+    if (intent.phase != "prepared" && !abandonment && !intent.candidate)
         return fail(error, "Intention de substitution incomplète.");
     if (r.contains("confirmed")) {
         VaultFileIdentity confirmed;
-        if (!decodeIdentity(r["confirmed"].toObject(), confirmed) || !intent.candidate)
+        if (!decodeIdentity(r["confirmed"].toObject(), confirmed) || (!abandonment && !intent.candidate))
             return fail(error, "Identité confirmée incomplète.");
-        auto expected = *intent.candidate;
+        auto expected = abandonment ? intent.previous : *intent.candidate;
         expected.path = intent.previous.path;
         if (confirmed != expected)
             return fail(error, "Identité confirmée étrangère au candidat.");
         intent.confirmed = std::move(confirmed);
     }
-    if ((intent.phase == "identity-confirmed" || intent.phase == "resolved") != intent.confirmed.has_value())
+    if ((intent.phase == "identity-confirmed" || intent.phase == "resolved" || abandonment) != intent.confirmed.has_value())
         return fail(error, "Phase de confirmation incohérente.");
-    if (intent.confirmed && !intent.recoveryArtifacts.contains(intent.candidate->path))
+    if (intent.confirmed && !abandonment && !intent.recoveryArtifacts.contains(intent.candidate->path))
         return fail(error, "Référence de récupération confirmée manquante.");
     return true;
 }
@@ -319,14 +333,14 @@ bool decode(const QJsonObject& root, QVector<VaultRegistration>& records, QStrin
         if (object.contains("replacement")) {
             VaultReplacementIntent intent;
             if (!decodeReplacement(object["replacement"].toObject(), intent, error)
-                || intent.phase == "resolved")
+                || intent.phase == "resolved" || intent.phase == "abandoned")
                 return fail(error, "Intention active de restauration invalide.");
             record.replacement = std::move(intent);
         }
         if (object.contains("resolvedReplacement")) {
             VaultReplacementIntent receipt;
             if (!decodeReplacement(object["resolvedReplacement"].toObject(), receipt, error)
-                || receipt.phase != "resolved")
+                || (receipt.phase != "resolved" && receipt.phase != "abandoned"))
                 return fail(error, "Reçu de restauration invalide.");
             record.resolvedReplacement = std::move(receipt);
         }
@@ -498,6 +512,53 @@ bool confirmSettingsDurability(const QString& path, QString& error)
         return fail(error, "Configuration publiée, mais durabilité non confirmée.");
 #endif
     return true;
+}
+
+bool confirmResolvedAccess(const QString& settingsFile, const VaultRegistration& expected, QString& error)
+{
+#ifdef Q_OS_UNIX
+    // Pin the very inode being parsed and synchronized. Ordinary QSettings UI
+    // writers do not take .registry-lock: a concurrent rename must fail closed,
+    // even if the new file happens to contain the same receipt.
+    Fd directory{openDirectory(QFileInfo(settingsFile).absolutePath())};
+    const auto name = QFile::encodeName(QFileInfo(settingsFile).fileName());
+    Fd published{directory.value < 0 ? -1 : ::openat(directory.value, name.constData(),
+        O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)};
+    struct stat before {}, after {}, named {};
+    if (published.value < 0 || ::fstat(published.value, &before) != 0 || !S_ISREG(before.st_mode)
+        || before.st_uid != ::geteuid() || before.st_nlink != 1 || (before.st_mode & 0077)
+        || before.st_size < 0 || before.st_size > MaxConfigBytes)
+        return fail(error, "Revalidation du reçu impossible ; récupération requise.");
+    QFile file;
+    if (!file.open(published.value, QIODevice::ReadOnly, QFileDevice::DontCloseHandle))
+        return fail(error, "Lecture du reçu impossible ; récupération requise.");
+    const auto bytes = file.read(MaxConfigBytes + 1);
+    QVariant registry; QVector<VaultRegistration> records;
+    if (file.error() != QFile::NoError || bytes.size() > MaxConfigBytes || !file.atEnd()
+        || !parseRegistrySnapshot(settingsFile, bytes, registry, error)
+        || !decode(QJsonDocument::fromJson(registry.toByteArray()).object(), records, error))
+        return fail(error, "Reçu de résolution illisible ; récupération requise.");
+    const auto found = std::find_if(records.cbegin(), records.cend(), [&](const auto& record) {
+        return record.localId == expected.localId && record.file == expected.file
+            && !record.replacement && record.resolvedReplacement == expected.resolvedReplacement;
+    });
+    if (found == records.cend())
+        return fail(error, "Reçu de résolution devenu obsolète ; récupération requise.");
+    if (::fsync(published.value) != 0 || ::fsync(directory.value) != 0)
+        return fail(error, "Durabilité actuelle du reçu non confirmée ; accès refusé.");
+    if (::fstat(published.value, &after) != 0
+        || ::fstatat(directory.value, name.constData(), &named, AT_SYMLINK_NOFOLLOW) != 0
+        || after.st_dev != before.st_dev || after.st_ino != before.st_ino
+        || named.st_dev != before.st_dev || named.st_ino != before.st_ino
+        || after.st_size != before.st_size || after.st_mtim.tv_sec != before.st_mtim.tv_sec
+        || after.st_mtim.tv_nsec != before.st_mtim.tv_nsec
+        || after.st_ctim.tv_sec != before.st_ctim.tv_sec || after.st_ctim.tv_nsec != before.st_ctim.tv_nsec)
+        return fail(error, "Registre changé pendant la revalidation ; accès refusé.");
+    return true;
+#else
+    Q_UNUSED(settingsFile); Q_UNUSED(expected);
+    return fail(error, "Revalidation durable indisponible sur cette plateforme.");
+#endif
 }
 
 template<class Operation>
@@ -707,7 +768,7 @@ VaultRecognition VaultPreferencesStore::recognizeOrRegister(
     VaultRecognition status = VaultRecognition::Error;
     VaultRegistration result;
     if (!accessRegistry(settingsFile_, error, [&](auto& records, bool& changed) {
-        if (!recoveryAllowed(records, path, error)) return false;
+        if (!recoveryAllowed(records, path, error, settingsFile_)) return false;
         VaultFileIdentity identity;
         if (!inspect(path, nullptr, identity, error)) {
             status = VaultRecognition::ReassociationRequired;
@@ -819,7 +880,7 @@ bool VaultPreferencesStore::prepareMutation(const QString& path,
     // caller opens SQLite only AFTER this method succeeds. No registry lock
     // is kept across SQLite work. No SQL inspection before recording intent.
     if (!accessRegistry(settingsFile_, error, [&](auto& records, bool& changed) {
-        if (!recoveryAllowed(records, path, error)) return false;
+        if (!recoveryAllowed(records, path, error, settingsFile_)) return false;
 #ifdef Q_OS_UNIX
         Fd directory{openDirectory(QFileInfo(normalized).absolutePath())};
         const auto name = QFile::encodeName(QFileInfo(normalized).fileName());
@@ -1102,7 +1163,7 @@ bool VaultPreferencesStore::updateIdentityAfterReplacement(const QString& localI
     const VaultFileIdentity& previous, const VaultFileIdentity& replacement, QString& error) const
 {
     return accessRegistry(settingsFile_, error, [&](auto& records, bool& changed) {
-        if (!recoveryAllowed(records, previous.path, error)) return false;
+        if (!recoveryAllowed(records, previous.path, error, settingsFile_)) return false;
         VaultFileIdentity current;
         if (previous.path != replacement.path || !inspect(replacement.path, nullptr, current, error)
             || current != replacement)
@@ -1128,7 +1189,7 @@ VaultRecoveryAccess VaultPreferencesStore::recoveryAccess(const QString& path, Q
 {
     bool allowed = false;
     const bool read = accessRegistry(settingsFile_, error, [&](auto& records, bool&) {
-        allowed = recoveryAllowed(records, path, error);
+        allowed = recoveryAllowed(records, path, error, settingsFile_);
         return true; // A readable pending fence differs from an unreadable registry.
     });
     if (!read) return VaultRecoveryAccess::Unavailable;
@@ -1192,6 +1253,46 @@ bool VaultPreferencesStore::resolveReplacement(const QString& localId,
         }
         return fail(error, "Enregistrement de récupération inconnu.");
     }, persistence);
+}
+
+bool VaultPreferencesStore::confirmPreparedAbandonment(const QString& localId,
+    const VaultReplacementIntent& expected, const VaultFileIdentity& observed, QString& error) const
+{
+    return accessRegistry(settingsFile_, error, [&](auto& records, bool& changed) {
+        for (auto& record : records) if (record.localId == localId) {
+            if (record.replacement != expected || record.file != expected.previous
+                || observed != expected.previous
+                || (expected.phase != "prepared" && expected.phase != "abandon-confirmed"))
+                return fail(error, "Abandon obsolète ou principal non confirmé ; blocage conservé.");
+            record.replacement->phase = "abandon-confirmed";
+            record.replacement->confirmed = observed;
+            changed = true; // Re-confirm a visible publication whose fsync failed.
+            return true;
+        }
+        return fail(error, "Préparation à abandonner introuvable.");
+    });
+}
+bool VaultPreferencesStore::resolvePreparedAbandonment(const QString& localId,
+    const VaultReplacementIntent& expected, const VaultFileIdentity& observed, QString& error) const
+{
+    return accessRegistry(settingsFile_, error, [&](auto& records, bool& changed) {
+        for (auto& record : records) if (record.localId == localId) {
+            if (!expected.confirmed || observed != expected.previous || observed != *expected.confirmed
+                || record.file != observed)
+                return fail(error, "Identité d'abandon non confirmée.");
+            if (expected.phase == "abandoned" && !record.replacement && record.resolvedReplacement == expected) {
+                changed = true; return true; // Explicit idempotent durability confirmation.
+            }
+            if (expected.phase != "abandon-confirmed" || record.replacement != expected)
+                return fail(error, "Abandon sans confirmation préalable interdit.");
+            auto receipt = expected; receipt.phase = "abandoned";
+            record.resolvedReplacement = std::move(receipt);
+            record.replacement.reset();
+            // No dirty/suspension/catalogue/rotation change, no artifact deletion.
+            changed = true; return true;
+        }
+        return fail(error, "Opération d'abandon introuvable.");
+    });
 }
 
 bool VaultPreferencesStore::confirmReplacementIdentity(const QString& localId,

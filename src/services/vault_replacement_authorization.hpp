@@ -80,6 +80,15 @@ private:
     friend class ReplacementTestAccess; // Only in the separately compiled test binary.
 #endif
     struct State;
+    // Distinct recovery admission, NOT a replacement authority. Only the real
+    // owner may admit abandonment after its queued cleanup acknowledgement.
+    // check is a secretless, thread-safe revocation flag, never a GUI callback.
+    static ReplacementRecoveryResult recoverLocked(const VaultPreferencesStore&,
+        const QString&, const QString&, ReplacementRecoveryAction, std::function<bool()> check);
+    static ReplacementRecoveryResult recoverImpl(const VaultPreferencesStore&,
+        const QString&, const QString&, ReplacementRecoveryAction, const std::function<bool()>&);
+    static ReplacementFinalizationResult resumeFinalizationImpl(const VaultPreferencesStore&,
+        const QString&, const QString&, const std::function<bool()>&);
     std::shared_ptr<State> state_;
     explicit VaultReplacementAuthorization(std::shared_ptr<State>) noexcept;
     static std::shared_ptr<State> reserve(const VaultPreferencesStore&, const QString&,

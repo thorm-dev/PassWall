@@ -11,6 +11,7 @@
 #include <QTimer>
 #include <QJsonObject>
 #include <QPointer>
+#include <QSet>
 #ifdef Q_OS_LINUX
 #include "services/restore_job.hpp"
 #endif
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <atomic>
 #include <vector>
 
 QT_BEGIN_NAMESPACE
@@ -38,6 +40,7 @@ namespace passwall::gui {
 class VaultExportDialog;
 class VaultRestoreController;
 class VaultBackupSettingsController;
+class VaultRecoveryController;
 #endif
 
 class MainWindow : public QMainWindow, public native::NativeVaultAccess {
@@ -71,7 +74,13 @@ public:
     // Internal execution API used by the restoration GUI/tests. Only an authority issued by THIS
     // MainWindow can be consumed. Returned facade remains owned by the window.
     services::RestoreJob* startReplacementOperation(services::VaultReplacementAuthorization,
-        const QString& source, core::SecureBuffer password, const QString& precaution);
+        const QString& source, core::SecureBuffer password, const QString& precaution,
+        QString* startError = nullptr);
+    // Recovery admission is distinct from replacement issuance. Always locks,
+    // waits for actual cleanup, then performs secretless proof I/O off-thread.
+    void requestReplacementRecovery(const QString& localId, const QString& operationId,
+        services::ReplacementRecoveryAction,
+        std::function<void(services::ReplacementRecoveryResult)>);
 #endif
     [[nodiscard]] native::NativeRequestResponse handleNativeRequest(
         const QJsonObject& request);
@@ -105,6 +114,10 @@ private:
     friend class VaultRestoreController; // Coordinates the real issuer; never a friend of Authorization.
     friend class VaultBackupSettingsController; // Presentation uses the existing backup coordinator.
     VaultBackupSettingsController* backupSettingsController_ = nullptr;
+    friend class VaultRecoveryController;
+    VaultRecoveryController* recoveryController_ = nullptr;
+    std::shared_ptr<std::atomic<bool>> recoveryAdmission_;
+    QSet<QString> recoveryUnconfirmed_; // Visible receipts never upgrade failed GUI results.
     void restoreVault();
     bool replacementMatchesSelection(const services::VaultReplacementAuthorization&,
         const services::VaultRegistration&) const noexcept;
@@ -115,7 +128,7 @@ private:
     void createVault();
     void unlockVault();
     void registerAuthenticatedVault(const QString& path);
-    void persistUiPreference(const QString& key, const QVariant& value);
+    bool persistUiPreference(const QString& key, const QVariant& value);
 
     void showUnlockedVault();
     enum class LockReason { Security, ReplacementPreparation };
@@ -170,7 +183,7 @@ private:
 #endif
 
     QTimer inactivityTimer_;
-    int autoLockMinutes_ = 5;
+    int autoLockMinutes_ = 1;
 
     Ui::MainWindow* ui_;
     core::SecureBuffer dataKey_{0};

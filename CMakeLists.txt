@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.25)
 
 project(PassWall VERSION 0.1.0 LANGUAGES CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -217,7 +219,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(passwall_vault_replacement PUBLIC passwall_vault_restore)
 
     # Restore-only secret transport and supervisor; keyless backup stays separate.
-    add_library(passwall_restore_driver STATIC src/services/restore_job.hpp src/services/restore_job.cpp)
+    add_library(passwall_restore_driver STATIC
+        src/services/restore_job.hpp src/services/restore_job.cpp
+        src/services/restore_executable_trust.hpp src/services/restore_executable_trust.cpp)
     target_include_directories(passwall_restore_driver PUBLIC src)
     target_link_libraries(passwall_restore_driver PUBLIC passwall_vault_replacement Qt6::Core)
     add_executable(passwall_restore_worker src/services/restore_worker_main.cpp)
@@ -422,6 +426,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             src/gui/vault_restore_controller.hpp src/gui/vault_restore_controller.cpp
             src/gui/vault_backup_settings_dialog.hpp src/gui/vault_backup_settings_dialog.cpp
             src/gui/vault_backup_settings_controller.hpp src/gui/vault_backup_settings_controller.cpp)
+        target_sources(${gui_target} PRIVATE
+            src/gui/vault_recovery_controller.hpp src/gui/vault_recovery_controller.cpp)
         target_link_libraries(${gui_target} PRIVATE passwall_backup_driver passwall_automatic_backup passwall_restore_driver)
         add_dependencies(${gui_target} passwall_backup_worker passwall_restore_worker)
     endforeach()
@@ -441,7 +447,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(passwall_gui_tests PRIVATE
         RESTORE_TEST_WORKER="$<TARGET_FILE:passwall_restore_worker_test>")
     target_link_options(passwall_gui_tests PRIVATE
-        -Wl,--wrap=_ZN8passwall8services10RestoreJob17siblingWorkerPathEv -Wl,--wrap=fsync -Wl,--wrap=send
+        -Wl,--wrap=_ZN8passwall8services10RestoreJob17siblingWorkerPathEv
+        -Wl,--wrap=_ZN8passwall8services10RestoreJob22siblingApplicationPathEv
+        -Wl,--wrap=fsync -Wl,--wrap=send
         -Wl,--wrap=fstatfs)
     target_compile_definitions(passwall_gui_tests PRIVATE
         EXPORT_FAKE_WORKER="$<TARGET_FILE:passwall_fake_backup_worker>")
@@ -464,6 +472,29 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         -Wl,--wrap=sodium_memzero
         -Wl,--wrap=_ZN8passwall8services21VaultLifecycleService11createVaultERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES9_RNS_4core12SecureBufferERS7_
         -Wl,--wrap=_ZN8passwall8services21VaultLifecycleService11unlockVaultERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES9_RNS_4core12SecureBufferERS7_)
+
+    # Security checks reject group/other-writable restoration executables.
+    # Build artifacts and installed production binaries therefore receive an
+    # explicit mode instead of inheriting the invoking user's umask.
+    function(passwall_secure_executable target)
+        set(permission_script "${CMAKE_CURRENT_BINARY_DIR}/passwall-permissions-${target}-$<CONFIG>.cmake")
+        file(GENERATE OUTPUT "${permission_script}" CONTENT
+            "file(CHMOD \"$<TARGET_FILE:${target}>\" PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)\n"
+            TARGET ${target})
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -P "${permission_script}"
+            COMMENT "Setting secure permissions on ${target}"
+            VERBATIM)
+    endfunction()
+    foreach(target passwall_app passwall_restore_worker
+            passwall_restore_worker_test passwall_restore_job_tests passwall_gui_tests)
+        passwall_secure_executable(${target})
+    endforeach()
+
+    install(TARGETS passwall_app passwall_restore_worker
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+        PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+            GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 endif()
 
 # Hôte natif de communication avec Firefox

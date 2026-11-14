@@ -4,6 +4,7 @@
 #include "services/credential_service.hpp"
 #include "storage/vault_storage.hpp"
 #include "storage/vault_operation_guard.hpp"
+#include "posix_test_io.hpp"
 #include <gtest/gtest.h>
 #include <QFile>
 #include <QFileInfo>
@@ -26,6 +27,7 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <sodium.h>
 #include <sqlite3.h>
@@ -38,6 +40,11 @@ namespace passwall::services {
 // class is not declared/friended in any production target.
 class ReplacementTestAccess {
 public:
+    static ReplacementRecoveryResult recoverPrepared(const VaultPreferencesStore& store,
+        const QString& id, const QString& operation, std::function<bool()> check = [] { return true; }) {
+        return VaultReplacementAuthorization::recoverLocked(store, id, operation,
+            ReplacementRecoveryAction::AbandonPrepared, std::move(check));
+    }
     static VaultReplacementAuthorization issue(const VaultPreferencesStore& store,
         const QString& id, QString& error) {
         return VaultReplacementAuthorization::acknowledge(
@@ -88,11 +95,13 @@ public:
 }
 namespace {
 bool failSync = false;
-enum class RegistryFault { None, Open, FileSync, DirectorySync, BeforeSync, SyncError, AfterSync };
+enum class RegistryFault { None, Open, FileSync, DirectorySync, BeforeSync, SyncError, AfterSync, AfterAbortSync, ReplaceDuringResolvedSync };
 RegistryFault registryFault = RegistryFault::None;
 std::string faultConfig;
 int faultCountdown = 1;
 bool sawVisiblePublication = false;
+bool sawVisibleAbortPublication = false;
+bool exitAfterRegistryDirectorySync = false;
 bool descriptorIs(int fd, const std::string& path) {
     char proc[64], actual[4096];
     const int length = std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
@@ -205,9 +214,16 @@ VaultReplacementAuthorization issueReplacementEngineTest(const VaultPreferencesS
     const QString& id, QString& error) {
     return ReplacementTestAccess::issue(store, id, error);
 }
+ReplacementRecoveryResult recoverPreparedReplacementForTest(const VaultPreferencesStore& store,
+    const QString& id, const QString& operation) {
+    return ReplacementTestAccess::recoverPrepared(store, id, operation);
+}
 void replacementRegistrySyncFaultForTest(const QString& config, int ordinal) {
     faultConfig = config.toStdString();
     registryFault = RegistryFault::FileSync; faultCountdown = ordinal;
+}
+void replacementCrashAfterRegistrySyncForTest(const QString& config) {
+    faultConfig = config.toStdString(); exitAfterRegistryDirectorySync = true;
 }
 bool replacementEngineSyncFault(int fd);
 extern "C" int __real_fsync(int);
@@ -217,7 +233,16 @@ extern "C" int __wrap_fsync(int fd) {
     if ((descriptorIs(fd, faultConfig) && trigger(RegistryFault::FileSync))
         || (descriptorIs(fd, QFileInfo(QString::fromStdString(faultConfig)).absolutePath().toStdString())
             && trigger(RegistryFault::DirectorySync))) { errno = EIO; return -1; }
-    return __real_fsync(fd);
+    const int result = __real_fsync(fd);
+    if (result == 0 && descriptorIs(fd, faultConfig) && trigger(RegistryFault::ReplaceDuringResolvedSync)) {
+        QSettings writer(QString::fromStdString(faultConfig), QSettings::IniFormat);
+        writer.setValue("unrelated/concurrent-writer", "fictitious-preference");
+        writer.sync(); // Real atomic QSettings rename, without the registry lock.
+    }
+    if (result == 0 && exitAfterRegistryDirectorySync
+        && descriptorIs(fd, QFileInfo(QString::fromStdString(faultConfig)).absolutePath().toStdString()))
+        ::_exit(74); // Test-only real interruption after the protected registry write.
+    return result;
 }
 extern "C" int __real_openat(int, const char*, int, ...);
 extern "C" int __wrap_openat(int directory, const char* name, int flags, ...) {
@@ -240,6 +265,14 @@ extern "C" void __wrap__ZN9QSettings4syncEv(QSettings* settings) {
         return;
     }
     realSettingsSync(settings);
+    if (target && registryFault == RegistryFault::AfterAbortSync) {
+        QFile published(settings->fileName());
+        if (published.open(QIODevice::ReadOnly) && published.readAll().contains("abandon-confirmed")) {
+            registryFault = RegistryFault::None;
+            sawVisibleAbortPublication = true;
+            throw std::bad_alloc(); // Exact visible phase, not a count of unrelated QSettings reads.
+        }
+    }
     if (target && trigger(RegistryFault::AfterSync)) {
         QFile file(settings->fileName());
         if (file.open(QIODevice::ReadOnly)) sawVisiblePublication = file.readAll().contains("identity-confirmed");
@@ -599,7 +632,42 @@ TEST_F(VaultReplacementTest, ResumeReportsSafeUnconfirmedResolutionSeparatelyFro
     const auto result = Authorization::resumeFinalization(store(), registered.localId, intent.operationId);
     EXPECT_EQ(result.state, ReplacementFinalizationState::SafeResolutionUnconfirmed);
     EXPECT_FALSE(result.diagnostic.isEmpty()); ASSERT_TRUE(read().resolvedReplacement);
+    childProbe("read-no-durability", intent.operationId, false);
+    // Success now requires a NEW durability barrier, not the visible receipt.
     childProbe("read", intent.operationId, true);
+}
+TEST_F(VaultReplacementTest, ResolvedAdmissionRequiresFileAndDirectoryDurabilityEveryTime) {
+    const auto intent = confirmLayout();
+    ASSERT_EQ(Authorization::resumeFinalization(store(), registered.localId, intent.operationId).state,
+        ReplacementFinalizationState::Resolved);
+    const auto configBefore = bytes(config), principalBefore = bytes(path);
+    registryFault = RegistryFault::FileSync;
+    EXPECT_EQ(store().recoveryAccess(path, error), VaultRecoveryAccess::RecoveryRequired);
+    EXPECT_TRUE(error.contains("Durabilité"));
+    registryFault = RegistryFault::DirectorySync; faultCountdown = 1;
+    EXPECT_EQ(store().recoveryAccess(path, error), VaultRecoveryAccess::RecoveryRequired);
+    EXPECT_EQ(bytes(config), configBefore); EXPECT_EQ(bytes(path), principalBefore);
+    EXPECT_EQ(store().recoveryAccess(path, error), VaultRecoveryAccess::Allowed);
+    registryFault = RegistryFault::FileSync; faultCountdown = 1; // A previous success is not a permanent cache grant.
+    EXPECT_EQ(store().recoveryAccess(path, error), VaultRecoveryAccess::RecoveryRequired);
+}
+TEST_F(VaultReplacementTest, ResolvedAdmissionRefusesConcurrentConfigurationRenameEvenWithSameReceipt) {
+    const auto intent = confirmLayout();
+    ASSERT_EQ(Authorization::resumeFinalization(store(), registered.localId, intent.operationId).state,
+        ReplacementFinalizationState::Resolved);
+    registryFault = RegistryFault::ReplaceDuringResolvedSync;
+    EXPECT_EQ(store().recoveryAccess(path, error), VaultRecoveryAccess::RecoveryRequired);
+    EXPECT_TRUE(error.contains("changé")); EXPECT_EQ(read().resolvedReplacement->operationId, intent.operationId);
+    EXPECT_EQ(store().recoveryAccess(path, error), VaultRecoveryAccess::Allowed);
+}
+TEST_F(VaultReplacementTest, AbandonedReceiptAlsoRequiresCurrentDurabilityBeforeAdmission) {
+    auto a = issue(); const auto op = a.operationId(); a.reset();
+    ASSERT_EQ(ReplacementTestAccess::recoverPrepared(store(), registered.localId, op).finalization.state,
+        ReplacementFinalizationState::Resolved);
+    registryFault = RegistryFault::FileSync;
+    EXPECT_EQ(store().recoveryAccess(path, error), VaultRecoveryAccess::RecoveryRequired);
+    EXPECT_EQ(read().resolvedReplacement->phase, "abandoned");
+    childProbe("read-no-durability", op, false); childProbe("read", op, true);
 }
 TEST_F(VaultReplacementTest, ResumeReportsUnconfirmedIdentityAndKeepsGate) {
     const auto intent = confirmLayout(); registryFault = RegistryFault::FileSync;
@@ -823,11 +891,203 @@ TEST_F(VaultReplacementTest, SnapshotSyncFailureDoesNotRevokeOrReleaseTheAuthori
     EXPECT_EQ(result.publication, SnapshotPublication::NotPublished); EXPECT_TRUE(a.valid(error));
     VaultOperationGuard access; std::string failure; EXPECT_FALSE(access.tryAccess(path.toStdString(), failure));
 }
+TEST_F(VaultReplacementTest, RecoveryPreparedRequiresOwnerAdmissionNotUuidOrReservation) {
+    auto a = issue(); const auto op = a.operationId(); a.reset();
+    const auto denied = Authorization::recoverReplacement(store(), registered.localId, op,
+        ReplacementRecoveryAction::AbandonPrepared);
+    EXPECT_NE(denied.finalization.state, ReplacementFinalizationState::Resolved);
+    EXPECT_TRUE(read().replacement);
+    const auto revoked = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op, [] { return false; });
+    EXPECT_NE(revoked.finalization.state, ReplacementFinalizationState::Resolved);
+    EXPECT_TRUE(read().replacement);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedConfirmsOriginalAndRetainsDurableAbortReceipt) {
+    auto a = issue(); const auto op = a.operationId(); const auto before = bytes(path); a.reset();
+    const auto result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_EQ(result.layout, ReplacementLayout::Abandoned);
+    EXPECT_EQ(result.finalization.state, ReplacementFinalizationState::Resolved) << result.diagnostic.toStdString();
+    EXPECT_EQ(bytes(path), before); EXPECT_FALSE(read().replacement);
+    ASSERT_TRUE(read().resolvedReplacement); EXPECT_EQ(read().resolvedReplacement->phase, "abandoned");
+    EXPECT_EQ(store().recoveryAccess(path, error), VaultRecoveryAccess::Allowed);
+    const auto again = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_EQ(again.finalization.state, ReplacementFinalizationState::Resolved);
+    childProbe("read", op, true);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedRefusesStillLiveAuthorityAndIncompatibleReservation) {
+    auto a = issue(); const auto op = a.operationId();
+    auto result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_NE(result.finalization.state, ReplacementFinalizationState::Resolved);
+    a.reset(); VaultOperationGuard other; std::string failure;
+    ASSERT_TRUE(other.tryAccess(path.toStdString(), failure));
+    result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_NE(result.finalization.state, ReplacementFinalizationState::Resolved);
+    EXPECT_TRUE(read().replacement);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedRefusesWrongOperationAndChangedBytes) {
+    auto a = issue(); const auto op = a.operationId(); a.reset();
+    auto result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, QUuid::createUuid().toString(QUuid::WithoutBraces));
+    EXPECT_NE(result.finalization.state, ReplacementFinalizationState::Resolved);
+    QFile changed(path); ASSERT_TRUE(changed.open(QIODevice::Append)); ASSERT_EQ(changed.write("x"), 1); changed.close();
+    result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_NE(result.finalization.state, ReplacementFinalizationState::Resolved); EXPECT_TRUE(read().replacement);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedRefusesMissingOrDifferentPhysicalPrincipal) {
+    auto a = issue(); const auto op = a.operationId(); a.reset();
+    ASSERT_TRUE(QFile::rename(path, path + ".kept"));
+    EXPECT_NE(ReplacementTestAccess::recoverPrepared(store(), registered.localId, op).finalization.state,
+        ReplacementFinalizationState::Resolved);
+    ASSERT_TRUE(QFile::copy(path + ".kept", path));
+    EXPECT_NE(ReplacementTestAccess::recoverPrepared(store(), registered.localId, op).finalization.state,
+        ReplacementFinalizationState::Resolved);
+    EXPECT_TRUE(read().replacement);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedFirstSyncFailureKeepsFenceAndResumesInFreshProcess) {
+    auto a = issue(); const auto op = a.operationId(); a.reset();
+    replacementRegistrySyncFaultForTest(config, 1);
+    const auto result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_NE(result.finalization.state, ReplacementFinalizationState::Resolved);
+    ASSERT_TRUE(read().replacement); EXPECT_EQ(read().replacement->phase, "abandon-confirmed");
+    childProbe("read", op, false);
+    QProcess child;
+    child.start(QCoreApplication::applicationFilePath(), {"--prepared-recover", config, registered.localId, op});
+    ASSERT_TRUE(child.waitForFinished(10000)); EXPECT_EQ(child.exitStatus(), QProcess::NormalExit); EXPECT_EQ(child.exitCode(), 0);
+    EXPECT_FALSE(read().replacement); childProbe("read", op, true);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedFinalSyncFailureIsNotReportedAsSuccessAndIsIdempotent) {
+    auto a = issue(); const auto op = a.operationId(); a.reset();
+    replacementRegistrySyncFaultForTest(config, 2);
+    const auto result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_EQ(result.finalization.state, ReplacementFinalizationState::SafeResolutionUnconfirmed);
+    ASSERT_TRUE(read().resolvedReplacement); // Safe durable first write precedes this visible receipt.
+    const auto resumed = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_EQ(resumed.finalization.state, ReplacementFinalizationState::Resolved);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedRevocationBetweenWritesRetainsProtectedConfirmation) {
+    auto a = issue(); const auto op = a.operationId(); a.reset(); int admissions = 0;
+    const auto result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op, [&] { return ++admissions < 4; });
+    EXPECT_NE(result.finalization.state, ReplacementFinalizationState::Resolved);
+    EXPECT_TRUE(read().replacement);
+    EXPECT_EQ(store().recoveryAccess(path, error), VaultRecoveryAccess::RecoveryRequired);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedRealProcessExitAndFreshProcessResolutionPreservePreferences) {
+    VaultBackupPreferences preferences; preferences.automatic = true;
+    preferences.directory = directory.filePath("absent-backup-device"); preferences.retainedVersions = 11;
+    ASSERT_TRUE(store().updatePreferences(registered.localId, preferences, error));
+    ASSERT_TRUE(store().suspendAutomaticBackup(registered.localId, error));
+    const auto before = read();
+    const auto child = ::fork(); ASSERT_GE(child, 0);
+    if (child == 0) {
+        auto a = issue();
+        ::_exit(a.operationId().isEmpty() ? 90 : 73); // No C++ destructors, real process interruption.
+    }
+    int status = 0; ASSERT_EQ(::waitpid(child, &status, 0), child); ASSERT_TRUE(WIFEXITED(status)); ASSERT_EQ(WEXITSTATUS(status), 73);
+    ASSERT_TRUE(read().replacement); const auto op = read().replacement->operationId;
+    QProcess fresh;
+    fresh.start(QCoreApplication::applicationFilePath(), {"--prepared-recover", config, registered.localId, op});
+    ASSERT_TRUE(fresh.waitForFinished(10000)); ASSERT_EQ(fresh.exitCode(), 0);
+    const auto after = read(); EXPECT_EQ(after.backup, before.backup);
+    EXPECT_EQ(after.backupRequired, before.backupRequired); EXPECT_EQ(after.automaticSuspended, before.automaticSuspended);
+    EXPECT_EQ(after.automaticVersions, before.automaticVersions); EXPECT_EQ(after.rotationAttempt, before.rotationAttempt);
+    EXPECT_EQ(after.file, before.file); EXPECT_FALSE(after.replacement);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedStagedCandidateIsPreservedAndRemainsFenced) {
+    auto a = issue(); const auto op = a.operationId();
+    ASSERT_TRUE(ReplacementTestAccess::stage(a, candidate, error)); a.reset();
+    const auto before = bytes(candidate);
+    const auto result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_EQ(result.finalization.state, ReplacementFinalizationState::Resolved);
+    EXPECT_EQ(bytes(candidate), before); EXPECT_TRUE(read().resolvedReplacement->candidate);
+    EXPECT_EQ(store().recoveryAccess(candidate, error), VaultRecoveryAccess::RecoveryRequired);
+}
+TEST_F(VaultReplacementTest, RecoveryArmedBeforeExchangeCannotBeAbandonedOrExchangedAgain) {
+    auto a = issue(); const auto op = a.operationId();
+    ASSERT_TRUE(ReplacementTestAccess::stage(a, candidate, error)); ASSERT_TRUE(ReplacementTestAccess::arm(a, error)); a.reset();
+    const auto mainBefore = bytes(path), otherBefore = bytes(candidate);
+    const auto result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_EQ(result.layout, ReplacementLayout::ArmedBeforeExchange);
+    EXPECT_NE(result.finalization.state, ReplacementFinalizationState::Resolved);
+    EXPECT_TRUE(read().replacement); EXPECT_EQ(bytes(path), mainBefore); EXPECT_EQ(bytes(candidate), otherBefore);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedCrashBetweenAbortWritesResumesWithoutLosingItsFence) {
+    auto a = issue(); const auto op = a.operationId(); a.reset();
+    const auto child = ::fork(); ASSERT_GE(child, 0);
+    if (child == 0) {
+        exitAfterRegistryDirectorySync = true;
+        const auto result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+        ::_exit(result.finalization.state == ReplacementFinalizationState::Resolved ? 91 : 92);
+    }
+    int status = 0; ASSERT_EQ(::waitpid(child, &status, 0), child); ASSERT_TRUE(WIFEXITED(status)); ASSERT_EQ(WEXITSTATUS(status), 74);
+    ASSERT_TRUE(read().replacement); EXPECT_EQ(read().replacement->phase, "abandon-confirmed"); childProbe("read", op, false);
+    QProcess fresh;
+    fresh.start(QCoreApplication::applicationFilePath(), {"--prepared-recover", config, registered.localId, op});
+    ASSERT_TRUE(fresh.waitForFinished(10000)); ASSERT_EQ(fresh.exitCode(), 0); childProbe("read", op, true);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedExceptionAfterProtectedPublicationRetainsResumableEvidence) {
+    auto a = issue(); const auto op = a.operationId(); a.reset();
+    sawVisibleAbortPublication = false; registryFault = RegistryFault::AfterAbortSync;
+    const auto result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_NE(result.finalization.state, ReplacementFinalizationState::Resolved);
+    ASSERT_TRUE(sawVisibleAbortPublication);
+    const auto persisted = read(); ASSERT_TRUE(persisted.replacement);
+    // QSettings may restore its prior cache during unwinding. Neither safe
+    // variant is a durable resolution; both must retain the recovery gate.
+    EXPECT_TRUE(persisted.replacement->phase == "prepared" || persisted.replacement->phase == "abandon-confirmed");
+    childProbe("read", op, false);
+    EXPECT_EQ(ReplacementTestAccess::recoverPrepared(store(), registered.localId, op).finalization.state,
+        ReplacementFinalizationState::Resolved);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedUnreadableRegistryNeverClearsOrRecreatesIt) {
+    auto a = issue(); const auto op = a.operationId(); a.reset(); corruptRegistry(); const auto before = bytes(config);
+    const auto result = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_NE(result.finalization.state, ReplacementFinalizationState::Resolved); EXPECT_EQ(bytes(config), before);
+    EXPECT_EQ(store().recoveryAccess(path, error), VaultRecoveryAccess::Unavailable);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedChildRetainsReservationUntilActualExit) {
+    auto a = issue(); const auto op = a.operationId();
+    int ready[2], release[2]; ASSERT_EQ(::pipe2(ready, O_CLOEXEC), 0); ASSERT_EQ(::pipe2(release, O_CLOEXEC), 0);
+    const auto child = ::fork(); ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::close(ready[0]); ::close(release[1]);
+        if (!passwall::test_io::writeAll(ready[1], "r", 1)) ::_exit(80);
+        char command = 0;
+        const auto received = passwall::test_io::readSome(release[0], &command, 1);
+        ::_exit(received == 1 && command == 'x' ? 0 : 81);
+    }
+    ::close(ready[1]); ::close(release[0]);
+    char response = 0;
+    const auto received = passwall::test_io::readSome(ready[0], &response, 1); ::close(ready[0]);
+    EXPECT_EQ(received, 1); EXPECT_EQ(response, 'r');
+    a.reset(); // The child still owns the inherited open file descriptions.
+    const auto active = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_NE(active.finalization.state, ReplacementFinalizationState::Resolved); EXPECT_TRUE(read().replacement);
+    EXPECT_TRUE(passwall::test_io::writeAll(release[1], "x", 1)); ::close(release[1]);
+    int status = 0; ASSERT_EQ(::waitpid(child, &status, 0), child); ASSERT_TRUE(WIFEXITED(status)); ASSERT_EQ(WEXITSTATUS(status), 0);
+    const auto stopped = ReplacementTestAccess::recoverPrepared(store(), registered.localId, op);
+    EXPECT_EQ(stopped.finalization.state, ReplacementFinalizationState::Resolved);
+}
+TEST_F(VaultReplacementTest, RecoveryPreparedMissingOrChangedCandidateKeepsEveryProofAndArtifact) {
+    auto a = issue(); const auto op = a.operationId(); ASSERT_TRUE(ReplacementTestAccess::stage(a, candidate, error)); a.reset();
+    const auto original = bytes(path); const auto registeredIntent = *read().replacement;
+    ASSERT_TRUE(QFile::rename(candidate, candidate + ".kept"));
+    EXPECT_NE(ReplacementTestAccess::recoverPrepared(store(), registered.localId, op).finalization.state,
+        ReplacementFinalizationState::Resolved);
+    ASSERT_TRUE(QFile::rename(candidate + ".kept", candidate));
+    QFile modified(candidate); ASSERT_TRUE(modified.open(QIODevice::Append)); ASSERT_EQ(modified.write("x"), 1); modified.close();
+    EXPECT_NE(ReplacementTestAccess::recoverPrepared(store(), registered.localId, op).finalization.state,
+        ReplacementFinalizationState::Resolved);
+    EXPECT_EQ(*read().replacement, registeredIntent); EXPECT_EQ(bytes(path), original); EXPECT_TRUE(QFile::exists(candidate));
+}
 } // namespace
 
 int main(int argc, char** argv)
 {
     QCoreApplication application(argc, argv);
+    if (argc == 5 && std::strcmp(argv[1], "--prepared-recover") == 0) {
+        if (sodium_init() < 0) return 10;
+        const auto result = ReplacementTestAccess::recoverPrepared(VaultPreferencesStore(QString::fromLocal8Bit(argv[2])),
+            QString::fromLocal8Bit(argv[3]), QString::fromLocal8Bit(argv[4]));
+        return result.finalization.state == ReplacementFinalizationState::Resolved ? 0 : 5;
+    }
     if (argc == 6 && std::strcmp(argv[1], "--replacement-recover") == 0) {
         VaultPreferencesStore store(QString::fromLocal8Bit(argv[2]));
         const auto result = Authorization::recoverReplacement(store, QString::fromLocal8Bit(argv[3]),
@@ -842,7 +1102,8 @@ int main(int argc, char** argv)
         const QString action = QString::fromLocal8Bit(argv[6]);
         // No test environment, QSettings cache, authority or session inherited
         // from the parent. All operations use this explicit isolated registry.
-        if (action != "read") {
+        if (action == "read-no-durability") replacementRegistrySyncFaultForTest(store.fileName(), 1);
+        else if (action != "read") {
             const auto result = Authorization::resumeFinalization(store, localId, operation);
             if ((action == "resume") != (result.state == ReplacementFinalizationState::Resolved)) return 2;
         }

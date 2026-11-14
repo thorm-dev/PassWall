@@ -1,8 +1,10 @@
 #include "services/restore_protocol.hpp"
 #include "services/restore_job.hpp"
+#include "services/restore_executable_trust.hpp"
 #include <gtest/gtest.h>
 #include <QCoreApplication>
 #include <QFile>
+#include <QFileInfo>
 #include <QProcess>
 #include <QTemporaryDir>
 #include <QElapsedTimer>
@@ -11,6 +13,7 @@
 #include <QDir>
 #include "storage/vault_operation_guard.hpp"
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sodium.h>
 #include <thread>
 
@@ -146,6 +149,28 @@ TEST(RestoreProtocolTest, TruncatedPasswordUsesSecureBufferAndWipesOnScopeExit) 
         EXPECT_EQ(secureLive, 1);
     }
     observeSecure = false; EXPECT_EQ(secureLive, 0); EXPECT_TRUE(secureWiped);
+}
+TEST(RestoreExecutableTrustTest, Accepts0755AndRejects0775)
+{
+    using namespace passwall::services::restore_executable_trust;
+    QTemporaryDir directory; ASSERT_TRUE(directory.isValid());
+    const auto path = directory.filePath("fictitious-executable");
+    QFile file(path); ASSERT_TRUE(file.open(QIODevice::WriteOnly)); ASSERT_EQ(file.write("x"), 1); file.close();
+    ASSERT_EQ(::chmod(QFile::encodeName(path).constData(), 0755), 0);
+    EXPECT_EQ(executable(path), Failure::None);
+    ASSERT_EQ(::chmod(QFile::encodeName(path).constData(), 0775), 0);
+    EXPECT_EQ(executable(path), Failure::WritableByOthers);
+}
+TEST(RestoreExecutableTrustTest, ProcessIdentityRejectsAnotherInode)
+{
+    using namespace passwall::services::restore_executable_trust;
+    const auto current = QFileInfo(QStringLiteral("/proc/self/exe")).symLinkTarget();
+    ASSERT_FALSE(current.isEmpty()); EXPECT_EQ(processExecutable(::getpid(), current), Failure::None);
+    QTemporaryDir directory; ASSERT_TRUE(directory.isValid());
+    const auto path = directory.filePath("replacement-inode");
+    QFile file(path); ASSERT_TRUE(file.open(QIODevice::WriteOnly)); ASSERT_EQ(file.write("x"), 1); file.close();
+    ASSERT_EQ(::chmod(QFile::encodeName(path).constData(), 0755), 0);
+    EXPECT_EQ(processExecutable(::getpid(), path), Failure::IdentityMismatch);
 }
 TEST(RestoreJobTest, RejectedStartDestroysOwnedSenderBufferWithoutMutatingAnotherBuffer) {
     ASSERT_GE(sodium_init(), 0);
