@@ -1,7 +1,7 @@
 
 cmake_minimum_required(VERSION 3.25)
 
-project(PassWall VERSION 1.28.0 LANGUAGES CXX)
+project(PassWall VERSION 1.29.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 

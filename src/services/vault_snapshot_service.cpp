@@ -250,6 +250,38 @@ bool checkColumns(sqlite3* database, const char* pragma,
     return true;
 }
 
+bool blobOfSize(sqlite3_stmt* statement, int column, int size)
+{
+    return sqlite3_column_type(statement, column) == SQLITE_BLOB
+        && sqlite3_column_bytes(statement, column) == size
+        && sqlite3_column_blob(statement, column) != nullptr;
+}
+
+bool validateMetadata(sqlite3* database, std::string& error)
+{
+    Statement query;
+    if (!prepare(database,
+            "SELECT vault_id,format_version,salt,argon2_operations,argon2_memory,"
+            "wrap_nonce,wrapped_dek FROM vault_metadata WHERE id=1;",
+            query, error)) return false;
+    if (sqlite3_step(query.value) != SQLITE_ROW
+        || !blobOfSize(query.value, 0, 16)
+        || sqlite3_column_type(query.value, 1) != SQLITE_INTEGER
+        || sqlite3_column_int64(query.value, 1) != VaultFormatVersion
+        || !blobOfSize(query.value, 2, 16)
+        || sqlite3_column_type(query.value, 3) != SQLITE_INTEGER
+        || sqlite3_column_int64(query.value, 3) < 3
+        || sqlite3_column_int64(query.value, 3) > 4
+        || sqlite3_column_type(query.value, 4) != SQLITE_INTEGER
+        || sqlite3_column_int64(query.value, 4) < sqlite3_int64(VaultArgon2Memory)
+        || sqlite3_column_int64(query.value, 4) > sqlite3_int64(2 * VaultArgon2Memory)
+        || !blobOfSize(query.value, 5, 24)
+        || !blobOfSize(query.value, 6, 48)
+        || sqlite3_step(query.value) != SQLITE_DONE)
+        return fail(error, "Métadonnées ou format du coffre incompatibles avec PassWall V1.");
+    return true;
+}
+
 bool validateSnapshot(sqlite3* database, std::string& error)
 {
     // Explicit object allow-list, including the two implicit UNIQUE/PK indexes.
@@ -290,6 +322,65 @@ bool validateSnapshot(sqlite3* database, std::string& error)
 }
 
 } // namespace
+
+bool VaultSnapshotService::prevalidateVaultSource(const std::string& path,
+    std::string& error, SnapshotSourceIdentity* identity)
+{
+    error.clear();
+    if (identity) *identity = {};
+    try {
+        if (!validPath(path)) return fail(error, "Chemin de sauvegarde invalide.");
+        const std::filesystem::path source(path);
+        Descriptor parent, file;
+        if (!openParent(source, parent, error)) return false;
+        file.value = ::openat(parent.value, source.filename().c_str(),
+            O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+        if (file.value < 0) return posixFailure(error, "Sauvegarde absente ou inaccessible");
+        struct stat original {}, named {}, opened {};
+        if (::fstat(file.value, &original) != 0
+            || !S_ISREG(original.st_mode) || original.st_nlink != 1
+            || original.st_uid != ::geteuid() || (original.st_mode & 0022) != 0)
+            return fail(error, "La sauvegarde doit être un fichier régulier protégé appartenant à l'utilisateur.");
+        std::array<char, 16> header {};
+        ssize_t count;
+        do { count = ::pread(file.value, header.data(), header.size(), 0); }
+        while (count < 0 && errno == EINTR);
+        constexpr std::array<char, 16> sqliteHeader{
+            'S','Q','L','i','t','e',' ','f','o','r','m','a','t',' ','3','\0'};
+        if (count != ssize_t(header.size()) || header != sqliteHeader)
+            return fail(error, "La sauvegarde n'est manifestement pas un fichier SQLite.");
+
+        Database database;
+        if (!openDatabase(path, true, database, error)
+            || !validateSnapshot(database.value, error)
+            || !validateMetadata(database.value, error)) return false;
+        if (database.close() != SQLITE_OK)
+            return fail(error, "Fermeture du contrôle SQLite impossible.");
+
+        if (::fstatat(parent.value, source.filename().c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0
+            || ::fstat(file.value, &opened) != 0
+            || named.st_dev != original.st_dev || named.st_ino != original.st_ino
+            || named.st_size != original.st_size
+            || named.st_mtim.tv_sec != original.st_mtim.tv_sec
+            || named.st_mtim.tv_nsec != original.st_mtim.tv_nsec
+            || named.st_ctim.tv_sec != original.st_ctim.tv_sec
+            || named.st_ctim.tv_nsec != original.st_ctim.tv_nsec
+            || opened.st_dev != original.st_dev || opened.st_ino != original.st_ino
+            || opened.st_size != original.st_size
+            || opened.st_mtim.tv_sec != original.st_mtim.tv_sec
+            || opened.st_mtim.tv_nsec != original.st_mtim.tv_nsec
+            || opened.st_ctim.tv_sec != original.st_ctim.tv_sec
+            || opened.st_ctim.tv_nsec != original.st_ctim.tv_nsec)
+            return fail(error, "La sauvegarde a changé pendant sa prévalidation.");
+        if (identity) *identity = {
+            std::uint64_t(original.st_dev), std::uint64_t(original.st_ino)};
+        return true;
+    } catch (...) {
+        try { error = "Prévalidation de la sauvegarde interrompue."; }
+        catch (...) { error.clear(); }
+        return false;
+    }
+}
 
 bool VaultSnapshotService::inspectDestinationDirectory(const std::string& path,
     SnapshotDirectoryIdentity& identity, std::string& error)

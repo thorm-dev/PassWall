@@ -23,9 +23,12 @@ signals:
     // Completion of the real asynchronous preparation, including a stale reply.
     void preparationSettled(bool current);
 private:
-    enum class AutomaticAbandonReason { Cancellation, AuthenticationRejected };
+    enum class AutomaticAbandonReason {
+        Cancellation, AuthenticationRejected, NonEngagedFailure, StartupRefused
+    };
     void load();
     void prepare();
+    void authorizeAfterPrevalidation(quint64 serial, quint64 securityGeneration);
     void execute();
     void cancel();
     void abandonPrepared(AutomaticAbandonReason);
@@ -40,10 +43,11 @@ private:
     services::VaultReplacementAuthorization authority_;
     std::optional<services::RestoreResult> result_;
     QString source_, precaution_, principalId_, operationId_;
+    QString automaticAbandonDiagnostic_;
     QSet<QString> uncertain_; // No GUI retry of an unconfirmed operation in this application lifetime.
     quint64 generation_ = 0;
-    enum class Stage { Idle, Loading, Choosing, Preparing, Password, Running, Resolving, Result } stage_ = Stage::Idle;
+    enum class Stage { Idle, Loading, Choosing, Prevalidating, Preparing, Password, Running, Resolving, Result } stage_ = Stage::Idle;
     bool cleanup_ = false, cancelled_ = false, engaged_ = false, finalReported_ = false;
-    bool authenticationAbandonPending_ = false;
+    std::optional<AutomaticAbandonReason> automaticAbandonPending_;
 };
 } // namespace passwall::gui

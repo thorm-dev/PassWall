@@ -559,6 +559,57 @@ TEST_F(VaultSnapshotServiceTest, KeylessSnapshotPreservesEncryptedRecordsAndReop
     }
 }
 
+TEST_F(VaultSnapshotServiceTest, RestorePrevalidationAcceptsOnlyStructurallyValidProtectedVaults)
+{
+    std::string error;
+    const auto original = fileBytes(source);
+    ASSERT_TRUE(VaultSnapshotService::prevalidateVaultSource(source, error)) << error;
+    EXPECT_EQ(fileBytes(source), original);
+
+    const auto renamed = directory.filePath("valid-renamed.txt");
+    ASSERT_TRUE(QFile::copy(QString::fromStdString(source), renamed));
+    EXPECT_TRUE(VaultSnapshotService::prevalidateVaultSource(renamed.toStdString(), error)) << error;
+
+    const auto text = directory.filePath("plain-text.txt");
+    QFile plain(text); ASSERT_TRUE(plain.open(QIODevice::WriteOnly));
+    ASSERT_EQ(plain.write("fictitious text, not a vault"), 28); plain.close();
+    ASSERT_EQ(::chmod(QFile::encodeName(text).constData(), 0600), 0);
+    EXPECT_FALSE(VaultSnapshotService::prevalidateVaultSource(text.toStdString(), error));
+    EXPECT_TRUE(error.find("SQLite") != std::string::npos);
+
+    const auto incompatible = directory.filePath("incompatible.db");
+    sqlite3* raw = nullptr;
+    ASSERT_EQ(sqlite3_open(QFile::encodeName(incompatible).constData(), &raw), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(raw, "CREATE TABLE unrelated(value TEXT);", nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_close(raw), SQLITE_OK);
+    ASSERT_EQ(::chmod(QFile::encodeName(incompatible).constData(), 0600), 0);
+    EXPECT_FALSE(VaultSnapshotService::prevalidateVaultSource(incompatible.toStdString(), error));
+
+    const auto corrupted = directory.filePath("corrupted.db");
+    ASSERT_TRUE(QFile::copy(QString::fromStdString(source), corrupted));
+    QFile damaged(corrupted); ASSERT_TRUE(damaged.open(QIODevice::ReadWrite));
+    ASSERT_GT(damaged.size(), 128); ASSERT_TRUE(damaged.seek(100));
+    const char invalidPageType = 0; ASSERT_EQ(damaged.write(&invalidPageType, 1), 1); damaged.close();
+    EXPECT_FALSE(VaultSnapshotService::prevalidateVaultSource(corrupted.toStdString(), error));
+}
+
+TEST_F(VaultSnapshotServiceTest, RestorePrevalidationRefusesMissingUnreadableAndNonRegularSources)
+{
+    std::string error;
+    const auto missing = directory.filePath("missing.db");
+    EXPECT_FALSE(VaultSnapshotService::prevalidateVaultSource(missing.toStdString(), error));
+
+    const auto unreadable = directory.filePath("unreadable.db");
+    ASSERT_TRUE(QFile::copy(QString::fromStdString(source), unreadable));
+    ASSERT_EQ(::chmod(QFile::encodeName(unreadable).constData(), 0000), 0);
+    EXPECT_FALSE(VaultSnapshotService::prevalidateVaultSource(unreadable.toStdString(), error));
+    ASSERT_EQ(::chmod(QFile::encodeName(unreadable).constData(), 0600), 0);
+
+    const auto fifo = directory.filePath("source-fifo.db");
+    ASSERT_EQ(::mkfifo(QFile::encodeName(fifo).constData(), 0600), 0);
+    EXPECT_FALSE(VaultSnapshotService::prevalidateVaultSource(fifo.toStdString(), error));
+}
+
 TEST_F(VaultSnapshotServiceTest, SlowHealthyCopyHasNoGlobalDurationLimit)
 {
     probe.simulateSlowCopy = true;

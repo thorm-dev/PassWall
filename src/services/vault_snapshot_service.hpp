@@ -14,6 +14,12 @@ struct SnapshotDirectoryIdentity {
     bool operator==(const SnapshotDirectoryIdentity&) const = default;
 };
 
+struct SnapshotSourceIdentity {
+    std::uint64_t device = 0;
+    std::uint64_t inode = 0;
+    bool operator==(const SnapshotSourceIdentity&) const = default;
+};
+
 enum class SnapshotPublication {
     NotPublished,
     CancelledBeforePublication,
@@ -48,6 +54,12 @@ struct SnapshotResult {
 
 class VaultSnapshotService final {
 public:
+    // Read-only, keyless screening for the restoration UI. This rejects files
+    // that are manifestly not protected PassWall V1 vaults, but is neither
+    // cryptographic authentication nor replacement authorization. The restore
+    // engine must still repeat all source/identity/content checks.
+    [[nodiscard]] static bool prevalidateVaultSource(const std::string& path,
+        std::string& error, SnapshotSourceIdentity* identity = nullptr);
     // Same directory traversal/permissions/filesystem policy as createSnapshot.
     // Never creates a missing directory or redirects to another destination.
     [[nodiscard]] static bool inspectDestinationDirectory(const std::string& path,

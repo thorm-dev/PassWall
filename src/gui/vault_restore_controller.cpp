@@ -2,6 +2,7 @@
 #include "gui/vault_restore_dialog.hpp"
 #include "gui/main_window.hpp"
 #include "services/automatic_backup_coordinator.hpp"
+#include "services/vault_snapshot_service.hpp"
 #include <QFileInfo>
 #include <QStatusBar>
 #include <QThread>
@@ -41,7 +42,8 @@ void VaultRestoreController::open() {
     result_.reset(); cancelled_ = engaged_ = cleanup_ = finalReported_ = false; load();
 }
 void VaultRestoreController::load() {
-    stage_ = Stage::Loading; operationId_.clear(); authenticationAbandonPending_ = false;
+    stage_ = Stage::Loading; operationId_.clear(); automaticAbandonPending_.reset();
+    automaticAbandonDiagnostic_.clear();
     const auto serial = ++generation_;
     struct Listing { QVector<services::VaultRegistration> records; QString error; bool ok = false; };
     auto listing = std::make_shared<Listing>();
@@ -89,9 +91,69 @@ void VaultRestoreController::prepare() {
         || (owner_.automaticBackup_ && owner_.automaticBackup_->isActive()) || !owner_.ensureLifecycleProtection()) {
         fail(tr("Une édition, une opération incompatible ou une protection indisponible empêche la restauration.")); return;
     }
-    selected_ = *found; principalId_ = selected; source_ = dialog_->source(); precaution_ = found->backup.automatic ? QString{} : dialog_->precaution();
-    stage_ = Stage::Preparing; dialog_->preparing(); const auto serial = ++generation_;
+    selected_ = *found; principalId_ = selected; source_ = dialog_->source();
+    precaution_ = found->backup.automatic ? QString{} : dialog_->precaution();
+    cancelled_ = false; stage_ = Stage::Prevalidating; dialog_->prevalidating();
+    const auto serial = ++generation_;
     const auto securityGeneration = owner_.replacementGeneration_;
+    struct Prevalidation {
+        bool ok = false;
+        services::SnapshotSourceIdentity identity;
+        QString error;
+    };
+    auto result = std::make_shared<Prevalidation>();
+    const auto source = source_;
+    auto* delivery = new QObject;
+    auto* task = QThread::create([result, source] {
+        try {
+            std::string error;
+            result->ok = services::VaultSnapshotService::prevalidateVaultSource(
+                source.toStdString(), error, &result->identity);
+            result->error = QString::fromStdString(error);
+        } catch (...) { result->error = QStringLiteral("Prévalidation de la sauvegarde interrompue."); }
+    });
+    const QPointer<VaultRestoreController> guarded(this);
+    connect(task, &QThread::finished, delivery,
+        [guarded, result, serial, securityGeneration, delivery, task] {
+            task->deleteLater(); delivery->deleteLater();
+            if (!guarded || guarded->generation_ != serial || guarded->cancelled_) {
+                if (guarded) emit guarded->preparationSettled(false);
+                return;
+            }
+            if (!guarded->dialog_) { emit guarded->preparationSettled(false); return; }
+            if (!result->ok) {
+                guarded->stage_ = Stage::Choosing;
+                guarded->dialog_->choosing();
+                guarded->dialog_->validationError(tr("Sauvegarde refusée avant verrouillage : %1")
+                    .arg(result->error.isEmpty() ? tr("format ou accès incompatible.") : result->error));
+                emit guarded->preparationSettled(true);
+                return;
+            }
+            if (result->identity.device == guarded->selected_.file.device
+                && result->identity.inode == guarded->selected_.file.inode) {
+                guarded->stage_ = Stage::Choosing;
+                guarded->dialog_->choosing();
+                guarded->dialog_->validationError(tr("Sauvegarde refusée avant verrouillage : la source est le coffre principal."));
+                emit guarded->preparationSettled(true);
+                return;
+            }
+            guarded->authorizeAfterPrevalidation(serial, securityGeneration);
+        }, Qt::QueuedConnection);
+    task->start();
+}
+
+void VaultRestoreController::authorizeAfterPrevalidation(quint64 serial, quint64 securityGeneration) {
+    if (generation_ != serial || cancelled_ || !dialog_) {
+        emit preparationSettled(false); return;
+    }
+    if (securityGeneration != owner_.replacementGeneration_
+        || owner_.externalLockBlocksAccess() || owner_.vaultLockInProgress_ || owner_.exportInProgress_
+        || owner_.exportCloseRequested_ || owner_.hasOpenCredentialEditor()
+        || (owner_.automaticBackup_ && owner_.automaticBackup_->isActive()) || !owner_.ensureLifecycleProtection()) {
+        fail(tr("Une édition, une opération incompatible ou une protection indisponible empêche la restauration."));
+        emit preparationSettled(true); return;
+    }
+    stage_ = Stage::Preparing; dialog_->preparing();
     // No secret entered yet. Explicit confirmation permits locking even another
     // active vault; the ordinary 6A emitter then reserves the selected record.
     // This deliberate lock must NOT trigger an automatic backup or cancellation.
@@ -100,7 +162,7 @@ void VaultRestoreController::prepare() {
         fail(tr("Le verrouillage a été interrompu ; restauration non démarrée.")); return;
     }
     const QPointer<VaultRestoreController> guarded(this);
-    owner_.requestReplacementAuthorization(selected, [guarded, serial](auto authority, QString error) {
+    owner_.requestReplacementAuthorization(principalId_, [guarded, serial](auto authority, QString error) {
         if (!guarded) return;
         if (guarded->generation_ != serial) { emit guarded->preparationSettled(false); return; }
         if (guarded->cancelled_ || authority.operationId().isEmpty() || !guarded->dialog_) {
@@ -127,9 +189,10 @@ void VaultRestoreController::execute() {
         QString startError;
         job_ = owner_.startReplacementOperation(std::move(authority_), source_, std::move(password), precaution_, &startError);
         if (!job_) {
-            fail(startError.isEmpty()
-                ? tr("Démarrage refusé ; le coffre reste verrouillé, récupération à vérifier.")
-                : tr("Démarrage refusé : %1 Le coffre reste verrouillé, récupération à vérifier.").arg(startError));
+            automaticAbandonDiagnostic_ = startError.left(1024);
+            if (dialog_ && !startError.isEmpty())
+                dialog_->running(tr("Démarrage refusé : %1 Vérification de l'abandon…").arg(startError), false);
+            abandonPrepared(AutomaticAbandonReason::StartupRefused);
             return;
         }
         using Job = services::RestoreJob;
@@ -140,11 +203,24 @@ void VaultRestoreController::execute() {
         });
         connect(job_, &Job::finished, this, [this](auto value) {
             if (value.outcome == services::RestoreOutcome::Unknown) uncertain_.insert(principalId_);
-            authenticationAbandonPending_ = value.outcome == services::RestoreOutcome::SourceAuthenticationFailed
-                && value.replacementStatusKnown
-                && value.replacement.outcome == services::ReplacementOutcome::NotReplaced
-                && value.replacement.sourceAuthenticationFailed
-                && !operationId_.isEmpty() && value.replacement.operationId == operationId_;
+            automaticAbandonPending_.reset();
+            automaticAbandonDiagnostic_.clear();
+            const bool exactNonEngagement = value.outcome != services::RestoreOutcome::Unknown
+                && value.replacementStatusKnown && !operationId_.isEmpty()
+                && value.replacement.operationId == operationId_
+                && (value.replacement.outcome == services::ReplacementOutcome::NotReplaced
+                    || value.replacement.outcome == services::ReplacementOutcome::CancelledBeforeEngagement);
+            if (exactNonEngagement) {
+                if (value.outcome == services::RestoreOutcome::SourceAuthenticationFailed
+                    && value.replacement.sourceAuthenticationFailed)
+                    automaticAbandonPending_ = AutomaticAbandonReason::AuthenticationRejected;
+                else if (cancelled_ || value.replacement.outcome == services::ReplacementOutcome::CancelledBeforeEngagement)
+                    automaticAbandonPending_ = AutomaticAbandonReason::Cancellation;
+                else {
+                    automaticAbandonPending_ = AutomaticAbandonReason::NonEngagedFailure;
+                    automaticAbandonDiagnostic_ = value.replacement.diagnostic.left(1024);
+                }
+            }
             finalReported_ = true; result_ = value; displayResult(false);
         });
         connect(job_, &Job::processTerminated, this, [this] {
@@ -154,9 +230,9 @@ void VaultRestoreController::execute() {
                 uncertain_.insert(principalId_);
             }
             cleanup_ = true; job_.clear(); stage_ = Stage::Result; displayResult(true);
-            if (authenticationAbandonPending_ && finalReported_ && result_
+            if (automaticAbandonPending_ && finalReported_ && result_
                 && result_->replacementStatusKnown) {
-                abandonPrepared(AutomaticAbandonReason::AuthenticationRejected);
+                abandonPrepared(*automaticAbandonPending_);
             }
         });
     } catch (...) {
@@ -169,12 +245,14 @@ void VaultRestoreController::abandonPrepared(AutomaticAbandonReason reason) {
     if (stage_ == Stage::Resolving) return;
     if (principalId_.isEmpty() || operationId_.isEmpty()) {
         authority_.reset(); owner_.revokeReplacement();
-        fail(reason == AutomaticAbandonReason::Cancellation
-            ? tr("Restauration annulée, mais l'abandon durable n'a pas pu être vérifié ; récupération manuelle nécessaire.")
-            : tr("Mot de passe maître incorrect, mais l'abandon durable n'a pas pu être vérifié ; récupération manuelle nécessaire."));
+        const auto prefix = reason == AutomaticAbandonReason::Cancellation ? tr("Restauration annulée")
+            : reason == AutomaticAbandonReason::AuthenticationRejected ? tr("Mot de passe maître incorrect")
+            : reason == AutomaticAbandonReason::StartupRefused ? tr("Démarrage de la restauration refusé")
+            : tr("Restauration refusée avant engagement");
+        fail(prefix + tr(", mais l'abandon durable n'a pas pu être vérifié ; récupération manuelle nécessaire."));
         return;
     }
-    authenticationAbandonPending_ = false;
+    automaticAbandonPending_.reset();
     stage_ = Stage::Resolving;
     authority_.reset();
     owner_.revokeReplacement();
@@ -196,15 +274,23 @@ void VaultRestoreController::abandonPrepared(AutomaticAbandonReason reason) {
             if (safe) {
                 guarded->uncertain_.remove(localId);
                 guarded->operationId_.clear();
-                const auto message = reason == AutomaticAbandonReason::Cancellation
-                    ? tr("Restauration annulée") : tr("Mot de passe maître incorrect");
+                QString message = reason == AutomaticAbandonReason::Cancellation ? tr("Restauration annulée")
+                    : reason == AutomaticAbandonReason::AuthenticationRejected ? tr("Mot de passe maître incorrect")
+                    : reason == AutomaticAbandonReason::StartupRefused ? tr("Démarrage refusé ; préparation abandonnée en sécurité")
+                    : tr("Restauration refusée avant engagement ; préparation abandonnée en sécurité");
+                if ((reason == AutomaticAbandonReason::NonEngagedFailure
+                        || reason == AutomaticAbandonReason::StartupRefused)
+                    && !guarded->automaticAbandonDiagnostic_.isEmpty())
+                    message += '\n' + guarded->automaticAbandonDiagnostic_;
                 if (guarded->dialog_) guarded->dialog_->showError(message);
                 else guarded->owner_.statusBar()->showMessage(message);
             } else {
                 guarded->uncertain_.insert(localId);
-                QString message = reason == AutomaticAbandonReason::Cancellation
-                    ? tr("Restauration annulée, mais l'abandon durable n'est pas confirmé ; récupération manuelle nécessaire.")
-                    : tr("Mot de passe maître incorrect, mais l'abandon durable n'est pas confirmé ; récupération manuelle nécessaire.");
+                const auto prefix = reason == AutomaticAbandonReason::Cancellation ? tr("Restauration annulée")
+                    : reason == AutomaticAbandonReason::AuthenticationRejected ? tr("Mot de passe maître incorrect")
+                    : reason == AutomaticAbandonReason::StartupRefused ? tr("Démarrage de la restauration refusé")
+                    : tr("Restauration refusée avant engagement");
+                QString message = prefix + tr(", mais l'abandon durable n'est pas confirmé ; récupération manuelle nécessaire.");
                 if (!recovered.diagnostic.isEmpty()) message += '\n' + recovered.diagnostic.left(1024);
                 if (guarded->dialog_) guarded->dialog_->showError(message);
                 else guarded->owner_.statusBar()->showMessage(message);
@@ -245,6 +331,9 @@ void VaultRestoreController::cancel() {
     } else if (stage_ == Stage::Password) {
         cancelled_ = true;
         abandonPrepared(AutomaticAbandonReason::Cancellation);
+    } else if (stage_ == Stage::Prevalidating) {
+        cancelled_ = true; ++generation_; stage_ = Stage::Choosing;
+        if (dialog_) { dialog_->choosing(); dialog_->validationError(tr("Restauration annulée ; aucune préparation persistante créée.")); }
     } else if (stage_ == Stage::Preparing) {
         cancelled_ = true; ++generation_; owner_.revokeReplacement();
         fail(tr("Restauration non démarrée. La préparation interrompue peut nécessiter une récupération."));
@@ -255,6 +344,7 @@ void VaultRestoreController::cancel() {
 }
 void VaultRestoreController::onLock(bool security) {
     if (dialog_) dialog_->clearPassword(); // Synchronous BEFORE global cleanup acknowledgement.
-    if (security && (stage_ == Stage::Preparing || stage_ == Stage::Password || stage_ == Stage::Running)) cancel();
+    if (security && (stage_ == Stage::Prevalidating || stage_ == Stage::Preparing
+        || stage_ == Stage::Password || stage_ == Stage::Running)) cancel();
 }
 } // namespace passwall::gui

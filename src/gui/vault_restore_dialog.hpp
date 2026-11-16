@@ -28,6 +28,7 @@ public:
     core::SecureBuffer takePassword();
     void clearPassword() noexcept;
     void choosing();
+    void prevalidating();
     void preparing();
     void awaitingPassword();
     void running(const QString& message, bool cancellationPossible = true);

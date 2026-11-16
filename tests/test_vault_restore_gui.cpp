@@ -15,6 +15,7 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileDialog>
 #include <QInputDialog>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -158,13 +159,10 @@ protected:
             && widget<QPushButton>("restoreCancelButton")->text() == "Fermer"; }, 20000));
     }
     void leavePreparedForRecovery() {
-        // A real, non-authentication engine refusal leaves the 6A preparation
-        // intact without relying on the password-dialog cancellation policy.
-        QFile existing(precaution);
-        ASSERT_TRUE(existing.open(QIODevice::WriteOnly));
-        ASSERT_EQ(existing.write("keep"), 4);
-        existing.close();
-        choose(); prepare(); ASSERT_NE(execute(), nullptr); done();
+        // Simulate a restart after 6A preparation without inventing an engine
+        // refusal: precise non-engaged worker results are now auto-abandoned.
+        choose(); prepare();
+        window.reset(); QApplication::processEvents(); newWindow();
         ASSERT_TRUE(record().replacement);
         ASSERT_EQ(record().replacement->phase, "prepared");
     }
@@ -262,9 +260,12 @@ TEST_F(VaultRestoreGuiTest, WorkerPermissionChangeAfterPreparationIsReportedByTh
     passwall::tests::overrideRestoreExecutablePaths(fakeWorker, {});
     const auto reset = qScopeGuard([] { passwall::tests::overrideRestoreExecutablePaths({}, {}); });
     const QPointer<RestoreJob> rejected = execute();
-    ASSERT_TRUE(waitFor([&] { return status().contains("permissions non sûres"); }, 3000));
+    ASSERT_TRUE(waitFor([&] { return status().contains("permissions non sûres")
+        && widget<QPushButton>("restoreCancelButton")->text() == "Fermer"; }, 3000));
     EXPECT_TRUE(!rejected || !rejected->isActive());
-    EXPECT_TRUE(record().replacement); EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_FALSE(record().replacement); ASSERT_TRUE(record().resolvedReplacement);
+    EXPECT_EQ(record().resolvedReplacement->phase, "abandoned");
+    EXPECT_FALSE(window->acquireLease().unlocked);
 }
 TEST_F(VaultRestoreGuiTest, ChangingAChosenPathInvalidatesTheConfirmation)
 {
@@ -273,6 +274,18 @@ TEST_F(VaultRestoreGuiTest, ChangingAChosenPathInvalidatesTheConfirmation)
     EXPECT_FALSE(widget<QCheckBox>("restoreConfirmationCheck")->isChecked());
     widget<QPushButton>("restorePrepareButton")->click(); EXPECT_FALSE(record().replacement);
     EXPECT_FALSE(window->findChild<RestoreJob*>());
+}
+TEST_F(VaultRestoreGuiTest, SourcePickerPrefersDbButKeepsAnExplicitAllFilesChoice)
+{
+    open();
+    QPushButton* browse = nullptr;
+    for (auto* button : dialog->findChildren<QPushButton*>())
+        if (button->text() == "Parcourir…") { browse = button; break; }
+    ASSERT_NE(browse, nullptr); browse->click(); QApplication::processEvents();
+    auto* picker = dialog->findChild<QFileDialog*>(); ASSERT_NE(picker, nullptr);
+    EXPECT_TRUE(picker->nameFilters().contains("Sauvegardes PassWall (*.db)"));
+    EXPECT_TRUE(picker->nameFilters().contains("Tous les fichiers (*)"));
+    picker->reject();
 }
 TEST_F(VaultRestoreGuiTest, FullGuiChainRestoresExternalBackupPreservesPrincipalConfigurationAndStaysLocked)
 {
@@ -328,8 +341,60 @@ TEST_F(VaultRestoreGuiTest, WrongMasterCannotReplaceOrPublishAnUnlockedSession)
 TEST_F(VaultRestoreGuiTest, InvalidSourceCannotReplacePrincipal)
 {
     { QFile f(source); ASSERT_TRUE(f.open(QIODevice::WriteOnly | QIODevice::Truncate)); ASSERT_EQ(f.write("not-a-vault"), 11); }
-    const auto before = bytes(principal); choose(); prepare(); ASSERT_NE(execute(), nullptr); done();
-    EXPECT_TRUE(status().startsWith("Échec avant remplacement")); EXPECT_TRUE(bytes(principal) == before);
+    unlock(); const auto lease = window->acquireLease(); const auto before = bytes(principal); choose();
+    widget<QPushButton>("restorePrepareButton")->click();
+    ASSERT_TRUE(waitFor([&] { return status().startsWith("Sauvegarde refusée avant verrouillage"); }, 10000));
+    EXPECT_TRUE(window->isLeaseCurrent(lease)); EXPECT_TRUE(bytes(principal) == before);
+    EXPECT_FALSE(record().replacement); EXPECT_FALSE(window->findChild<RestoreJob*>());
+}
+TEST_F(VaultRestoreGuiTest, MissingAndNonRegularSourcesNeverCreatePersistentPreparation)
+{
+    const auto before = bytes(principal); choose();
+    widget<QLineEdit>("restoreSourceEdit")->setText(directory.filePath("missing.db"));
+    widget<QCheckBox>("restoreConfirmationCheck")->setChecked(true);
+    widget<QPushButton>("restorePrepareButton")->click();
+    ASSERT_TRUE(waitFor([&] { return status().startsWith("Sauvegarde refusée avant verrouillage"); }, 10000));
+    EXPECT_FALSE(record().replacement); EXPECT_TRUE(bytes(principal) == before);
+
+    const auto fifo = directory.filePath("selected-fifo.db");
+    ASSERT_EQ(::mkfifo(QFile::encodeName(fifo).constData(), 0600), 0);
+    widget<QLineEdit>("restoreSourceEdit")->setText(fifo);
+    widget<QCheckBox>("restoreConfirmationCheck")->setChecked(true);
+    widget<QPushButton>("restorePrepareButton")->click();
+    ASSERT_TRUE(waitFor([&] { return status().startsWith("Sauvegarde refusée avant verrouillage"); }, 10000));
+    EXPECT_FALSE(record().replacement); EXPECT_TRUE(bytes(principal) == before);
+}
+TEST_F(VaultRestoreGuiTest, StructurallyIncompatibleSqliteNeverCreatesPersistentPreparation)
+{
+    const auto invalid = directory.filePath("structurally-invalid.db"); sqlite3* database = nullptr;
+    ASSERT_EQ(sqlite3_open(QFile::encodeName(invalid).constData(), &database), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(database, "CREATE TABLE unrelated(value TEXT);", nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+    ASSERT_EQ(::chmod(QFile::encodeName(invalid).constData(), 0600), 0);
+    choose(); widget<QLineEdit>("restoreSourceEdit")->setText(invalid);
+    widget<QCheckBox>("restoreConfirmationCheck")->setChecked(true);
+    widget<QPushButton>("restorePrepareButton")->click();
+    ASSERT_TRUE(waitFor([&] { return status().startsWith("Sauvegarde refusée avant verrouillage"); }, 10000));
+    EXPECT_FALSE(record().replacement); EXPECT_FALSE(window->findChild<RestoreJob*>());
+}
+TEST_F(VaultRestoreGuiTest, PrincipalItselfCannotBeSelectedAsTheBackupSource)
+{
+    unlock(); const auto lease = window->acquireLease(); choose();
+    widget<QLineEdit>("restoreSourceEdit")->setText(principal);
+    widget<QCheckBox>("restoreConfirmationCheck")->setChecked(true);
+    widget<QPushButton>("restorePrepareButton")->click();
+    ASSERT_TRUE(waitFor([&] { return status().contains("source est le coffre principal"); }, 10000));
+    EXPECT_TRUE(window->isLeaseCurrent(lease)); EXPECT_FALSE(record().replacement);
+}
+TEST_F(VaultRestoreGuiTest, SourceChangedAfterPrevalidationIsRefusedAndPreparedStateIsSafelyAbandoned)
+{
+    const auto before = encryptedState(principal); choose(); prepare();
+    { QFile f(source); ASSERT_TRUE(f.open(QIODevice::WriteOnly | QIODevice::Truncate)); ASSERT_EQ(f.write("changed-after-prevalidation"), 27); }
+    ASSERT_NE(execute(), nullptr); done();
+    EXPECT_TRUE(status().startsWith("Restauration refusée avant engagement")) << status().toStdString();
+    EXPECT_FALSE(record().replacement); ASSERT_TRUE(record().resolvedReplacement);
+    EXPECT_EQ(record().resolvedReplacement->phase, "abandoned");
+    EXPECT_EQ(encryptedState(principal), before); EXPECT_FALSE(window->acquireLease().unlocked);
 }
 TEST_F(VaultRestoreGuiTest, DifferentCryptographicLineageCannotReplacePrincipal)
 {
@@ -352,8 +417,10 @@ TEST_F(VaultRestoreGuiTest, FailedPrecautionPreservesBothExistingFilesAndRefuses
 {
     { QFile f(precaution); ASSERT_TRUE(f.open(QIODevice::WriteOnly)); ASSERT_EQ(f.write("keep"), 4); }
     const auto before = bytes(principal); choose(); prepare(); ASSERT_NE(execute(), nullptr); done();
-    EXPECT_TRUE(status().startsWith("Échec avant remplacement")); EXPECT_TRUE(bytes(principal) == before);
+    EXPECT_TRUE(status().startsWith("Restauration refusée avant engagement")); EXPECT_TRUE(bytes(principal) == before);
     EXPECT_TRUE(bytes(precaution) == "keep");
+    EXPECT_FALSE(record().replacement); ASSERT_TRUE(record().resolvedReplacement);
+    EXPECT_EQ(record().resolvedReplacement->phase, "abandoned");
 }
 TEST_F(VaultRestoreGuiTest, AutomaticPolicyDoesNotRequireExtraCopyOrAvailableAutomaticDestination)
 {
@@ -444,8 +511,9 @@ TEST_F(VaultRestoreGuiTest, CancellationBeforeEngagementUsesTheRealJobAndKeepsPr
     QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto p) {
         if (p == ReplacementCheckpoint::BeforeArm) { observed = true; widget<QPushButton>("restoreCancelButton")->click(); }
     });
-    done(); EXPECT_TRUE(observed); EXPECT_TRUE(status().startsWith("Annulation confirmée"));
-    EXPECT_TRUE(bytes(principal) == before); EXPECT_TRUE(record().replacement);
+    done(); EXPECT_TRUE(observed); EXPECT_EQ(status(), "Restauration annulée");
+    EXPECT_TRUE(bytes(principal) == before); EXPECT_FALSE(record().replacement);
+    ASSERT_TRUE(record().resolvedReplacement); EXPECT_EQ(record().resolvedReplacement->phase, "abandoned");
 }
 TEST_F(VaultRestoreGuiTest, LateCancellationNeverClaimsThatAnExchangedPrincipalWasNotReplaced)
 {
@@ -475,7 +543,11 @@ TEST_F(VaultRestoreGuiTest, ClosingTheDialogCancelsButDoesNotDestroyTheSuperviso
     ASSERT_TRUE(waitFor([&] { return phaseSeen; })); dialog->reject();
     EXPECT_TRUE(job->isActive()); passwall::storage::VaultOperationGuard access; std::string error;
     EXPECT_FALSE(access.tryReserve(principal.toStdString(), error)); hold.release();
-    ASSERT_TRUE(waitFor([&] { return terminated; }, 10000)); EXPECT_TRUE(access.tryReserve(principal.toStdString(), error));
+    ASSERT_TRUE(waitFor([&] { return terminated; }, 10000));
+    // The worker is reaped first; the new controlled abandonment still owns a
+    // recovery reservation until its durable resolution is confirmed.
+    ASSERT_TRUE(waitFor([&] { return access.tryReserve(principal.toStdString(), error); }, 10000));
+    EXPECT_FALSE(record().replacement);
 }
 TEST_F(VaultRestoreGuiTest, DestroyingMainWindowDoesNotWaitForTheHeldChildOrReleaseItsReservation)
 {
@@ -568,6 +640,18 @@ TEST_F(VaultRestoreGuiTest, AutomaticAbandonPersistenceFailureKeepsPreparedAndRe
     EXPECT_FALSE(window->acquireLease().unlocked);
     openRecovery(); examineRecovery(); resolveRecovery();
     EXPECT_FALSE(record().replacement); EXPECT_FALSE(window->acquireLease().unlocked); unlock();
+}
+TEST_F(VaultRestoreGuiTest, NonEngagedWorkerFailureWithUnconfirmedAbandonKeepsRecoveryRequired)
+{
+    choose(); prepare();
+    { QFile f(source); ASSERT_TRUE(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+      ASSERT_EQ(f.write("invalid-after-prevalidation"), 27); }
+    passwall::tests::failSettingsSync();
+    ASSERT_NE(execute(), nullptr); done();
+    EXPECT_TRUE(status().contains("récupération manuelle nécessaire"));
+    ASSERT_TRUE(record().replacement); EXPECT_TRUE(record().replacement->phase == "prepared"
+        || record().replacement->phase == "abandon-confirmed");
+    EXPECT_FALSE(window->acquireLease().unlocked);
 }
 TEST_F(VaultRestoreGuiTest, RecoveryRefusesLiveWorkerEvenAfterItHasSentItsBusinessResult)
 {

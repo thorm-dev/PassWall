@@ -138,6 +138,11 @@ void VaultRestoreDialog::choosing() {
         tr("Choisissez explicitement le principal et une sauvegarde. La sauvegarde n'est pas encore validée."));
     updateSelection();
 }
+void VaultRestoreDialog::prevalidating() {
+    stage_ = Stage::Preparing; choices_->setEnabled(false); password_->setEnabled(false);
+    primary_->setEnabled(false); cancel_->setEnabled(true); cancel_->setText(tr("Annuler"));
+    activity_->show(); status_->setText(tr("Prévalidation non destructive de la sauvegarde…"));
+}
 void VaultRestoreDialog::preparing() {
     stage_ = Stage::Preparing; choices_->setEnabled(false); password_->setEnabled(false);
     primary_->setEnabled(false); cancel_->setEnabled(true); cancel_->setText(tr("Annuler"));
@@ -200,6 +205,10 @@ void VaultRestoreDialog::chooseFile(QLineEdit* field, bool save) {
     selection->setAttribute(Qt::WA_DeleteOnClose); selection->setOption(QFileDialog::DontResolveSymlinks);
     selection->setAcceptMode(save ? QFileDialog::AcceptSave : QFileDialog::AcceptOpen);
     selection->setFileMode(save ? QFileDialog::AnyFile : QFileDialog::ExistingFile);
+    if (!save) {
+        selection->setNameFilters({tr("Sauvegardes PassWall (*.db)"), tr("Tous les fichiers (*)")});
+        selection->selectNameFilter(tr("Sauvegardes PassWall (*.db)"));
+    }
     selection->setOption(QFileDialog::DontConfirmOverwrite); // Engine never overwrites this destination.
     connect(selection, &QFileDialog::fileSelected, this, [this, field](const QString& path) {
         if (stage_ == Stage::Choosing) field->setText(path);
