@@ -23,6 +23,7 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             cmake \
+            dbus-daemon \
             ninja-build \
             pkg-config \
             qt6-base-dev \
@@ -39,6 +40,16 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build PassWall
+      - name: Build PassWall production targets
         run: |
           cmake --build build --parallel 2
+
+      - name: Build PassWall test targets
+        run: |
+          cmake --build build --target passwall_all_tests --parallel 2
+
+      - name: Run PassWall CTest suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          ctest --test-dir build --output-on-failure --no-tests=error --parallel 1

@@ -1,8 +1,8 @@
 # PassWall — Plan technique des travaux restants
 
-**Version :** 1.22
-**Date :** 12 novembre 2026
-**Statut :** interfaces 8A/8B, récupération utilisateur 8C-1c et minuteur obligatoire 8C-2 implémentés. Annulation avant worker et mauvais maître sont maintenant résolus automatiquement lorsque l'abandon durable de `prepared` est prouvé ; les états incertains restent bloqués. Nettoyage des artefacts, états insuffisamment prouvés, export de configuration et distribution reproductible complète restent ouverts. Aucun déploiement utilisateur, suite CTest complète ou nouvelle validation GitHub Actions pendant cette intervention.
+**Version :** 1.25
+**Date :** 16 novembre 2026
+**Statut :** interfaces 8A/8B, récupération utilisateur 8C-1c et minuteur obligatoire 8C-2 implémentés. L'ancienne API sans appelant `VaultRestoreService` et sa cible de tests sont retirées après transfert de leurs trois garanties encore uniques vers 6B. Le build CMake courant exclut tests, probes et outils indépendants ; ils restent disponibles par compilation explicite. Le workflow ARM64 compile l'agrégat puis exécute désormais les 888 cas CTest sans filtre ; sa première exécution GitHub après publication reste à confirmer. Nettoyage des artefacts, états insuffisamment prouvés, export de configuration et distribution reproductible complète restent ouverts.
 
 ## 1. Objet et méthode
 
@@ -21,7 +21,7 @@ La documentation technique décrit les contrats et limites des composants ; ce T
 ### Faits vérifiés dans l'implémentation
 
 - Coffre local, GUI, Firefox à traitement unique `NativeRequestProcessor`, générateur, validation des champs, durcissement mémoire et SQLite V1 sont développés. Leur architecture et leurs validations figurent dans la documentation technique, sections 5 et 6.
-- Les étapes de sauvegarde 1 à 5, l'export manuel et les préférences/reprise GUI 8B existent. L'intermittence du test de rotation est résolue par synchronisation déterministe, sans changement de production (section 4.4). L'ancien moteur restaure vers un nouveau fichier ; le moteur unique 6B remplace le principal sous autorisation 6A/6A-bis et délégation 7, avec parcours GUI 8A.
+- Les étapes de sauvegarde 1 à 5, l'export manuel et les préférences/reprise GUI 8B existent. L'intermittence du test de rotation est résolue par synchronisation déterministe, sans changement de production (section 4.4). Le moteur unique 6B remplace le principal sous autorisation 6A/6A-bis et délégation 7, avec parcours GUI 8A ; l'ancien moteur sans appelant vers un nouveau fichier est retiré.
 - Les protections Linux, des éditeurs et des générations natives sont présentes. `SessionGuard1` est supprimé, sans garde globale ni authentification globale supplémentaire ; l'intention de récupération 6A reste propre à une opération sur un coffre.
 - Le coffre est cryptographiquement autonome ; ses copies sont indépendantes et l'utilisateur assure leurs transferts/cohérence. Aucun modèle d'autorisation d'appareil ni développement de synchronisation automatique ou de serveur de référence n'est retenu dans le périmètre actuel. Les contrôles locaux de récupération restent applicables (section 5).
 - TOTP, passkeys, audit de mots de passe, migrations et export de configuration restent absents ; l'import de configuration n'est pas défini.
@@ -183,7 +183,9 @@ Lorsqu'une évolution de format le nécessitera : spécifier les transitions sup
 
 ### 4.5 Restauration par remplacement — moteur 6B et auxiliaire 7
 
-Le moteur existant `VaultRestoreService` authentifie le mot de passe maître et toutes les entrées avant publication vers un nouveau fichier. Il est testé, mais ne remplace pas le principal et n'a pas de parcours GUI. Son mot de passe est un `std::span` emprunté : sa durée de vie et son nettoyage restent à la charge de l'appelant.
+`VaultRestoreService`, ancienne publication vers un nouveau fichier sans appelant de production, a été retiré en version 1.23 avec ses 23 tests dédiés. Maintenir dans `VaultReplacementEngineTest` les trois garanties transférées : contenu authentifié mais métier invalide, FIFO refusée sans blocage et allocation interrompue pendant l'authentification avec nettoyage et reprise sûre. Les résultats historiques de l'ancienne cible restent des archives, pas une cible actuelle à restaurer.
+
+**Maintenance validée le 15 novembre 2026 :** compilation isolée `-j1` de l'application, du worker et des tests concernés ; **72/72** tests du moteur 6B/interruptions et **22/22** tests du protocole/superviseur/worker réussis. La cible retirée ne doit pas être réintroduite ; conserver les trois cas transférés dans les régressions 6B.
 
 **Étape 6A — fondations de sécurité, implémentée :** autorisation opaque émise par `MainWindow` après nettoyage réel, réservation exclusive, barrière aux nouvelles sessions, intention persistante et porte de récupération (documentation technique, section 5.16). Ces fondations seules ne substituaient aucun fichier ; elles sont maintenant utilisées par 6B. Les tests simulés ne remplacent pas ceux de l'émetteur GUI réel.
 
@@ -193,7 +195,7 @@ Le moteur existant `VaultRestoreService` authentifie le mot de passe maître et 
 
 **Étape 6B — moteur de remplacement récupérable, implémenté et validé dans son périmètre synchrone :**
 
-1. `replacePrincipal()` exige l'autorisation opaque et son principal exact ; copie privée stable, validation structurelle, même `vault_id`, authentification réelle de toutes les entrées et nettoyage du `SecureBuffer` propriétaire/DEK/credentials avant publication. L'ancienne API de restauration vers un nouveau fichier reste inchangée.
+1. `replacePrincipal()` exige l'autorisation opaque et son principal exact ; copie privée stable, validation structurelle, même `vault_id`, authentification réelle de toutes les entrées et nettoyage du `SecureBuffer` propriétaire/DEK/credentials avant publication.
 2. Copie de précaution par `snapshotPrincipal()` en `prepared` obligatoire lorsque automatique désactivé : destination explicite inexistante, échec ou durabilité incertaine bloquants, exclusion du catalogue. Si activé : ni copie récente ni disponibilité du dossier habituel exigée.
 3. Candidat privé 0600 dans un dossier 0700 du système de fichiers du principal, empreinte authentifiée et durabilité établies avant `armed`. Échange réel `RENAME_EXCHANGE`, sans copie en place : l'ancien inode reste au nom technique du candidat, avec références persistantes et réservations continues.
 4. Finalisation 6A-bis réutilisée, résultats détaillés, conservation de l'identifiant local/préférences/catalogue/suspensions, `backupRequired` conservateur si automatique activé. Aucune ouverture, sauvegarde ou rotation déclenchée par le moteur.
@@ -289,7 +291,7 @@ La récupération repose sur des copies/sauvegardes utilisables et le mot de pas
 
 ## 6. P1 — Tests
 
-**Couverture déjà présente à conserver :** mémoire succès/erreur/exception, listes partiellement lues et corruption, validation des champs, nettoyage des éditeurs, minuterie, contrôle D-Bus et générations natives ; configuration/ressources SQLite et diagnostics transactionnels ; exclusion réelle entre processus, suivi persistant, snapshots, worker, export GUI, catalogue/rotation ; restauration vers un nouveau fichier ; contrats et émetteur réel d'autorisation 6A. Ne pas redemander ces suites comme si elles étaient absentes.
+**Couverture déjà présente à conserver :** mémoire succès/erreur/exception, listes partiellement lues et corruption, validation des champs, nettoyage des éditeurs, minuterie, contrôle D-Bus et générations natives ; configuration/ressources SQLite et diagnostics transactionnels ; exclusion réelle entre processus, suivi persistant, snapshots, worker, export GUI, catalogue/rotation ; remplacement 6B, y compris les trois garanties transférées de l'ancienne API ; contrats et émetteur réel d'autorisation 6A. Ne pas redemander ces suites comme si elles étaient absentes.
 
 **Scénarios à maintenir ou à consolider :**
 
@@ -341,6 +343,10 @@ La campagne Firefox manuelle du 6 novembre et le bilan du verrouillage Linux du 
 La reproductibilité Linux doit couvrir `passwall_backup_worker` et `passwall_restore_worker` à côté de l'application ; le second vérifie l'identité de l'exécutable parent. Vérifier les versions réellement installées avant toute mise à jour, sans considérer les sources récentes comme automatiquement déployées.
 
 **Maintenance de compilation distincte — réalisée après 7 le 10 novembre :** alias conditionnel intégré après l'unique recherche SQLite, références `SQLite3::SQLite3` conservées ; plus de dépendance à un hook externe, y compris dans l'ancien cache de vérification. Les 14 retours ignorés signalés dans huit fichiers de tests/auxiliaires sont contrôlés, avec petits helpers POSIX de test, synchronisations vérifiées et injections volontairement invalides conservées. Aucun changement de la politique SQLite V1, du moteur métier ou des protections 6A/6A-bis/6B/7. L'utilisateur rapporte ensuite une compilation GitHub Actions ARM64 réussie après publication ; ce n'est ni une exécution CI pendant 8A ni une validation des nouvelles modifications GUI.
+
+**Optimisation CMake — réalisée le 16 novembre :** le build sans cible compile seulement la production et ses dépendances. Les suites C++ et auxiliaires de test sont exclus de `all`, mais restent accessibles individuellement ou avec `cmake --build build --target passwall_all_tests --parallel 1`, à exécuter avant `ctest --test-dir build --output-on-failure`. `passwall_env_check` et `passwall_argon2_benchmark` restent compilables explicitement par leur nom. Validation initiale : build courant neuf, outils explicites, deux suites explicites et 38/38 cas CTest réussis.
+
+**CTest ARM64 — configuré le 16 novembre :** le workflow conserve les deux builds, installe explicitement le démon D-Bus utilisé uniquement comme broker privé de test, puis exécute les **888 cas CTest** séquentiellement avec Qt offscreen, sortie des échecs et `--no-tests=error`. Aucun filtre ni exclusion CTest. Compilation locale complète de l'agrégat ; validations ciblées autorisées : **569/569** non-GUI prioritaires et **108/108** GUI restauration/protections Linux, soit 677 cas distincts. Les 211 autres cas GUI sont compilés mais non rejoués localement. Reste à confirmer le workflow sur GitHub et à maintenir séparément les essais réels Wayland/logind/swaylock ainsi que les cinq tests JavaScript hors CTest.
 
 ## 8. Ordre de travail recommandé
 

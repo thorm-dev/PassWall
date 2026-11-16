@@ -193,30 +193,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         -Wl,--wrap=unlinkat)
     gtest_discover_tests(passwall_snapshot_tests)
 
-    # Independent authenticated restoration; never linked to the keyless worker.
-    add_library(passwall_vault_restore STATIC
-        src/services/vault_restore_service.cpp src/services/credential_service.cpp
-        src/services/vault_key_service.cpp src/core/crypto_engine.cpp)
-    target_include_directories(passwall_vault_restore PUBLIC src)
-    target_link_libraries(passwall_vault_restore PUBLIC passwall_vault_snapshot
-        passwall_vault_preferences PkgConfig::SODIUM)
-    add_executable(passwall_restore_tests tests/test_vault_restore_service.cpp
-        src/services/vault_lifecycle_service.cpp)
-    target_link_libraries(passwall_restore_tests PRIVATE
-        passwall_vault_restore GTest::gtest_main Qt6::Core)
-    target_link_options(passwall_restore_tests PRIVATE
-        -Wl,--wrap=_Znwm -Wl,--wrap=sodium_malloc -Wl,--wrap=sodium_free
-        -Wl,--wrap=sodium_memzero -Wl,--wrap=crypto_pwhash
-        -Wl,--wrap=sqlite3_open_v2 -Wl,--wrap=sqlite3_close -Wl,--wrap=sqlite3_close_v2
-        -Wl,--wrap=sqlite3_prepare_v2 -Wl,--wrap=sqlite3_finalize -Wl,--wrap=sqlite3_step
-        -Wl,--wrap=sqlite3_backup_step -Wl,--wrap=fsync -Wl,--wrap=linkat -Wl,--wrap=unlinkat)
-    gtest_discover_tests(passwall_restore_tests)
-
     # Single capability-scoped engine shared by direct and delegated execution.
     # Deliberately separate from the keyless snapshot/backup binaries.
-    add_library(passwall_vault_replacement STATIC src/services/vault_replacement_service.cpp)
+    add_library(passwall_vault_replacement STATIC
+        src/services/vault_replacement_service.cpp
+        src/services/credential_service.cpp
+        src/services/vault_key_service.cpp
+        src/core/crypto_engine.cpp)
     target_include_directories(passwall_vault_replacement PUBLIC src)
-    target_link_libraries(passwall_vault_replacement PUBLIC passwall_vault_restore)
+    target_link_libraries(passwall_vault_replacement PUBLIC passwall_vault_snapshot
+        passwall_vault_preferences PkgConfig::SODIUM)
 
     # Restore-only secret transport and supervisor; keyless backup stays separate.
     add_library(passwall_restore_driver STATIC
@@ -265,7 +251,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         GTest::gtest Qt6::Core PkgConfig::SODIUM)
     target_link_options(passwall_replacement_tests PRIVATE -Wl,--wrap=fsync -Wl,--wrap=openat
         -Wl,--wrap=_ZN9QSettings4syncEv -Wl,--wrap=renameat2
-        -Wl,--wrap=sodium_malloc -Wl,--wrap=sodium_free -Wl,--wrap=sqlite3_step
+        -Wl,--wrap=_Znwm -Wl,--wrap=sodium_malloc -Wl,--wrap=sodium_free
+        -Wl,--wrap=sodium_memzero -Wl,--wrap=sqlite3_step
         -Wl,--wrap=crypto_aead_xchacha20poly1305_ietf_decrypt -Wl,--wrap=fstatfs
         -Wl,--wrap=sqlite3_backup_step -Wl,--wrap=linkat)
     gtest_discover_tests(passwall_replacement_tests)
@@ -338,8 +325,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         -Wl,--wrap=sqlite3_open_v2 -Wl,--wrap=sqlite3_exec
         -Wl,--wrap=fsync -Wl,--wrap=_ZNK9QSettings6statusEv)
     gtest_discover_tests(passwall_dirty_tracking_tests)
-    foreach(regression_target passwall_storage_tests passwall_snapshot_tests
-            passwall_restore_tests passwall_backup_tests)
+    foreach(regression_target passwall_storage_tests passwall_snapshot_tests passwall_backup_tests)
         target_sources(${regression_target} PRIVATE tests/isolated_vault_settings.cpp)
     endforeach()
 endif()
@@ -557,3 +543,44 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_dependencies(passwall_session_lock_tests passwall_session_lock_test_driver passwall_session_lock)
     gtest_discover_tests(passwall_session_lock_tests PROPERTIES TIMEOUT 15)
 endif()
+
+# Keep the regular build focused on production. Test executables and their
+# standalone helpers remain available individually and through the aggregate
+# target below; CTest registration is unchanged.
+set(PASSWALL_CTEST_TARGETS
+    passwall_tests
+    passwall_preferences_tests
+    passwall_gui_tests
+    passwall_native_host_tests)
+set(PASSWALL_TEST_SUPPORT_TARGETS)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND PASSWALL_CTEST_TARGETS
+        passwall_storage_tests
+        passwall_snapshot_tests
+        passwall_restore_job_tests
+        passwall_replacement_tests
+        passwall_automatic_backup_tests
+        passwall_backup_tests
+        passwall_dirty_tracking_tests
+        passwall_session_lock_tests)
+    list(APPEND PASSWALL_TEST_SUPPORT_TARGETS
+        passwall_restore_worker_test
+        passwall_restore_issuer_probe
+        passwall_fake_backup_worker
+        passwall_backup_worker_probe
+        passwall_instance_probe
+        passwall_fake_session_locker
+        passwall_session_lock_test_driver)
+endif()
+
+foreach(test_target IN LISTS PASSWALL_CTEST_TARGETS PASSWALL_TEST_SUPPORT_TARGETS)
+    set_property(TARGET ${test_target} PROPERTY EXCLUDE_FROM_ALL TRUE)
+endforeach()
+
+add_custom_target(passwall_all_tests DEPENDS ${PASSWALL_CTEST_TARGETS})
+
+# Independent diagnostics are opt-in development tools, not production
+# dependencies. They remain buildable by their target names.
+set_property(TARGET passwall_env_check PROPERTY EXCLUDE_FROM_ALL TRUE)
+set_property(TARGET passwall_argon2_benchmark PROPERTY EXCLUDE_FROM_ALL TRUE)

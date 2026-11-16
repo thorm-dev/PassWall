@@ -1,6 +1,8 @@
 #include "services/vault_replacement_service.hpp"
 #include "services/vault_lifecycle_service.hpp"
+#include "services/vault_key_service.hpp"
 #include "services/credential_service.hpp"
+#include "core/crypto_engine.hpp"
 #include "storage/vault_storage.hpp"
 #include "storage/vault_operation_guard.hpp"
 #include "posix_test_io.hpp"
@@ -20,6 +22,7 @@
 #include <array>
 #include <cstring>
 #include <functional>
+#include <new>
 #include <span>
 #include <sodium.h>
 #include <sqlite3.h>
@@ -39,15 +42,29 @@ void replacementCrashAfterRegistrySyncForTest(const QString&);
 
 namespace {
 constexpr std::string_view master = "fictitious-replacement-master-v1";
+constexpr std::array<std::size_t, 5> largeFieldSizes{1000, 1100, 1200, 1300, 8192};
+struct SensitiveAllocation {
+    void* pointer = nullptr;
+    std::size_t size = 0;
+    bool wiped = false;
+};
 struct Probe {
     int liveSecrets = 0, decryptions = 0, exchanges = 0;
     bool wiped = true, cleanAtExchange = false, cleanAtCandidatePublication = false, failExchange = false;
     bool failDirectoryAfterExchange = false, throwAuth = false, unsupportedFs = false;
     bool assertReservations = false, reservationsHeld = false;
     bool failPrecautionPublication = false, failPrecautionDurability = false, precautionPublished = false;
+    bool failCredentialAllocation = false, credentialAllocationInjected = false;
+    int sensitiveStringCount = 0;
     std::function<void()> afterCopyStep;
     QString principal, artifact;
     std::array<std::pair<void*, std::size_t>, 128> allocations {};
+    std::array<SensitiveAllocation, 16> sensitiveStrings {};
+    bool sensitiveStringsWiped() const noexcept {
+        for (int index = 0; index < sensitiveStringCount; ++index)
+            if (!sensitiveStrings[index].wiped) return false;
+        return true;
+    }
 };
 thread_local Probe* active = nullptr;
 bool isZero(const void* pointer, std::size_t size) noexcept {
@@ -98,8 +115,16 @@ protected:
         ASSERT_TRUE(VaultLifecycleService::createVault(principal.toStdString(), std::string(master), key, failure));
         for (int index = 0; index < 3; ++index) {
             passwall::models::Credential entry;
-            entry.title = "fictitious-title"; entry.username = "fictitious-user";
-            entry.password = "fictitious-password"; entry.notes = "fictitious-notes";
+            if (index == 1) {
+                entry.title.assign(largeFieldSizes[0], 't');
+                entry.url.assign(largeFieldSizes[1], 'u');
+                entry.username.assign(largeFieldSizes[2], 'n');
+                entry.password.assign(largeFieldSizes[3], 'p');
+                entry.notes.assign(largeFieldSizes[4], 'o');
+            } else {
+                entry.title = "fictitious-title"; entry.username = "fictitious-user";
+                entry.password = "fictitious-password"; entry.notes = "fictitious-notes";
+            }
             ASSERT_TRUE(CredentialService::add(principal.toStdString(), key, entry, failure));
             for (auto* field : {&entry.title, &entry.username, &entry.password, &entry.notes}) {
                 sodium_memzero(field->data(), field->size()); field->clear();
@@ -142,6 +167,61 @@ protected:
         EXPECT_EQ(store().recoveryAccess(principal, failure), VaultRecoveryAccess::RecoveryRequired);
     }
     void unchanged() { EXPECT_TRUE(bytes(principal) == original); EXPECT_TRUE(bytes(source) == sourceBytes); }
+    void makeAuthenticatedBusinessInvalidSource() {
+        VaultKeyMetadata metadata; std::string failure;
+        ASSERT_TRUE(passwall::storage::VaultStorage::readMetadata(source.toStdString(), metadata, failure));
+        SecureBuffer key(0);
+        ASSERT_EQ(VaultKeyService::unlock({reinterpret_cast<const unsigned char*>(master.data()), master.size()},
+            metadata, key), passwall::core::CryptoError::None);
+        sqlite3* database = nullptr;
+        ASSERT_EQ(sqlite3_open(source.toLocal8Bit().constData(), &database), SQLITE_OK);
+        struct Close { sqlite3* value; ~Close() { sqlite3_close(value); } } close{database};
+        sqlite3_stmt* raw = nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(database,
+            "SELECT entry_id,nonce,ciphertext FROM entries ORDER BY entry_id LIMIT 1;", -1, &raw, nullptr), SQLITE_OK);
+        struct Finalize { sqlite3_stmt* value; ~Finalize() { sqlite3_finalize(value); } } finalize{raw};
+        ASSERT_EQ(sqlite3_step(raw), SQLITE_ROW);
+        ASSERT_EQ(sqlite3_column_bytes(raw, 0), 16);
+        ASSERT_EQ(sqlite3_column_bytes(raw, 1), int(passwall::core::NonceSize));
+        passwall::models::EntryId id{};
+        std::memcpy(id.data(), sqlite3_column_blob(raw, 0), id.size());
+        passwall::core::EncryptedData encrypted;
+        std::memcpy(encrypted.nonce.data(), sqlite3_column_blob(raw, 1), encrypted.nonce.size());
+        const auto* ciphertext = static_cast<const unsigned char*>(sqlite3_column_blob(raw, 2));
+        const auto ciphertextSize = sqlite3_column_bytes(raw, 2);
+        ASSERT_NE(ciphertext, nullptr); ASSERT_GT(ciphertextSize, 0);
+        encrypted.ciphertext.assign(ciphertext, ciphertext + ciphertextSize);
+        std::array<unsigned char, 52> aad{};
+        std::copy(metadata.vaultId.begin(), metadata.vaultId.end(), aad.begin());
+        std::copy(id.begin(), id.end(), aad.begin() + 16);
+        aad[32] = 1;
+        constexpr std::array<unsigned char, 16> purpose{
+            'P','W','-','E','N','T','R','Y','-','E','N','C','-','v','1',0};
+        std::copy(purpose.begin(), purpose.end(), aad.begin() + 36);
+        SecureBuffer plaintext(0);
+        ASSERT_EQ(passwall::core::CryptoEngine::decrypt(encrypted, aad,
+            {key.data(), key.size()}, plaintext), passwall::core::CryptoError::None);
+        ASSERT_GE(plaintext.size(), 24U);
+        const std::uint32_t titleSize = std::uint32_t(plaintext.data()[4])
+            | (std::uint32_t(plaintext.data()[5]) << 8)
+            | (std::uint32_t(plaintext.data()[6]) << 16)
+            | (std::uint32_t(plaintext.data()[7]) << 24);
+        ASSERT_GT(titleSize, 0U); ASSERT_GE(plaintext.size(), 24U + titleSize);
+        std::memset(plaintext.data() + 24, ' ', titleSize);
+        ASSERT_EQ(passwall::core::CryptoEngine::encrypt({plaintext.data(), plaintext.size()}, aad,
+            {key.data(), key.size()}, encrypted), passwall::core::CryptoError::None);
+        sqlite3_finalize(raw); finalize.value = nullptr;
+        raw = nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(database,
+            "UPDATE entries SET nonce=?,ciphertext=? WHERE entry_id=?;", -1, &raw, nullptr), SQLITE_OK);
+        finalize.value = raw;
+        ASSERT_EQ(sqlite3_bind_blob(raw, 1, encrypted.nonce.data(), encrypted.nonce.size(), SQLITE_TRANSIENT), SQLITE_OK);
+        ASSERT_EQ(sqlite3_bind_blob(raw, 2, encrypted.ciphertext.data(), encrypted.ciphertext.size(), SQLITE_TRANSIENT), SQLITE_OK);
+        ASSERT_EQ(sqlite3_bind_blob(raw, 3, id.data(), id.size(), SQLITE_TRANSIENT), SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(raw), SQLITE_DONE);
+        ASSERT_EQ(sqlite3_changes(database), 1);
+        sourceBytes = bytes(source);
+    }
     void newProcessRecovery(ReplacementLayout expected) {
         const auto record = read();
         const auto intent = record.replacement ? record.replacement : record.resolvedReplacement;
@@ -213,6 +293,29 @@ extern "C" void __wrap_sodium_free(void* pointer) {
         active->wiped &= isZero(pointer, item.second); --active->liveSecrets; item = {}; break;
     }
     __real_sodium_free(pointer);
+}
+extern "C" void __real_sodium_memzero(void*, std::size_t);
+extern "C" void __wrap_sodium_memzero(void* pointer, std::size_t size) {
+    __real_sodium_memzero(pointer, size);
+    if (active && pointer) for (auto& allocation : active->sensitiveStrings)
+        if (allocation.pointer == pointer && allocation.size == size)
+            allocation.wiped = isZero(pointer, size);
+}
+extern "C" void* realNew(std::size_t) asm("__real__Znwm");
+extern "C" void* wrappedNew(std::size_t) asm("__wrap__Znwm");
+extern "C" void* wrappedNew(std::size_t size) {
+    if (active && active->failCredentialAllocation && size == largeFieldSizes.back() + 1) {
+        active->failCredentialAllocation = false;
+        active->credentialAllocationInjected = true;
+        throw std::bad_alloc{};
+    }
+    void* pointer = realNew(size);
+    if (active && pointer && active->sensitiveStringCount < int(active->sensitiveStrings.size()))
+        for (const auto fieldSize : largeFieldSizes) if (size == fieldSize + 1) {
+            active->sensitiveStrings[active->sensitiveStringCount++] = {pointer, fieldSize, false};
+            break;
+        }
+    return pointer;
 }
 extern "C" int __real_crypto_aead_xchacha20poly1305_ietf_decrypt(
     unsigned char*, unsigned long long*, unsigned char*, const unsigned char*, unsigned long long,
@@ -326,9 +429,40 @@ TEST_F(VaultReplacementEngineTest, LastCorruptedEntryAfterValidEntryPreventsExch
     EXPECT_FALSE(result.sourceAuthenticationFailed);
     EXPECT_TRUE(bytes(principal) == original); blocked();
 }
+TEST_F(VaultReplacementEngineTest, AuthenticatedBusinessInvalidPlaintextNeverEngagesReplacement) {
+    makeAuthenticatedBusinessInvalidSource();
+    EXPECT_FALSE(run());
+    EXPECT_EQ(result.outcome, ReplacementOutcome::NotReplaced);
+    EXPECT_FALSE(result.sourceAuthenticationFailed); EXPECT_EQ(probe.exchanges, 0);
+    EXPECT_TRUE(bytes(principal) == original); EXPECT_TRUE(bytes(source) == sourceBytes); blocked();
+}
+TEST_F(VaultReplacementEngineTest, FifoSourceIsRefusedWithoutBlockingOrOpeningAReplacement) {
+    ASSERT_TRUE(QFile::remove(source));
+    ASSERT_EQ(::mkfifo(source.toLocal8Bit().constData(), 0600), 0);
+    EXPECT_FALSE(run());
+    EXPECT_EQ(result.outcome, ReplacementOutcome::NotReplaced);
+    EXPECT_FALSE(result.sourceAuthenticationFailed); EXPECT_EQ(probe.exchanges, 0);
+    EXPECT_TRUE(bytes(principal) == original); blocked();
+    EXPECT_TRUE(QFile::remove(source));
+}
 TEST_F(VaultReplacementEngineTest, ExceptionDuringAuthenticationCleansOwnedSecrets) {
     probe.throwAuth = true; EXPECT_FALSE(run()); EXPECT_EQ(probe.exchanges, 0);
     unchanged(); EXPECT_FALSE(result.diagnostic.isEmpty()); blocked();
+}
+TEST_F(VaultReplacementEngineTest, CredentialAllocationFailureWipesPartialFieldsAndAllowsSafeRetry) {
+    probe.failCredentialAllocation = true;
+    EXPECT_FALSE(run());
+    EXPECT_TRUE(probe.credentialAllocationInjected); EXPECT_GE(probe.sensitiveStringCount, 4);
+    EXPECT_TRUE(probe.sensitiveStringsWiped()); EXPECT_EQ(probe.exchanges, 0);
+    EXPECT_TRUE(bytes(principal) == original); blocked();
+    const auto pending = read(); ASSERT_TRUE(pending.replacement);
+    const auto recovered = recoverPreparedReplacementForTest(
+        store(), registered.localId, pending.replacement->operationId);
+    ASSERT_EQ(recovered.finalization.state, ReplacementFinalizationState::Resolved)
+        << recovered.diagnostic.toStdString();
+    const auto principalPath = probe.principal;
+    probe = Probe{}; probe.principal = principalPath;
+    ASSERT_TRUE(run()); EXPECT_EQ(result.outcome, ReplacementOutcome::Replaced);
 }
 TEST_F(VaultReplacementEngineTest, SourceAliasOfPrincipalRefused) {
     source = principal; EXPECT_FALSE(run()); EXPECT_EQ(probe.decryptions, 0);
