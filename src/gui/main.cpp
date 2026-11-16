@@ -10,9 +10,18 @@
 #include <QApplication>
 #include <QDebug>
 #include <QPointer>
+#include <cstdio>
+#include <cstring>
 
 int main(int argc, char* argv[])
 {
+    for (int index = 1; index < argc; ++index) {
+        if (argv[index] && (std::strcmp(argv[index], "--version") == 0
+            || std::strcmp(argv[index], "-v") == 0)) {
+            std::fputs("PassWall " PASSWALL_VERSION "\n", stdout);
+            return 0;
+        }
+    }
 #ifdef Q_OS_LINUX
     // Outlives QApplication, the window, DBus registration and every service.
     QString instanceError;

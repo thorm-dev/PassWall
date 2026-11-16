@@ -1,7 +1,7 @@
 
 cmake_minimum_required(VERSION 3.25)
 
-project(PassWall VERSION 0.1.0 LANGUAGES CXX)
+project(PassWall VERSION 1.28.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
@@ -360,6 +360,7 @@ add_executable(passwall_app
 )
 
 target_include_directories(passwall_app PRIVATE src)
+target_compile_definitions(passwall_app PRIVATE PASSWALL_VERSION="${PROJECT_VERSION}")
 
 target_link_libraries(passwall_app PRIVATE
     passwall_vault_preferences

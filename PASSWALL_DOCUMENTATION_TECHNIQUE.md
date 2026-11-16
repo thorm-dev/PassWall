@@ -1,8 +1,8 @@
 # PassWall — Documentation technique du projet et état des réalisations
 
-**Version :** 1.27
+**Version :** 1.28
 **Date :** 16 novembre 2026
-**Statut :** GUI 8A/8B, récupération utilisateur 8C-1c et verrouillage automatique obligatoire 8C-2 implémentés. L'ancienne restauration vers un nouveau fichier et sa cible de 23 tests sont retirées ; les garanties encore propres à ce chemin sont transférées au moteur 6B. Le build CMake courant est limité aux exécutables de production et à leurs dépendances ; tests et outils indépendants restent disponibles par cibles explicites. La version 1.26 est validée sur GitHub ARM64 avec 887 cas CTest réussis et un auxiliaire volontairement ignoré. Le workflow exécute désormais séparément les cinq tests JavaScript de l'extension avec Node.js 24 ; sa validation GitHub après publication reste attendue. Nettoyage des artefacts et états insuffisamment prouvés restent ouverts.
+**Statut :** GUI 8A/8B, récupération utilisateur 8C-1c et verrouillage automatique obligatoire 8C-2 implémentés. L'ancienne restauration vers un nouveau fichier et sa cible de 23 tests sont retirées ; les garanties encore propres à ce chemin sont transférées au moteur 6B. Le build CMake courant est limité aux exécutables de production et à leurs dépendances ; tests et outils indépendants restent disponibles par cibles explicites. La version applicative provient désormais de CMake et `passwall_app --version`/`-v` l'affiche sans initialiser Qt ni les services. La version 1.26 est validée sur GitHub ARM64 ; l'étape JavaScript 1.27 et la version 1.28 restent à confirmer après publication. Nettoyage des artefacts et états insuffisamment prouvés restent ouverts.
 
 ## 1. Présentation
 
@@ -120,6 +120,8 @@ Les sauvegardes locales ont donc été développées, mais le support NAS/systè
 | `tests` | tests unitaires et d'intégration |
 
 Ce découpage est confirmé dans les sources inspectées. Les composants nouveaux et leurs limites sont détaillés en sections 5.10 à 5.19.
+
+La source unique de la version applicative est `project(PassWall VERSION 1.28.0 ...)` dans `CMakeLists.txt`. CMake transmet `PROJECT_VERSION` à la seule cible `passwall_app` par la définition privée `PASSWALL_VERSION`. Au tout début de `main()`, avant verrou d'instance Linux, `QApplication`, bridge ou lecture de préférences, `--version` et `-v` écrivent exactement `PassWall 1.28.0` suivi d'un retour à la ligne sur la sortie standard, puis terminent avec le code 0. Sans ces options, le chemin de démarrage reste inchangé.
 
 ### 5.1 Moteur cryptographique
 
@@ -806,6 +808,8 @@ La validation locale initiale est restée ciblée : **569/569** cas non-GUI prio
 Le workflow GitHub Actions ARM64 n° 43868859895 sur `64d1900` avait exécuté les 888 cas : **885 réussis, deux échoués et un ignoré**. Les deux échecs étaient propres au harnais GUI, sans changement du moteur. Le test du reçu `abandoned` ouvrait la récupération avant la fin de l'abandon automatique asynchrone ; il attend désormais sa terminaison et vérifie le reçu persistant avant d'injecter l'échec du dernier `fsync`. Le test UTF-8 appelait directement `VaultRestoreDialog::takePassword()` dans un processus CTest où aucune fixture n'avait encore initialisé libsodium ; le `main()` du binaire GUI initialise désormais libsodium avant tout test. En Release ARM64 local, le second test réussissait isolément, le premier dix passages consécutifs, puis les **57/57** tests voisins réussissaient. La version 1.26 a ensuite été validée sur GitHub ARM64 : **887 réussis, aucun échec et un auxiliaire volontairement ignoré**.
 
 **Intégration JavaScript 1.27 — 16 novembre 2026 :** les étapes CMake et CTest restent inchangées. Une étape `actions/setup-node@v7` sélectionne explicitement Node.js 24 sans cache de gestionnaire de paquets, puis une étape indépendante exécute `node --test tests/extension/*.test.cjs`. Aucun framework, paquet npm, permission GitHub ou changement de l'extension n'est ajouté. Les cinq tests — deux de remplissage et trois de navigation/origine — réussissent localement ; le workflow 1.27 reste à valider sur GitHub ARM64. Cette couverture ne remplace ni Firefox réel ni les essais Native Messaging de bout en bout.
+
+**Version en ligne de commande 1.28 — 16 novembre 2026 :** configuration Release neuve puis compilation ciblée de `passwall_app` avec `--parallel 1`, sans avertissement relevé. `--version` et `-v` produisent chacun exactement `PassWall 1.28.0\n`, sans stderr, avec le code 0. Une plateforme Qt, un bus et des chemins de configuration volontairement invalides n'affectent pas ces commandes, confirmant leur retour avant initialisation. Le chemin normal sans option a été exercé offscreen avec configuration temporaire isolée et arrêt instrumenté de la boucle événementielle : initialisation puis nettoyage réussis, sans verrou ni socket runtime résiduel. Aucun coffre ou réglage personnel n'a été utilisé.
 
 ### 6.3 Incidents corrigés et diagnostic de l'annulation de rotation
 

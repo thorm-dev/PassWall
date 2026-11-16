@@ -1,8 +1,8 @@
 # PassWall — Plan technique des travaux restants
 
-**Version :** 1.27
+**Version :** 1.28
 **Date :** 16 novembre 2026
-**Statut :** interfaces 8A/8B, récupération utilisateur 8C-1c et minuteur obligatoire 8C-2 implémentés. L'ancienne API sans appelant `VaultRestoreService` et sa cible de tests sont retirées après transfert de leurs trois garanties encore uniques vers 6B. Le build CMake courant exclut tests, probes et outils indépendants ; ils restent disponibles par compilation explicite. La version 1.26 est validée sur GitHub ARM64 avec 887 cas CTest réussis et un auxiliaire volontairement ignoré. Les cinq tests JavaScript de l'extension sont maintenant raccordés séparément au workflow avec Node.js 24 ; la première exécution GitHub de 1.27 reste à confirmer. Nettoyage des artefacts, états insuffisamment prouvés, export de configuration et distribution reproductible complète restent ouverts.
+**Statut :** interfaces 8A/8B, récupération utilisateur 8C-1c et minuteur obligatoire 8C-2 implémentés. L'ancienne API sans appelant `VaultRestoreService` et sa cible de tests sont retirées après transfert de leurs trois garanties encore uniques vers 6B. Le build CMake courant exclut tests, probes et outils indépendants ; ils restent disponibles par compilation explicite. La version CMake 1.28.0 est exposée par `passwall_app --version`/`-v` sans démarrage applicatif. La prochaine intervention prioritaire est l'abandon automatique sûr d'un `prepared` créé après sélection d'une source manifestement invalide, actuellement récupérable manuellement. Nettoyage des artefacts, autres états insuffisamment prouvés, export de configuration et distribution reproductible complète restent ouverts.
 
 ## 1. Objet et méthode
 
@@ -225,6 +225,8 @@ L'arrêt architectural du 9 novembre a précédé cette réalisation ; il ne dé
 
 **Limites 8A à conserver, complétées par 8C-1 :** l'annulation avant lancement et le refus authentifié du maître peuvent maintenant résoudre automatiquement `prepared`, mais uniquement par l'abandon contrôlé existant et après ses preuves durables. `Unknown`, worker vivant, engagement, divergence ou échec de persistance imposent toujours la récupération manuelle. Un retour tardif ne devient pas une réussite ; aucun effacement d'artefact ni nouvelle garde globale. Une restauration complète et une récupération contrôlée ont été observées manuellement sous Wayland le 12 novembre 2026 ; la nouvelle ergonomie d'abandon automatique reste à revalider manuellement.
 
+**Anomalie prioritaire constatée manuellement en 1.28 :** la sélection d'un fichier `.txt` invalide peut créer un état `prepared`, puis exiger la récupération manuelle alors que le moteur n'a engagé aucune substitution. L'abandon contrôlé permet ensuite de retrouver le coffre fictif intact. La prochaine intervention doit classifier ce refus avant engagement et tenter automatiquement l'abandon existant uniquement après preuve du principal intact, absence de worker actif et confirmation durable ; tout doute doit conserver le blocage. Ne pas effacer directement le marqueur ni généraliser cette issue aux états engagés.
+
 **8B — réalisée et validée dans le périmètre automatisé, garanties à maintenir :**
 
 - Menu « Coffre → Sauvegardes automatiques… », fenêtre non modale et sélection explicite du principal ; exactement activation/dossier/rétention, valeurs initiales désactivé/vide/7. Rétention : entier positif `int`, 1 à 2 147 483 647, sans suppression immédiate.
@@ -350,15 +352,16 @@ La reproductibilité Linux doit couvrir `passwall_backup_worker` et `passwall_re
 
 ## 8. Ordre de travail recommandé
 
-1. **P0 — Mémoire :** maintenir le durcissement clos et `CredentialSummary` ; vérifier les nouveaux chemins sensibles au fur et à mesure, sans recommencer les corrections validées.
-2. **P0 — Firefox :** maintenir l'implémentation unique et l'invalidation ; préparer l'extension de validation déterministe au parcours réel et l'automatisation de bout en bout.
-3. **P0 — Verrouillage :** conserver les protections Linux/éditeurs/minuteur ; assurer leur articulation avec les opérations longues, sans réintroduire de garde globale abandonnée.
-4. **P1 — Maintien de 6B :** conserver le moteur commun direct/délégué, les preuves de remplacement réel, la copie préalable conditionnelle, l'ancien inode et la reprise sans seconde substitution ; aucun moteur GUI parallèle.
-5. **P1 — Maintien de 7 :** préserver délégation, canal secret, acquittements globaux et réservations jusqu'à terminaison, validés par la campagne ciblée ; conserver les limites physiques et l'audit V1, sans rouvrir les contrats réalisés.
-6. **P1 — Étape 8C, prochain chantier :** récupération contrôlée, verrouillage automatique obligatoire et essais manuels Wayland. L'export de configuration reste une finition distincte à développer. Maintenir les GUI 8A/8B et leur chaîne de services existante ; ne pas les réimplémenter.
-7. **P1 — Validation et distribution :** campagne adaptée aux changements, audit global V1, portabilité des copies et déploiement Linux/Firefox/auxiliaires reproductible, avec tests JavaScript. Ne pas annoncer les supports réseau ou autres plateformes avant validation.
-8. **P1 — Évolutions de données :** développer les migrations lorsqu'une transition de format le nécessitera. Aucun chantier de synchronisation, serveur de référence ou autorisation d'appareil n'est décidé.
-9. **P2/P3 — Produit et plateformes :** TOTP, passkeys, audit et ergonomie ; étendre les plateformes dans l'ordre Linux, Windows, puis iOS.
+1. **P1 — Restauration d'une source invalide :** corriger le maintien inutile de `prepared` après refus certain avant substitution, par l'abandon contrôlé et durable déjà existant ; conserver la récupération manuelle si une preuve manque.
+2. **P0 — Mémoire :** maintenir le durcissement clos et `CredentialSummary` ; vérifier les nouveaux chemins sensibles au fur et à mesure, sans recommencer les corrections validées.
+3. **P0 — Firefox :** maintenir l'implémentation unique et l'invalidation ; préparer l'extension de validation déterministe au parcours réel et l'automatisation de bout en bout.
+4. **P0 — Verrouillage :** conserver les protections Linux/éditeurs/minuteur ; assurer leur articulation avec les opérations longues, sans réintroduire de garde globale abandonnée.
+5. **P1 — Maintien de 6B :** conserver le moteur commun direct/délégué, les preuves de remplacement réel, la copie préalable conditionnelle, l'ancien inode et la reprise sans seconde substitution ; aucun moteur GUI parallèle.
+6. **P1 — Maintien de 7 :** préserver délégation, canal secret, acquittements globaux et réservations jusqu'à terminaison, validés par la campagne ciblée ; conserver les limites physiques et l'audit V1, sans rouvrir les contrats réalisés.
+7. **P1 — Étape 8C :** poursuivre les états encore volontairement non résolus et les essais manuels Wayland. L'export de configuration reste une finition distincte à développer. Maintenir les GUI 8A/8B et leur chaîne de services existante ; ne pas les réimplémenter.
+8. **P1 — Validation et distribution :** campagne adaptée aux changements, audit global V1, portabilité des copies et déploiement Linux/Firefox/auxiliaires reproductible, avec tests JavaScript. Ne pas annoncer les supports réseau ou autres plateformes avant validation.
+9. **P1 — Évolutions de données :** développer les migrations lorsqu'une transition de format le nécessitera. Aucun chantier de synchronisation, serveur de référence ou autorisation d'appareil n'est décidé.
+10. **P2/P3 — Produit et plateformes :** TOTP, passkeys, audit et ergonomie ; étendre les plateformes dans l'ordre Linux, Windows, puis iOS.
 
 Chaque étape fonctionnelle doit disposer de ses critères d'acceptation et tests ciblés. Les invariants P0 s'appliquent à toutes les étapes ; ils ne retardent pas artificiellement les P1 en l'absence de nouveau défaut.
 
