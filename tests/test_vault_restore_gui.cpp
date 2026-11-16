@@ -660,7 +660,9 @@ TEST_F(VaultRestoreGuiTest, RecoveryIdentityConfirmedAfterInterruptedSyncResumes
 TEST_F(VaultRestoreGuiTest, RecoveryVisibleAbandonedReceiptWithFailedLastSyncIsNotGuiSuccess)
 {
     const auto reset = qScopeGuard([] { passwall::tests::failSettingsSyncWhenPublished({}, {}); });
-    choose(); prepare(); widget<QPushButton>("restoreCancelButton")->click();
+    choose(); prepare(); widget<QPushButton>("restoreCancelButton")->click(); done();
+    EXPECT_FALSE(record().replacement); ASSERT_TRUE(record().resolvedReplacement);
+    EXPECT_EQ(record().resolvedReplacement->phase, "abandoned");
     const auto original = bytes(principal);
     openRecovery(); examineRecovery();
     passwall::tests::failSettingsSyncWhenPublished(VaultPreferencesStore().fileName(), "abandoned");

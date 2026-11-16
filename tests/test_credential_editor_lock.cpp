@@ -2859,6 +2859,10 @@ int main(int argc, char** argv)
         return 1;
     QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, nativeSettings.path());
     QSettings::setPath(QSettings::NativeFormat, QSettings::SystemScope, nativeSettings.path());
+    // Some CTest cases exercise SecureBuffer directly, without first going
+    // through a vault service that initializes libsodium for them.
+    if (sodium_init() < 0)
+        return 1;
     // Les tests ne lancent ni passwall_app ni Firefox et n'utilisent pas le
     // bureau utilisateur. Ce choix permet aussi la decouverte CTest sans ecran.
     qputenv("QT_QPA_PLATFORM", QByteArrayLiteral("offscreen"));
