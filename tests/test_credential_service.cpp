@@ -18,10 +18,28 @@
 #include <vector>
 
 #include <QString>
+#include <QMetaObject>
 
 namespace {
 
 namespace fs = std::filesystem;
+
+struct CredentialEventProbe {
+    std::vector<std::pair<QString, passwall::services::CredentialMutation>> events;
+    QMetaObject::Connection connection;
+
+    CredentialEventProbe()
+    {
+        connection = QObject::connect(
+            &passwall::services::CredentialService::events(),
+            &passwall::services::CredentialEvents::committed,
+            [this](const QString& path, passwall::services::CredentialMutation mutation, quint64) {
+                events.emplace_back(path, mutation);
+            });
+    }
+
+    ~CredentialEventProbe() { QObject::disconnect(connection); }
+};
 
 template <typename T>
 concept HasPasswordMember = requires(T value) {
@@ -210,6 +228,39 @@ TEST_F(CredentialServiceTest, RequiredFieldsRejectUpdateWithoutWritingAndAllowRe
     ASSERT_TRUE(CredentialService::update(databasePath.string(), *dataKey, original, error));
     EXPECT_TRUE(error.empty());
     EXPECT_TRUE(sameCredential(original, sourceBefore));
+}
+
+TEST_F(CredentialServiceTest, EmitsOneTypedNotificationAfterEachConfirmedCommit)
+{
+    using passwall::services::CredentialMutation;
+    using passwall::services::CredentialService;
+
+    CredentialEventProbe probe;
+    auto credential = validationCredential();
+    std::string error;
+
+    ASSERT_TRUE(CredentialService::add(databasePath.string(), *dataKey, credential, error));
+    credential.title = "Titre fictif modifié après ajout";
+    ASSERT_TRUE(CredentialService::update(databasePath.string(), *dataKey, credential, error));
+    ASSERT_TRUE(CredentialService::remove(databasePath.string(), *dataKey, credential.id, error));
+
+    ASSERT_EQ(probe.events.size(), 3u);
+    const QString expectedPath = QString::fromStdString(databasePath.string());
+    EXPECT_EQ(probe.events[0], std::make_pair(expectedPath, CredentialMutation::Added));
+    EXPECT_EQ(probe.events[1], std::make_pair(expectedPath, CredentialMutation::Updated));
+    EXPECT_EQ(probe.events[2], std::make_pair(expectedPath, CredentialMutation::Removed));
+}
+
+TEST_F(CredentialServiceTest, RejectedMutationDoesNotNotify)
+{
+    CredentialEventProbe probe;
+    auto credential = validationCredential();
+    credential.password.clear();
+    std::string error;
+
+    EXPECT_FALSE(passwall::services::CredentialService::add(
+        databasePath.string(), *dataKey, credential, error));
+    EXPECT_TRUE(probe.events.empty());
 }
 
 TEST_F(CredentialServiceTest, RequiredFieldsPreserveExactPasswordsAndOptionalFields)

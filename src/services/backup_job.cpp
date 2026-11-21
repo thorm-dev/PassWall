@@ -20,14 +20,21 @@ class BackupProcessSession final : public QObject {
 public:
     BackupProcessSession(BackupJob* job, QString program, QByteArray request,
                          storage::VaultOperationGuard reservation, BackupJob::Finalizer finalize,
-                         QString source, std::optional<AutomaticBackupContext> automatic)
+                         QString source, QString destination,
+                         std::optional<AutomaticBackupContext> automatic, bool snapshotAccess,
+                         bool receiptRequired)
         : job_(job), owner_(job), program_(std::move(program)), request_(std::move(request)),
           reservation_(std::move(reservation)), finalize_(std::move(finalize)),
-          source_(std::move(source)), automatic_(std::move(automatic))
+          source_(std::move(source)), destination_(std::move(destination)),
+          automatic_(std::move(automatic)), snapshotAccess_(snapshotAccess),
+          receiptRequired_(receiptRequired)
     {
-        const auto handles = reservation_.inheritedHandles();
-        process_.setChildProcessModifier([handles] {
-            for (int fd : handles)
+        const auto exclusiveHandles = reservation_.inheritedHandles();
+        const auto snapshotHandles = reservation_.inheritedSnapshotHandles();
+        process_.setChildProcessModifier([exclusiveHandles, snapshotHandles] {
+            for (int fd : exclusiveHandles)
+                if (fd >= 0 && ::fcntl(fd, F_SETFD, 0) != 0) ::_exit(127);
+            for (int fd : snapshotHandles)
                 if (fd >= 0 && ::fcntl(fd, F_SETFD, 0) != 0) ::_exit(127);
         });
         process_.setStandardErrorFile(QProcess::nullDevice());
@@ -68,8 +75,11 @@ public:
             if (invalid_ || status != QProcess::NormalExit || code != 0
                 || !backup_protocol::parseResult(output_, result))
                 result = {BackupOutcome::Unknown, QStringLiteral("Résultat de publication non confirmé ; ne pas relancer automatiquement.")};
-            if (automatic_ && result.outcome == BackupOutcome::Published && !result.receipt)
-                result = {BackupOutcome::Unknown, QStringLiteral("Reçu de publication automatique absent ; aucune suppression autorisée.")};
+            if (receiptRequired_ && result.outcome == BackupOutcome::Published
+                && (!result.receipt || result.publishedPath != destination_
+                    || (snapshotAccess_ && !result.receipt->permitsDeletion())))
+                result = {BackupOutcome::Unknown,
+                    QStringLiteral("Preuve de publication absente ou incohérente.")};
             finalizeCopy(result);
             if (automatic_ && copyResult_.outcome == BackupOutcome::Published && copyResult_.receipt) {
                 // Same supervisor and same open lock descriptions throughout.
@@ -124,12 +134,20 @@ public:
             deleteLater();
             return;
         }
-        const auto handles = reservation_.inheritedHandles();
         if (rotation_ && owner_) emit owner_->rotationStarted();
         // A direct receiver may close/cancel us while observing the phase.
         if (cancelled_) { begin(); return; }
-        process_.start(program_, {rotation_ ? QStringLiteral("--rotation-v1") : QStringLiteral("--protocol-v1"),
-            QString::number(handles[0]), QString::number(handles[1])});
+        QStringList arguments;
+        if (snapshotAccess_) {
+            const auto handles = reservation_.inheritedSnapshotHandles();
+            arguments = {QStringLiteral("--snapshot-v1"), QString::number(handles[0]),
+                QString::number(handles[1]), QString::number(handles[2])};
+        } else {
+            const auto handles = reservation_.inheritedHandles();
+            arguments = {rotation_ ? QStringLiteral("--rotation-v1") : QStringLiteral("--protocol-v1"),
+                QString::number(handles[0]), QString::number(handles[1])};
+        }
+        process_.start(program_, arguments);
     }
     void cancel()
     {
@@ -204,13 +222,15 @@ private:
     QProcess process_;
     storage::VaultOperationGuard reservation_;
     BackupJob::Finalizer finalize_;
-    QString source_;
+    QString source_, destination_;
     std::optional<AutomaticBackupContext> automatic_;
     BackupResult copyResult_;
     QTimer escalation_;
     int stage_ = 0;
     bool cancelled_ = false, launched_ = false, invalid_ = false, reported_ = false;
     bool rotation_ = false, rotationReported_ = false, finalized_ = false;
+    bool snapshotAccess_ = false;
+    bool receiptRequired_ = false;
 };
 
 QString BackupJob::siblingWorkerPath()
@@ -240,28 +260,46 @@ bool BackupJob::start(const QString& source, const QString& destination)
     }
     return startReserved(source, destination, std::move(reservation), {});
 }
+bool BackupJob::startSnapshotReserved(const QString& source, const QString& destination,
+    storage::VaultOperationGuard access, Finalizer finalize,
+    std::optional<SnapshotDirectoryIdentity> directory)
+{
+    return startWithAccess(source, destination, std::move(access), std::move(finalize),
+        directory, {}, true);
+}
 bool BackupJob::startReserved(const QString& source, const QString& destination,
     storage::VaultOperationGuard reservation, Finalizer finalize,
     std::optional<SnapshotDirectoryIdentity> directory, std::optional<AutomaticBackupContext> automatic)
+{
+    return startWithAccess(source, destination, std::move(reservation), std::move(finalize),
+        directory, std::move(automatic), false);
+}
+bool BackupJob::startWithAccess(const QString& source, const QString& destination,
+    storage::VaultOperationGuard reservation, Finalizer finalize,
+    std::optional<SnapshotDirectoryIdentity> directory,
+    std::optional<AutomaticBackupContext> automatic, bool snapshotAccess)
 {
     Q_ASSERT(QThread::currentThread() == thread());
     std::string error;
     if (started_ || !backup_protocol::validPath(workerPath_) || QDir::cleanPath(workerPath_) != workerPath_
         || !backup_protocol::validPath(source) || !backup_protocol::validPath(destination)
-        || !reservation.matchesReservation(source.toStdString(), error)) {
-        startError_ = QStringLiteral("Réservation ou paramètres de sauvegarde invalides.");
+        || !(snapshotAccess ? reservation.matchesSnapshotAccess(source.toStdString(), error)
+                            : reservation.matchesReservation(source.toStdString(), error))) {
+        startError_ = QStringLiteral("Accès réservé ou paramètres de sauvegarde invalides.");
         return false;
     }
     if (automatic && (!backup_protocol::validPath(automatic->settingsFile)
         || QDir::cleanPath(automatic->settingsFile) != automatic->settingsFile
         || QUuid(automatic->localId).isNull() || QUuid(automatic->attempt).isNull())) return false;
-    const auto request = backup_protocol::request(source, destination, directory, automatic.has_value());
+    const bool receiptRequired = automatic.has_value() || snapshotAccess;
+    const auto request = backup_protocol::request(source, destination, directory, receiptRequired);
     if (request.size() > backup_protocol::requestLimit) return false;
     try {
         // No process starts until the queued callback. Constructor/queueing
         // exceptions can therefore destroy this candidate without waiting.
         auto candidate = std::make_unique<BackupProcessSession>(
-            this, workerPath_, request, std::move(reservation), std::move(finalize), source, std::move(automatic));
+            this, workerPath_, request, std::move(reservation), std::move(finalize), source,
+            destination, std::move(automatic), snapshotAccess, receiptRequired);
         const QPointer<BackupProcessSession> session(candidate.get());
         QTimer::singleShot(0, candidate.get(), [session] { if (session) session->begin(); });
         session_ = candidate.release();

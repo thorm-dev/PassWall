@@ -754,6 +754,7 @@ TEST_P(VaultReplacementCrashTest, PersistentLayoutInNewProcessNeverRepeatsExchan
             ? ReplacementLayout::ArmedBeforeExchange : ReplacementLayout::PreparedIntact);
         blocked(); EXPECT_TRUE(bytes(principal) == original);
     }
+    EXPECT_EQ(bytes(source), sourceBytes);
 }
 INSTANTIATE_TEST_SUITE_P(RealFiles, VaultReplacementCrashTest, ::testing::Values(
     ReplacementCheckpoint::SourceAuthenticated, ReplacementCheckpoint::CandidateStaged,

@@ -152,6 +152,32 @@ TEST_F(BackupJobTest, RejectsUncontrolledExecutableAndInvalidPaths)
     EXPECT_FALSE(normal.start(QStringLiteral("relative.pwdb"), destination));
     EXPECT_FALSE(normal.start(source, QString("/tmp/a") + QChar::Null + "b"));
 }
+TEST_F(BackupJobTest, SnapshotStartRejectsBusinessAndExclusiveCapabilities)
+{
+    std::string error;
+    passwall::storage::VaultOperationGuard business;
+    ASSERT_TRUE(business.tryAccess(source.toStdString(), error));
+    BackupJob first;
+    EXPECT_FALSE(first.startSnapshotReserved(source, destination, std::move(business), {}));
+
+    passwall::storage::VaultOperationGuard exclusive;
+    ASSERT_TRUE(exclusive.tryReserve(source.toStdString(), error));
+    BackupJob second;
+    EXPECT_FALSE(second.startSnapshotReserved(source, destination, std::move(exclusive), {}));
+}
+TEST_F(BackupJobTest, SnapshotPublicationReturnsReceiptBoundToDestination)
+{
+    passwall::storage::VaultOperationGuard snapshot;
+    std::string error;
+    ASSERT_TRUE(snapshot.trySnapshotAccess(source.toStdString(), error)) << error;
+    BackupJob job; observe(job);
+    ASSERT_TRUE(job.startSnapshotReserved(source, destination, std::move(snapshot), {}));
+    ASSERT_TRUE(until([&] { return result.has_value(); }));
+    ASSERT_EQ(result->outcome, BackupOutcome::Published) << result->diagnostic.toStdString();
+    ASSERT_TRUE(result->receipt.has_value());
+    EXPECT_EQ(result->publishedPath, destination);
+    EXPECT_TRUE(result->receipt->permitsDeletion());
+}
 TEST_F(BackupJobTest, CancellationBeforeDeferredStartNeverLaunches)
 {
     BackupJob job; observe(job);
@@ -164,8 +190,16 @@ TEST_F(BackupJobTest, CancellationDuringRealCopyCleansPrivateTemporaries)
 {
     useSource("during.pwdb");
     BackupJob job(QString::fromLatin1(PROBE_BACKUP_WORKER)); observe(job);
-    ASSERT_TRUE(job.start(source, destination));
+    passwall::storage::VaultOperationGuard snapshot;
+    std::string guardError;
+    ASSERT_TRUE(snapshot.trySnapshotAccess(source.toStdString(), guardError)) << guardError;
+    ASSERT_TRUE(job.startSnapshotReserved(source, destination, std::move(snapshot), {}));
     ASSERT_TRUE(until([&] { return QFile::exists(source + ".checkpoint"); }));
+    passwall::storage::VaultOperationGuard business, replacement, secondSnapshot;
+    EXPECT_TRUE(business.tryAccess(source.toStdString(), guardError));
+    EXPECT_FALSE(replacement.tryReserve(source.toStdString(), guardError));
+    EXPECT_FALSE(secondSnapshot.trySnapshotAccess(source.toStdString(), guardError));
+    business.reset();
     job.cancel(); touch(source + ".resume");
     ASSERT_TRUE(until([&] { return result.has_value(); }));
     EXPECT_EQ(result->outcome, BackupOutcome::CancelledBeforePublication);
@@ -308,6 +342,19 @@ TEST_F(BackupJobTest, WorkerRejectsInvalidOrOversizedRequestsWithoutPublishing)
         EXPECT_FALSE(QFile::exists(destination));
     }
 }
+TEST_F(BackupJobTest, WorkerRejectsForgedSnapshotDescriptorsWithoutPublishing)
+{
+    QProcess process;
+    process.start(QString::fromLatin1(REAL_BACKUP_WORKER),
+        {"--snapshot-v1", "64", "-1", "65"});
+    ASSERT_TRUE(process.waitForStarted(2000));
+    process.write(backup_protocol::request(source, destination));
+    process.closeWriteChannel();
+    ASSERT_TRUE(process.waitForFinished(5000));
+    EXPECT_NE(process.exitCode(), 0);
+    EXPECT_TRUE(process.readAllStandardOutput().isEmpty());
+    EXPECT_FALSE(QFile::exists(destination));
+}
 
 TEST_F(BackupJobTest, ParentProcessDeathPreventsVoluntaryLatePublication)
 {
@@ -342,7 +389,7 @@ TEST_F(BackupJobTest, ParentProcessDeathPreventsVoluntaryLatePublication)
     EXPECT_TRUE(access.tryAccess(source.toStdString(), error));
 }
 
-TEST_F(BackupJobTest, UnknownWithLiveWorkerRetainsReservationUntilConfirmedTermination)
+TEST_F(BackupJobTest, UnknownWithLiveWorkerRetainsSnapshotSerializationUntilConfirmedTermination)
 {
     QFile mode(source + ".fake-mode");
     ASSERT_TRUE(mode.open(QIODevice::WriteOnly)); mode.write("ignore"); mode.close();
@@ -355,22 +402,26 @@ TEST_F(BackupJobTest, UnknownWithLiveWorkerRetainsReservationUntilConfirmedTermi
     BackupJob job(QString::fromLatin1(FAKE_BACKUP_WORKER)); observe(job);
     int terminated = 0;
     QObject::connect(&job, &BackupJob::processTerminated, &job, [&] { ++terminated; });
-    ASSERT_TRUE(job.start(source, destination));
+    passwall::storage::VaultOperationGuard snapshot;
+    std::string error;
+    ASSERT_TRUE(snapshot.trySnapshotAccess(source.toStdString(), error)) << error;
+    ASSERT_TRUE(job.startSnapshotReserved(source, destination, std::move(snapshot), {}));
     ASSERT_TRUE(until([&] { return QFile::exists(destination + ".ready"); }));
     job.cancel();
     ASSERT_TRUE(until([&] { return result.has_value(); }));
     EXPECT_EQ(result->outcome, BackupOutcome::Unknown);
     EXPECT_TRUE(job.isActive()); EXPECT_EQ(terminated, 0);
-    passwall::storage::VaultOperationGuard access;
-    std::string error;
-    EXPECT_FALSE(access.tryAccess(source.toStdString(), error));
+    passwall::storage::VaultOperationGuard access, replacement;
+    EXPECT_TRUE(access.tryAccess(source.toStdString(), error));
+    EXPECT_FALSE(replacement.tryReserve(source.toStdString(), error));
     BackupJob another;
     EXPECT_FALSE(another.start(source, directory.filePath("another.db")));
+    access.reset();
     ASSERT_TRUE(suppressedProcess);
     suppressProcessStops = false; realProcessKill(suppressedProcess);
     ASSERT_TRUE(until([&] { return !job.isActive(); }));
     EXPECT_EQ(terminated, 1); EXPECT_EQ(reports, 1);
-    EXPECT_TRUE(access.tryAccess(source.toStdString(), error));
+    EXPECT_TRUE(replacement.tryReserve(source.toStdString(), error));
 }
 
 TEST_F(BackupJobTest, DestroyingFacadeAfterUnknownDoesNotReleaseLiveWorkerReservation)
@@ -384,16 +435,20 @@ TEST_F(BackupJobTest, DestroyingFacadeAfterUnknownDoesNotReleaseLiveWorkerReserv
     });
     suppressProcessStops = true;
     auto job = std::make_unique<BackupJob>(QString::fromLatin1(FAKE_BACKUP_WORKER)); observe(*job);
-    ASSERT_TRUE(job->start(source, destination));
+    passwall::storage::VaultOperationGuard snapshot;
+    std::string error;
+    ASSERT_TRUE(snapshot.trySnapshotAccess(source.toStdString(), error)) << error;
+    ASSERT_TRUE(job->startSnapshotReserved(source, destination, std::move(snapshot), {}));
     ASSERT_TRUE(until([&] { return QFile::exists(destination + ".ready"); }));
     job->cancel(); ASSERT_TRUE(until([&] { return result.has_value(); }));
     EXPECT_TRUE(job->isActive()); job.reset();
-    passwall::storage::VaultOperationGuard access;
-    std::string error;
-    EXPECT_FALSE(access.tryAccess(source.toStdString(), error));
+    passwall::storage::VaultOperationGuard access, replacement;
+    EXPECT_TRUE(access.tryAccess(source.toStdString(), error));
+    EXPECT_FALSE(replacement.tryReserve(source.toStdString(), error));
+    access.reset();
     ASSERT_TRUE(suppressedProcess);
     suppressProcessStops = false; realProcessKill(suppressedProcess);
-    ASSERT_TRUE(until([&] { return access.tryAccess(source.toStdString(), error); }));
+    ASSERT_TRUE(until([&] { return replacement.tryReserve(source.toStdString(), error); }));
 }
 
 TEST_F(BackupJobTest, ExecChildRetainsReservationAfterUnexpectedParentExit)
@@ -416,9 +471,12 @@ TEST_F(BackupJobTest, ExecChildRetainsReservationAfterUnexpectedParentExit)
     QFile ready(destination + ".ready"); ASSERT_TRUE(ready.open(QIODevice::ReadOnly));
     bool ok = false; const auto pid = ready.readAll().toLongLong(&ok);
     ASSERT_TRUE(ok); ASSERT_GT(pid, 1);
-    passwall::storage::VaultOperationGuard access;
+    passwall::storage::VaultOperationGuard access, replacement, secondSnapshot;
     std::string error;
-    EXPECT_FALSE(access.tryAccess(source.toStdString(), error));
+    EXPECT_TRUE(access.tryAccess(source.toStdString(), error));
+    EXPECT_FALSE(replacement.tryReserve(source.toStdString(), error));
+    EXPECT_FALSE(secondSnapshot.trySnapshotAccess(source.toStdString(), error));
+    access.reset();
     touch(destination + ".exit");
     int status = 0;
     bool reaped = false;
@@ -427,7 +485,7 @@ TEST_F(BackupJobTest, ExecChildRetainsReservationAfterUnexpectedParentExit)
         return reaped;
     }));
     EXPECT_TRUE(WIFEXITED(status));
-    EXPECT_TRUE(access.tryAccess(source.toStdString(), error));
+    EXPECT_TRUE(replacement.tryReserve(source.toStdString(), error));
 }
 
 TEST_F(BackupJobTest, ProtocolRejectsWrongTypesVersionsAndDuplicateTerminalRecords)
@@ -438,6 +496,21 @@ TEST_F(BackupJobTest, ProtocolRejectsWrongTypesVersionsAndDuplicateTerminalRecor
     EXPECT_FALSE(backup_protocol::parseResult("{\"v\":1,\"outcome\":\"published\",\"diagnostic\":7}", value));
     const auto record = backup_protocol::result({BackupOutcome::Published, {}});
     EXPECT_FALSE(backup_protocol::parseResult(record + record, value));
+    auto evidence = BackupFileEvidence{};
+    evidence.device = 1; evidence.inode = 2; evidence.size = 3; evidence.mount = 4;
+    evidence.directoryDevice = 5; evidence.directoryInode = 6; evidence.directoryMount = 7;
+    evidence.modified = QStringLiteral("1:0"); evidence.changed = QStringLiteral("2:0");
+    evidence.sha256 = QByteArray(32, 'p');
+    const auto bound = backup_protocol::result(
+        {BackupOutcome::Published, {}, evidence, destination});
+    ASSERT_TRUE(backup_protocol::parseResult(bound, value));
+    EXPECT_EQ(value.publishedPath, destination);
+    ASSERT_TRUE(value.receipt.has_value());
+    EXPECT_EQ(*value.receipt, evidence);
+    auto missingPath = QJsonDocument::fromJson(bound).object();
+    missingPath.remove(QStringLiteral("publishedPath"));
+    EXPECT_FALSE(backup_protocol::parseResult(
+        QJsonDocument(missingPath).toJson(QJsonDocument::Compact), value));
     QString from, to;
     EXPECT_FALSE(backup_protocol::parseRequest("{\"v\":1,\"source\":7,\"destination\":\"/tmp/test\"}", from, to));
 }
@@ -478,7 +551,10 @@ int main(int argc, char** argv)
     if (application.arguments().size() == 4 && application.arguments()[1] == "--orphan-driver") {
         const auto source = application.arguments()[2], destination = application.arguments()[3];
         BackupJob job(QString::fromLatin1(FAKE_BACKUP_WORKER));
-        if (!job.start(source, destination)
+        passwall::storage::VaultOperationGuard snapshot;
+        std::string error;
+        if (!snapshot.trySnapshotAccess(source.toStdString(), error)
+            || !job.startSnapshotReserved(source, destination, std::move(snapshot), {})
             || !until([&] { return QFile::exists(destination + ".ready"); })) return 2;
         ::_exit(0); // No facade, QProcess or QApplication destructor/quit signal.
     }

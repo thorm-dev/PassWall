@@ -187,9 +187,12 @@ bool decodeIdentity(const QJsonObject& object, VaultFileIdentity& file)
         && unsignedNumber(object["inode"], file.inode) && file.inode != 0;
 }
 
-bool confirmResolvedAccess(const QString& settingsFile, const VaultRegistration& expected, QString& error);
+bool decodeRecoveryRecords(const QJsonObject& root,
+    QVector<VaultRegistration>& records, QString& error);
+bool confirmResolvedAccess(const QString& settingsFile,
+    const VaultRegistration& expected, QString& error, bool recoveryOnly);
 bool recoveryAllowed(const QVector<VaultRegistration>& records, const QString& path, QString& error,
-    const QString& settingsFile)
+    const QString& settingsFile, bool recoveryOnly = false)
 {
     const auto normalized = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
     quint64 device = 0, inode = 0;
@@ -225,7 +228,7 @@ bool recoveryAllowed(const QVector<VaultRegistration>& records, const QString& p
                 // Visible content cannot establish that an earlier fsync worked.
                 // Revalidate NOW, even in a fresh process; no persisted/cache bit
                 // can substitute for this barrier. Caller holds the registry lock.
-                if (!confirmResolvedAccess(settingsFile, record, error)) return false;
+                if (!confirmResolvedAccess(settingsFile, record, error, recoveryOnly)) return false;
             } else if ((inode && device == receipt.previous.device && inode == receipt.previous.inode)
                 || (receipt.phase == "abandoned" && receipt.candidate && inode
                     && device == receipt.candidate->device && inode == receipt.candidate->inode)
@@ -447,6 +450,58 @@ bool decode(const QJsonObject& root, QVector<VaultRegistration>& records, QStrin
     return true;
 }
 
+// Recovery admission must not depend on ordinary backup preferences being
+// valid. Parse only the identity and recovery evidence, while failing closed
+// on any malformed or ambiguous recovery field.
+bool decodeRecoveryRecords(const QJsonObject& root,
+    QVector<VaultRegistration>& records, QString& error)
+{
+    records.clear();
+    if (root.value("version") != QJsonValue(1) || !root.value("vaults").isArray())
+        return fail(error, "Version ou structure du registre de récupération invalide.");
+    for (const auto& value : root.value("vaults").toArray()) {
+        if (!value.isObject())
+            return fail(error, "Enregistrement de récupération invalide.");
+        const auto object = value.toObject();
+        VaultRegistration record;
+        record.localId = object.value("localId").toString();
+        const QUuid localId(record.localId);
+        if (localId.isNull()
+            || localId.toString(QUuid::WithoutBraces) != record.localId
+            || !decodeIdentity(object.value("file").toObject(), record.file))
+            return fail(error, "Identité locale de récupération invalide.");
+        if (object.contains("replacement")) {
+            VaultReplacementIntent intent;
+            if (!object.value("replacement").isObject()
+                || !decodeReplacement(object.value("replacement").toObject(), intent, error)
+                || intent.phase == "resolved" || intent.phase == "abandoned")
+                return fail(error, "Intention active de restauration invalide.");
+            record.replacement = std::move(intent);
+        }
+        if (object.contains("resolvedReplacement")) {
+            VaultReplacementIntent receipt;
+            if (!object.value("resolvedReplacement").isObject()
+                || !decodeReplacement(object.value("resolvedReplacement").toObject(), receipt, error)
+                || (receipt.phase != "resolved" && receipt.phase != "abandoned"))
+                return fail(error, "Reçu de restauration invalide.");
+            record.resolvedReplacement = std::move(receipt);
+        }
+        if (record.replacement && record.file != (record.replacement->confirmed
+            ? *record.replacement->confirmed : record.replacement->previous))
+            return fail(error, "Identité de restauration incohérente.");
+        if (record.resolvedReplacement && (record.replacement
+            || record.file != *record.resolvedReplacement->confirmed))
+            return fail(error, "Reçu résolu incohérent avec le coffre enregistré.");
+        for (const auto& existing : records)
+            if (existing.localId == record.localId || existing.file.path == record.file.path
+                || (existing.file.device == record.file.device
+                    && existing.file.inode == record.file.inode))
+                return fail(error, "Identités de récupération ambiguës dans le registre.");
+        records.push_back(std::move(record));
+    }
+    return true;
+}
+
 // Preserve unknown root/record fields for future version-1 extensions.
 void encode(QJsonObject& root, const QVector<VaultRegistration>& records)
 {
@@ -514,7 +569,8 @@ bool confirmSettingsDurability(const QString& path, QString& error)
     return true;
 }
 
-bool confirmResolvedAccess(const QString& settingsFile, const VaultRegistration& expected, QString& error)
+bool confirmResolvedAccess(const QString& settingsFile, const VaultRegistration& expected,
+    QString& error, bool recoveryOnly)
 {
 #ifdef Q_OS_UNIX
     // Pin the very inode being parsed and synchronized. Ordinary QSettings UI
@@ -536,7 +592,9 @@ bool confirmResolvedAccess(const QString& settingsFile, const VaultRegistration&
     QVariant registry; QVector<VaultRegistration> records;
     if (file.error() != QFile::NoError || bytes.size() > MaxConfigBytes || !file.atEnd()
         || !parseRegistrySnapshot(settingsFile, bytes, registry, error)
-        || !decode(QJsonDocument::fromJson(registry.toByteArray()).object(), records, error))
+        || !(recoveryOnly
+            ? decodeRecoveryRecords(QJsonDocument::fromJson(registry.toByteArray()).object(), records, error)
+            : decode(QJsonDocument::fromJson(registry.toByteArray()).object(), records, error)))
         return fail(error, "Reçu de résolution illisible ; récupération requise.");
     const auto found = std::find_if(records.cbegin(), records.cend(), [&](const auto& record) {
         return record.localId == expected.localId && record.file == expected.file
@@ -556,9 +614,30 @@ bool confirmResolvedAccess(const QString& settingsFile, const VaultRegistration&
         return fail(error, "Registre changé pendant la revalidation ; accès refusé.");
     return true;
 #else
-    Q_UNUSED(settingsFile); Q_UNUSED(expected);
+    Q_UNUSED(settingsFile); Q_UNUSED(expected); Q_UNUSED(recoveryOnly);
     return fail(error, "Revalidation durable indisponible sur cette plateforme.");
 #endif
+}
+
+bool admitRecoveryRegistry(const QString& path, const QString& vaultPath,
+    QVector<VaultRegistration>& records, QString& error)
+{
+    records.clear();
+    error.clear();
+    if (!prepareSettings(path, error)) return false;
+    QLockFile lock(path + ".registry-lock");
+    lock.setStaleLockTime(0);
+    if (!lock.tryLock(0))
+        return fail(error, "Configuration occupée ; réessayer explicitement.");
+    QVariant published;
+    if (!readRegistryOnDisk(path, published, error)) return false;
+    if (!published.isValid()) return true;
+    QJsonParseError parseError;
+    const auto document = QJsonDocument::fromJson(published.toByteArray(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject())
+        return fail(error, "Registre de récupération illisible ; accès refusé.");
+    return decodeRecoveryRecords(document.object(), records, error)
+        && recoveryAllowed(records, vaultPath, error, path, true);
 }
 
 template<class Operation>
@@ -916,6 +995,46 @@ bool VaultPreferencesStore::prepareMutation(const QString& path,
         return fail(error, "Suivi local des modifications indisponible sur cette plateforme.");
 #endif
     })) return false;
+    access = std::move(candidate);
+    return true;
+}
+
+bool VaultPreferencesStore::admitGenerationalMutation(const QString& path,
+    storage::VaultOperationGuard& access, QString& error) const
+{
+    error.clear();
+    storage::VaultOperationGuard candidate;
+    std::string accessError;
+    if (!candidate.tryAccess(path.toStdString(), accessError)) {
+        error = QString::fromStdString(accessError);
+        return false;
+    }
+    QVector<VaultRegistration> recoveryRecords;
+    if (!admitRecoveryRegistry(settingsFile_, path, recoveryRecords, error))
+        return false;
+    const QString normalized = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+#ifdef Q_OS_UNIX
+    Fd directory{openDirectory(QFileInfo(normalized).absolutePath())};
+    const auto name = QFile::encodeName(QFileInfo(normalized).fileName());
+    Fd descriptor{directory.value < 0 ? -1 : ::openat(directory.value, name.constData(),
+        O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)};
+    struct stat info {};
+    if (descriptor.value < 0 || ::fstat(descriptor.value, &info) != 0
+        || !S_ISREG(info.st_mode) || info.st_uid != ::geteuid()
+        || info.st_nlink != 1 || (info.st_mode & 0022))
+        return fail(error, "Identité du coffre impossible à confirmer avant modification.");
+    const auto birth = birthTime(descriptor.value);
+    for (const auto& record : recoveryRecords) {
+        const bool same = record.file.device == quint64(info.st_dev)
+            && record.file.inode == quint64(info.st_ino);
+        if (record.file.path != normalized && !same) continue;
+        if (record.file.path != normalized || !same || record.file.birthTime != birth)
+            return fail(error, "Identité du coffre modifiée ou ambiguë ; modification refusée.");
+        break;
+    }
+#else
+    return fail(error, "Admission locale des modifications indisponible sur cette plateforme.");
+#endif
     access = std::move(candidate);
     return true;
 }

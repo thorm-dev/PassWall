@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <QApplication>
 #include <QFile>
+#include <QFileDialog>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -25,6 +26,14 @@ protected:
     QTemporaryDir directory;
     std::unique_ptr<MainWindow> window;
     QString path;
+    void recreateWindow()
+    {
+        window.reset();
+        QApplication::processEvents();
+        window = std::make_unique<MainWindow>();
+        window->setLifecycleProtectionValidator([] { return true; }, [] {});
+        window->setLifecycleProtectionAvailable(true);
+    }
     void SetUp() override
     {
         ASSERT_TRUE(directory.isValid());
@@ -39,9 +48,7 @@ protected:
         settings.setValue("unrelated/value", "keep");
         settings.sync();
         path = directory.filePath("fictitious.db");
-        window = std::make_unique<MainWindow>();
-        window->setLifecycleProtectionValidator([] { return true; }, [] {});
-        window->setLifecycleProtectionAvailable(true);
+        recreateWindow();
     }
     void TearDown() override { window.reset(); QApplication::processEvents(); }
     void click(const char* name)
@@ -65,6 +72,171 @@ protected:
         click("createVaultButton");
     }
 };
+
+TEST_F(VaultPreferencesGuiTest, AbsentLastPathLeavesUnlockFieldEmpty)
+{
+    QSettings settings("PassWall", "PassWall");
+    ASSERT_FALSE(settings.contains("vault/lastPath"));
+    auto* field = window->findChild<QLineEdit*>("unlockPathEdit");
+    ASSERT_NE(field, nullptr);
+    EXPECT_TRUE(field->text().isEmpty());
+
+    settings.setValue("vault/lastPath", QString{});
+    settings.sync();
+    recreateWindow();
+    EXPECT_TRUE(window->findChild<QLineEdit*>("unlockPathEdit")->text().isEmpty());
+    EXPECT_TRUE(settings.value("vault/lastPath").toString().isEmpty());
+}
+
+TEST_F(VaultPreferencesGuiTest, AvailableOrdinaryLastPathIsPrefilledWithoutVaultInspection)
+{
+    QFile file(path);
+    ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    ASSERT_EQ(file.write("not-a-sqlite-vault"), 18);
+    file.close();
+    QSettings settings("PassWall", "PassWall");
+    settings.setValue("vault/lastPath", path);
+    settings.sync();
+
+    recreateWindow();
+
+    EXPECT_EQ(window->findChild<QLineEdit*>("unlockPathEdit")->text(), path);
+}
+
+TEST_F(VaultPreferencesGuiTest, UnavailableLastPathIsNotPrefilledOrDeleted)
+{
+    passwall::core::SecureBuffer key(0);
+    std::string lifecycleError;
+    const QString registered = directory.filePath("registered.db");
+    ASSERT_TRUE(VaultLifecycleService::createVault(
+        registered.toStdString(), "fictitious-registry-master", key, lifecycleError));
+    key = passwall::core::SecureBuffer(0);
+    VaultRegistration registration;
+    QString registryError;
+    ASSERT_EQ(VaultPreferencesStore().recognizeOrRegister(
+        registered, registration, registryError), VaultRecognition::Registered);
+    QSettings settings("PassWall", "PassWall");
+    const QByteArray registry = settings.value("vaultRegistry/data").toByteArray();
+    const QString missing = directory.filePath("removed.db");
+    settings.setValue("vault/lastPath", missing);
+    settings.sync();
+
+    recreateWindow();
+
+    EXPECT_TRUE(window->findChild<QLineEdit*>("unlockPathEdit")->text().isEmpty());
+    settings.sync();
+    EXPECT_EQ(settings.value("vault/lastPath").toString(), missing);
+    EXPECT_EQ(settings.value("vaultRegistry/data").toByteArray(), registry);
+    EXPECT_EQ(settings.value("unrelated/value").toString(), "keep");
+}
+
+TEST_F(VaultPreferencesGuiTest, UnreadableLastPathIsNotPrefilledOrDeleted)
+{
+    QFile file(path);
+    ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    ASSERT_EQ(file.write("fictitious"), 10);
+    file.close();
+    ASSERT_TRUE(QFile::setPermissions(path, QFileDevice::WriteOwner));
+    QSettings settings("PassWall", "PassWall");
+    settings.setValue("vault/lastPath", path);
+    settings.sync();
+
+    recreateWindow();
+
+    EXPECT_TRUE(window->findChild<QLineEdit*>("unlockPathEdit")->text().isEmpty());
+    settings.sync();
+    EXPECT_EQ(settings.value("vault/lastPath").toString(), path);
+    ASSERT_TRUE(QFile::setPermissions(path,
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner));
+}
+
+#ifdef Q_OS_UNIX
+TEST_F(VaultPreferencesGuiTest, SymlinkLastPathIsNotPrefilledOrDeleted)
+{
+    QFile file(path);
+    ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    file.close();
+    const QString alias = directory.filePath("ambiguous-link.db");
+    ASSERT_TRUE(QFile::link(path, alias));
+    QSettings settings("PassWall", "PassWall");
+    settings.setValue("vault/lastPath", alias);
+    settings.sync();
+
+    recreateWindow();
+
+    EXPECT_TRUE(window->findChild<QLineEdit*>("unlockPathEdit")->text().isEmpty());
+    settings.sync();
+    EXPECT_EQ(settings.value("vault/lastPath").toString(), alias);
+}
+#endif
+
+TEST_F(VaultPreferencesGuiTest, BrowserSelectionDoesNotPersistBeforeAuthentication)
+{
+    QFile file(path);
+    ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    file.close();
+    const QString previous = directory.filePath("temporarily-unavailable.db");
+    QSettings settings("PassWall", "PassWall");
+    settings.setValue("vault/lastPath", previous);
+    settings.sync();
+    recreateWindow();
+
+    bool dialogFound = false;
+    QTimer picker;
+    picker.setInterval(1);
+    QObject::connect(&picker, &QTimer::timeout, window.get(), [&] {
+        auto* dialog = window->findChild<QFileDialog*>();
+        if (!dialog)
+            dialog = qobject_cast<QFileDialog*>(QApplication::activeModalWidget());
+        if (!dialog)
+            return;
+        dialogFound = true;
+        picker.stop();
+        dialog->selectFile(path);
+        static_cast<QDialog*>(dialog)->accept();
+    });
+    QTimer watchdog;
+    watchdog.setSingleShot(true);
+    QObject::connect(&watchdog, &QTimer::timeout, window.get(), [&] {
+        if (auto* dialog = qobject_cast<QFileDialog*>(QApplication::activeModalWidget()))
+            dialog->reject();
+    });
+    picker.start();
+    watchdog.start(1000);
+    click("openPageButton");
+    click("unlockBrowseButton");
+    picker.stop();
+    watchdog.stop();
+
+    ASSERT_TRUE(dialogFound);
+    EXPECT_EQ(window->findChild<QLineEdit*>("unlockPathEdit")->text(), path);
+    settings.sync();
+    EXPECT_EQ(settings.value("vault/lastPath").toString(), previous);
+}
+
+TEST_F(VaultPreferencesGuiTest, SuccessfulAuthenticationPublishesLastPath)
+{
+    passwall::core::SecureBuffer key(0);
+    std::string error;
+    ASSERT_TRUE(VaultLifecycleService::createVault(
+        path.toStdString(), "fictitious-registry-master", key, error));
+    key = passwall::core::SecureBuffer(0);
+    const QString previous = directory.filePath("temporarily-unavailable.db");
+    QSettings settings("PassWall", "PassWall");
+    settings.setValue("vault/lastPath", previous);
+    settings.sync();
+    recreateWindow();
+
+    click("openPageButton");
+    field("unlockPathEdit", path);
+    field("unlockPasswordEdit", "fictitious-registry-master");
+    click("unlockVaultButton");
+
+    EXPECT_TRUE(window->acquireLease().unlocked);
+    settings.sync();
+    EXPECT_EQ(settings.value("vault/lastPath").toString(), path);
+    EXPECT_EQ(settings.value("unrelated/value").toString(), "keep");
+}
 
 TEST_F(VaultPreferencesGuiTest, CreationRegistersDefaultsAndPreservesUnrelatedSettings)
 {
@@ -163,6 +335,8 @@ TEST_F(VaultPreferencesGuiTest, FailedAuthenticationDoesNotRegisterOrPublishSess
     QString error;
     ASSERT_TRUE(VaultPreferencesStore().list(records, error));
     EXPECT_TRUE(records.isEmpty());
+    QSettings settings("PassWall", "PassWall");
+    EXPECT_FALSE(settings.contains("vault/lastPath"));
 }
 
 TEST_F(VaultPreferencesGuiTest, CorruptIniRefusesCreationWithoutPublishingOrRewriting)

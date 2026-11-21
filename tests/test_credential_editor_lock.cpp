@@ -1,9 +1,11 @@
 #include "gui/credential_editor_context.hpp"
 #include "gui/main_window.hpp"
 #include "services/credential_service.hpp"
+#include "services/automatic_backup_coordinator.hpp"
 #include "services/restore_protocol.hpp"
 #include "storage/vault_operation_guard.hpp"
 #include "services/vault_lifecycle_service.hpp"
+#include "services/global_backup_preferences_store.hpp"
 #ifdef Q_OS_LINUX
 #include "fake_login1_backend.hpp"
 #include "platform/linux_instance_lock.hpp"
@@ -491,6 +493,20 @@ protected:
         EXPECT_FALSE(window->acquireLease().unlocked);
     }
 
+#ifdef PASSWALL_GUI_TESTING
+    void restartWithGenerationalCoordinator()
+    {
+        window.reset();
+        QApplication::processEvents();
+        window = MainWindow::createForGenerationalTests();
+        window->setLifecycleProtectionValidator([] { return true; }, [] {});
+        window->setLifecycleProtectionAvailable(true);
+        window->show();
+        runBounded([&] { unlock(); });
+        ASSERT_TRUE(window->acquireLease().unlocked);
+    }
+#endif
+
     QMessageBox* migrationNotice() const
     {
         return window->findChild<QMessageBox*>(QStringLiteral("autoLockMigrationNotice"));
@@ -818,6 +834,197 @@ protected:
 };
 
 #ifdef Q_OS_LINUX
+TEST_F(MainWindowEditorLockTest, ProductionManualLockKeepsGenerationalTriggerInactive)
+{
+    using passwall::services::AutomaticBackupCoordinator;
+    auto* coordinator = window->findChild<AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    ASSERT_NE(coordinator, nullptr);
+
+    Credential added = makeCredential();
+    added.id = {};
+    added.title = "Fictitious mutation before lock";
+    const auto wipe = qScopeGuard([&] { wipeCredential(added); });
+    std::string error;
+    ASSERT_TRUE(CredentialService::add(
+        vaultPath.toStdString(), verificationKey, added, error)) << error;
+    ASSERT_EQ(coordinator->triggerMode(),
+        passwall::services::BackupTriggerMode::Historical);
+    ASSERT_FALSE(coordinator->modificationGroupingPending());
+
+    const auto oldLease = window->acquireLease();
+    bool invalidated = false;
+    bool requested = false;
+    QString requestedPath;
+    QObject observer;
+    QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated,
+        &observer, [&] { invalidated = true; });
+    QObject::connect(coordinator, &AutomaticBackupCoordinator::generationalBackupRequested,
+        &observer, [&](passwall::services::GenerationalBackupRequestOffer offer) {
+            requested = true;
+            requestedPath = offer.vaultPath;
+            EXPECT_TRUE(invalidated);
+            EXPECT_FALSE(window->isLeaseCurrent(oldLease));
+            EXPECT_FALSE(window->acquireLease().unlocked);
+        });
+
+    lock();
+    EXPECT_TRUE(invalidated);
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_FALSE(requested); // No consumer runs in the cleanup/lock stack.
+    QCoreApplication::processEvents();
+    EXPECT_FALSE(requested);
+    EXPECT_TRUE(requestedPath.isEmpty());
+    EXPECT_FALSE(coordinator->isActive());
+}
+
+TEST_F(MainWindowEditorLockTest, ProductionNormalCloseDoesNotSettleAnInactiveGeneration)
+{
+    using passwall::services::AutomaticBackupCoordinator;
+    using passwall::services::MutationBackupOutcome;
+    using passwall::services::MutationBackupResult;
+    auto* coordinator = window->findChild<AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    ASSERT_NE(coordinator, nullptr);
+
+    Credential added = makeCredential();
+    added.id = {};
+    added.title = "Fictitious mutation before normal close";
+    const auto wipe = qScopeGuard([&] { wipeCredential(added); });
+    std::string error;
+    ASSERT_TRUE(CredentialService::add(
+        vaultPath.toStdString(), verificationKey, added, error)) << error;
+    ASSERT_EQ(coordinator->triggerMode(),
+        passwall::services::BackupTriggerMode::Historical);
+    ASSERT_FALSE(coordinator->modificationGroupingPending());
+
+    const auto oldLease = window->acquireLease();
+    bool invalidated = false;
+    int requests = 0;
+    QVector<MutationBackupOutcome> outcomes;
+    QObject observer;
+    QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated,
+        &observer, [&] { invalidated = true; });
+    QObject::connect(coordinator, &AutomaticBackupCoordinator::generationalBackupRequested,
+        &observer, [&](passwall::services::GenerationalBackupRequestOffer) { ++requests; });
+    QObject::connect(coordinator, &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult result) {
+            outcomes.push_back(result.outcome);
+        });
+
+    EXPECT_TRUE(window->close());
+    EXPECT_TRUE(invalidated);
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_EQ(requests, 0); // The production generation consumer is still disabled.
+    EXPECT_TRUE(outcomes.isEmpty());
+    EXPECT_TRUE(coordinator->canClose());
+}
+
+#ifdef PASSWALL_GUI_TESTING
+TEST_F(MainWindowEditorLockTest,
+    GenerationalCloseWithoutMutationWipesImmediatelyAndClosesWithoutARequest)
+{
+    using passwall::services::AutomaticBackupCoordinator;
+    restartWithGenerationalCoordinator();
+    auto* coordinator = window->findChild<AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    ASSERT_NE(coordinator, nullptr);
+    ASSERT_EQ(coordinator->triggerMode(),
+        passwall::services::BackupTriggerMode::Generational);
+
+    bool invalidated = false;
+    int requests = 0;
+    QObject observer;
+    QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated,
+        &observer, [&] { invalidated = true; });
+    QObject::connect(coordinator, &AutomaticBackupCoordinator::generationalBackupRequested,
+        &observer, [&](passwall::services::GenerationalBackupRequestOffer) { ++requests; });
+
+    EXPECT_FALSE(window->close());
+    EXPECT_TRUE(invalidated);
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_TRUE(passwall::tests::waitFor([&] { return !window->isVisible(); }));
+    EXPECT_EQ(requests, 0);
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalCloseDrainsEachCommittedGenerationBeforeClosingWithoutRetry)
+{
+    using passwall::services::AutomaticBackupCoordinator;
+    using passwall::services::BackupFileEvidence;
+    using passwall::services::GenerationalBackupRequestOffer;
+    using passwall::services::MutationBackupOutcome;
+    using passwall::services::MutationBackupPublicationReceipt;
+    const QString backupRoot = testDirectory->filePath(QStringLiteral("automatic-backups"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    const auto saved = passwall::services::GlobalBackupPreferencesStore().save({backupRoot, 7});
+    ASSERT_TRUE(saved.valid()) << saved.diagnostic.toStdString();
+    restartWithGenerationalCoordinator();
+    auto* coordinator = window->findChild<AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    ASSERT_NE(coordinator, nullptr);
+
+    QVector<GenerationalBackupRequestOffer> offers;
+    bool invalidated = false;
+    QObject observer;
+    QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated,
+        &observer, [&] { invalidated = true; });
+    QObject::connect(coordinator, &AutomaticBackupCoordinator::generationalBackupRequested,
+        &observer, [&](GenerationalBackupRequestOffer offer) {
+            offers.push_back(std::move(offer));
+        });
+    auto commit = [&](const QString& title) {
+        Credential added = makeCredential();
+        added.id = {};
+        added.title = title.toStdString();
+        const auto wipe = qScopeGuard([&] { wipeCredential(added); });
+        std::string error;
+        EXPECT_TRUE(CredentialService::add(vaultPath.toStdString(), verificationKey,
+            added, error, passwall::services::BackupTriggerMode::Generational))
+            << error;
+    };
+    const auto receiptFor = [](const GenerationalBackupRequestOffer& offer,
+                               const QString& destination) {
+        BackupFileEvidence evidence;
+        evidence.device = 1; evidence.inode = 2; evidence.size = 3; evidence.mount = 4;
+        evidence.directoryDevice = 5; evidence.directoryInode = 6; evidence.directoryMount = 7;
+        evidence.birth = QStringLiteral("1:0"); evidence.modified = QStringLiteral("2:0");
+        evidence.changed = QStringLiteral("3:0"); evidence.directoryBirth = QStringLiteral("4:0");
+        evidence.sha256 = QByteArray(32, 'p');
+        return MutationBackupPublicationReceipt{offer.vaultPath, destination,
+            offer.mutationGeneration, offer.requestId, evidence};
+    };
+
+    commit(QStringLiteral("first close generation"));
+    EXPECT_FALSE(window->close());
+    EXPECT_FALSE(window->close()); // Reentrant close cannot start another drain.
+    EXPECT_TRUE(invalidated);
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return offers.size() == 1; }));
+    const auto first = offers[0];
+    const QString firstDestination = testDirectory->filePath(QStringLiteral("first-close.pwdb"));
+    ASSERT_TRUE(coordinator->markMutationBackupStarted(first.requestId,
+        first.vaultPath, first.mutationGeneration, firstDestination));
+    EXPECT_TRUE(window->isVisible());
+
+    // The session identity is retained during the drain, although its key was
+    // already wiped.  A COMMIT completing alongside close is therefore not
+    // folded into the first snapshot attempt.
+    commit(QStringLiteral("second close generation"));
+    ASSERT_TRUE(coordinator->markMutationBackupFinished(first.requestId,
+        MutationBackupOutcome::Published, receiptFor(first, firstDestination)));
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return offers.size() == 2; }));
+    const auto second = offers[1];
+    ASSERT_TRUE(coordinator->markMutationBackupStarted(second.requestId,
+        second.vaultPath, second.mutationGeneration));
+    ASSERT_TRUE(coordinator->markMutationBackupFinished(second.requestId,
+        MutationBackupOutcome::Failed));
+
+    EXPECT_TRUE(passwall::tests::waitFor([&] { return !window->isVisible(); }));
+    EXPECT_EQ(offers.size(), 2);
+}
+#endif
+
 TEST_F(MainWindowEditorLockTest, ReplacementPreparationDoesNotBlockGuiAndLateResultCannotAuthorizeAfterRepeatedLock)
 {
     using namespace passwall::services;

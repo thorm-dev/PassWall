@@ -12,8 +12,10 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLockFile>
+#include <QScopeGuard>
 #include <QSettings>
 #include <QTemporaryDir>
+#include <QUuid>
 #include <sodium.h>
 #include <sqlite3.h>
 #include <algorithm>
@@ -197,16 +199,19 @@ protected:
         ADD_FAILURE() << "Missing fictitious local registration";
         return {};
     }
-    bool mutate(int operation, const QString& target = {})
+    bool mutate(int operation, const QString& target = {},
+        BackupTriggerMode triggerMode = BackupTriggerMode::Historical)
     {
         const auto file = (target.isEmpty() ? path : target).toStdString();
         std::string failure;
         auto value = fictitious();
         value.id = original.id;
         value.version = original.version;
-        const bool ok = operation == 0 ? CredentialService::add(file, key, value, failure)
-            : operation == 1 ? CredentialService::update(file, key, value, failure)
-            : CredentialService::remove(file, key, original.id, failure);
+        const bool ok = operation == 0
+            ? CredentialService::add(file, key, value, failure, triggerMode)
+            : operation == 1
+                ? CredentialService::update(file, key, value, failure, triggerMode)
+                : CredentialService::remove(file, key, original.id, failure, triggerMode);
         error = QString::fromStdString(failure);
         return ok;
     }
@@ -234,6 +239,166 @@ TEST_F(VaultDirtyTrackingTest, DisabledBackupsAllowAllCrudWithoutChangingTheRegi
     for (int operation = 0; operation < 3; ++operation) ASSERT_TRUE(mutate(operation));
     EXPECT_FALSE(record().backupRequired);
     EXPECT_EQ(bytes(config), before);
+}
+
+TEST_F(VaultDirtyTrackingTest, ExplicitHistoricalModeStillPersistsIntentBeforeSqlite)
+{
+    enable();
+    bool observed = false;
+    probe.beforeOpen = [&] {
+        observed = true;
+        EXPECT_TRUE(record().backupRequired);
+    };
+    { ProbeScope scope(probe);
+      ASSERT_TRUE(mutate(0, {}, BackupTriggerMode::Historical)) << error.toStdString(); }
+    EXPECT_TRUE(observed);
+    EXPECT_TRUE(record().backupRequired);
+}
+
+TEST_F(VaultDirtyTrackingTest, GenerationalCrudNeverWritesHistoricalBackupState)
+{
+    enable();
+    const QByteArray before = bytes(config);
+    for (const int operation : {0, 1, 2})
+        ASSERT_TRUE(mutate(operation, {}, BackupTriggerMode::Generational))
+            << error.toStdString();
+    EXPECT_EQ(bytes(config), before);
+    const auto current = record();
+    EXPECT_FALSE(current.backupRequired);
+    EXPECT_FALSE(current.automaticSuspended);
+    EXPECT_TRUE(current.backupAttempt.isEmpty());
+}
+
+TEST_F(VaultDirtyTrackingTest, GenerationalAdmissionIgnoresMalformedOrdinaryBackupFields)
+{
+    rawRegistry([](auto& root) {
+        auto array = root["vaults"].toArray();
+        auto item = array[0].toObject();
+        item["backup"] = QJsonObject{{"automatic", "invalid"},
+            {"directory", 7}, {"retainedVersions", "invalid"}};
+        item["backupRequired"] = "invalid";
+        item["automaticState"] = QJsonObject{{"suspended", "invalid"}};
+        array[0] = item;
+        root["vaults"] = array;
+    });
+    const QByteArray configuration = bytes(config);
+    ASSERT_TRUE(mutate(0, {}, BackupTriggerMode::Generational)) << error.toStdString();
+    EXPECT_EQ(bytes(config), configuration);
+}
+
+TEST_F(VaultDirtyTrackingTest, GenerationalAdmissionAllowsAbsentOrdinaryBackupFields)
+{
+    rawRegistry([](auto& root) {
+        auto array = root["vaults"].toArray();
+        auto item = array[0].toObject();
+        item.remove("backup");
+        item.remove("backupRequired");
+        item.remove("automaticState");
+        item.remove("automaticVersions");
+        item.remove("rotation");
+        array[0] = item;
+        root["vaults"] = array;
+    });
+    const QByteArray configuration = bytes(config);
+    ASSERT_TRUE(mutate(0, {}, BackupTriggerMode::Generational)) << error.toStdString();
+    EXPECT_EQ(bytes(config), configuration);
+}
+
+TEST_F(VaultDirtyTrackingTest, GenerationalAdmissionAllowsAbsentConfigurationWithoutCreatingIt)
+{
+    ASSERT_TRUE(QFile::remove(config));
+    ASSERT_FALSE(QFileInfo::exists(config));
+    ASSERT_TRUE(mutate(0, {}, BackupTriggerMode::Generational)) << error.toStdString();
+    EXPECT_FALSE(QFileInfo::exists(config));
+}
+
+TEST_F(VaultDirtyTrackingTest, AdmittedMetadataRequiresTheExactLiveBusinessCapability)
+{
+    VaultKeyMetadata metadata;
+    std::string failure;
+    VaultOperationGuard missing;
+    EXPECT_FALSE(VaultStorage::readMetadataAdmitted(
+        path.toStdString(), missing, metadata, failure));
+    EXPECT_FALSE(failure.empty());
+
+    const auto other = directory.filePath("other-admission.db");
+    makeVault(other);
+    VaultOperationGuard wrong;
+    ASSERT_TRUE(wrong.tryAccess(other.toStdString(), failure)) << failure;
+    failure.clear();
+    EXPECT_FALSE(VaultStorage::readMetadataAdmitted(
+        path.toStdString(), wrong, metadata, failure));
+    EXPECT_FALSE(failure.empty());
+}
+
+TEST_F(VaultDirtyTrackingTest, GenerationalAdmissionStillBlocksActiveHistoricalRecovery)
+{
+    rawRegistry([&](QJsonObject& root) {
+        auto vaults = root["vaults"].toArray();
+        bool found = false;
+        for (qsizetype i = 0; i < vaults.size(); ++i) {
+            auto item = vaults[i].toObject();
+            if (item["localId"].toString() != registered.localId) continue;
+
+            const QJsonObject identity = item["file"].toObject();
+            ASSERT_FALSE(identity.isEmpty());
+
+            item["replacement"] = QJsonObject{
+                {"version", 1},
+                {"operation", QUuid::createUuid().toString(QUuid::WithoutBraces)},
+                {"previous", identity},
+                {"previousDigest", QString::fromLatin1(QByteArray(32, 'p').toHex())},
+                {"phase", "prepared"},
+                {"artifacts", QJsonArray{}}
+            };
+            vaults[i] = item;
+            found = true;
+            break;
+        }
+        ASSERT_TRUE(found);
+        root["vaults"] = vaults;
+    });
+
+    const QByteArray before = bytes(path);
+    { ProbeScope scope(probe);
+      EXPECT_FALSE(mutate(0, {}, BackupTriggerMode::Generational)); }
+    EXPECT_EQ(probe.opens, 0);
+    EXPECT_EQ(bytes(path), before);
+    EXPECT_TRUE(error.contains(QStringLiteral("récupération"), Qt::CaseInsensitive));
+}
+
+TEST_F(VaultDirtyTrackingTest, GenerationalAdmissionFailsClosedOnMalformedRecoveryEvidence)
+{
+    rawRegistry([](auto& root) {
+        auto array = root["vaults"].toArray();
+        auto item = array[0].toObject();
+        item["replacement"] = QJsonObject{{"version", 1}, {"phase", "prepared"}};
+        array[0] = item;
+        root["vaults"] = array;
+    });
+    const QByteArray before = bytes(path), configuration = bytes(config);
+    { ProbeScope scope(probe);
+      EXPECT_FALSE(mutate(0, {}, BackupTriggerMode::Generational)); }
+    EXPECT_EQ(probe.opens, 0);
+    EXPECT_EQ(bytes(path), before);
+    EXPECT_EQ(bytes(config), configuration);
+}
+
+TEST_F(VaultDirtyTrackingTest, GenerationalNotificationRemainsAfterConfirmedCommitOnly)
+{
+    int notifications = 0;
+    const auto connection = QObject::connect(&CredentialService::events(),
+        &CredentialEvents::committed, [&](const QString&, CredentialMutation, quint64) {
+            ++notifications;
+        });
+    const auto disconnect = qScopeGuard([&] { QObject::disconnect(connection); });
+    probe.commit = CommitFault::Rollback;
+    { ProbeScope scope(probe);
+      EXPECT_FALSE(mutate(0, {}, BackupTriggerMode::Generational)); }
+    EXPECT_EQ(notifications, 0);
+    probe.commit = CommitFault::None;
+    ASSERT_TRUE(mutate(0, {}, BackupTriggerMode::Generational)) << error.toStdString();
+    EXPECT_EQ(notifications, 1);
 }
 
 class DirtyCrudTest : public VaultDirtyTrackingTest, public ::testing::WithParamInterface<int> {};

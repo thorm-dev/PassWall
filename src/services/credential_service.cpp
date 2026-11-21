@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -31,6 +32,8 @@ using core::CryptoEngine;
 using core::CryptoError;
 using core::EncryptedData;
 using core::SecureBuffer;
+
+std::atomic<quint64> commitGeneration{0};
 
 void wipeString(std::string& value) noexcept
 {
@@ -173,7 +176,8 @@ bool sqlError(sqlite3* database, int result, const char* operation, std::string&
 bool openDatabase(
     const std::string& path,
     Database& database,
-    std::string& error)
+    std::string& error,
+    bool recoveryAdmissionConfirmed = false)
 {
     if (path.empty()) {
         error = "Le chemin du coffre est vide.";
@@ -181,7 +185,8 @@ bool openDatabase(
     }
 
     if (!database.access.tryAccess(path, error)) return false;
-    if (!VaultPreferencesStore::checkRecoveryAccess(path, error)) return false;
+    if (!recoveryAdmissionConfirmed
+        && !VaultPreferencesStore::checkRecoveryAccess(path, error)) return false;
     const int result = sqlite3_open_v2(
         path.c_str(),
         &database.handle,
@@ -765,23 +770,70 @@ bool commit(sqlite3* database, const char* operation, std::string& error)
 bool loadMetadata(
     const std::string& databasePath,
     services::VaultKeyMetadata& metadata,
-    std::string& error)
+    std::string& error,
+    const storage::VaultOperationGuard* admittedAccess = nullptr)
 {
+    if (admittedAccess)
+        return storage::VaultStorage::readMetadataAdmitted(
+            databasePath, *admittedAccess, metadata, error);
     return storage::VaultStorage::readMetadata(
         databasePath, metadata, error);
 }
 
 bool prepareMutation(const std::string& path, storage::VaultOperationGuard& access,
-                     std::string& error)
+                     std::string& error, BackupTriggerMode triggerMode)
 {
     QString failure;
-    if (VaultPreferencesStore().prepareMutation(QString::fromStdString(path), access, failure))
-        return true;
-    error = "Modification refusée (suivi des sauvegardes) : " + failure.toStdString();
+    const VaultPreferencesStore store;
+    bool admitted = false;
+    switch (triggerMode) {
+    case BackupTriggerMode::Historical:
+        admitted = store.prepareMutation(QString::fromStdString(path), access, failure);
+        break;
+    case BackupTriggerMode::Generational:
+        admitted = store.admitGenerationalMutation(
+            QString::fromStdString(path), access, failure);
+        break;
+    default:
+        failure = QStringLiteral("Politique de sauvegarde inconnue.");
+        break;
+    }
+    if (admitted) return true;
+    const char* context = triggerMode == BackupTriggerMode::Historical
+        ? "suivi des sauvegardes"
+        : "admission du coffre";
+    error = std::string("Modification refusée (") + context + ") : "
+        + failure.toStdString();
     return false;
 }
 
+void notifyCommitted(CredentialEvents& events, const QString& databasePath,
+                     CredentialMutation mutation) noexcept
+{
+    // A confirmed business result must never be reported as failed because an
+    // in-process observer misbehaved after COMMIT. Qt slots are expected not to
+    // throw; keep the storage contract conservative if one nevertheless does.
+    const quint64 generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    try {
+        emit events.committed(databasePath, mutation, generation);
+    } catch (...) {
+    }
+}
+
 } // namespace
+
+CredentialEvents& CredentialService::events()
+{
+    static CredentialEvents value;
+    static const int registered = qRegisterMetaType<CredentialMutation>();
+    (void)registered;
+    return value;
+}
+
+quint64 CredentialService::currentCommitGeneration() noexcept
+{
+    return commitGeneration.load(std::memory_order_acquire);
+}
 
 bool CredentialService::validate(const Credential& credential, std::string& error)
 {
@@ -809,7 +861,8 @@ bool CredentialService::add(
     const std::string& databasePath,
     const SecureBuffer& dataKey,
     Credential& credential,
-    std::string& error)
+    std::string& error,
+    BackupTriggerMode triggerMode)
 {
     error.clear();
 
@@ -823,13 +876,20 @@ bool CredentialService::add(
     }
 
     storage::VaultOperationGuard mutation;
-    if (!prepareMutation(databasePath, mutation, error)) return false;
+    if (!prepareMutation(databasePath, mutation, error, triggerMode)) return false;
+    const bool generationalAdmission = triggerMode == BackupTriggerMode::Generational;
 
     services::VaultKeyMetadata metadata{};
 
-    if (!loadMetadata(databasePath, metadata, error)) {
+    if (!loadMetadata(databasePath, metadata, error,
+            generationalAdmission ? &mutation : nullptr)) {
         return false;
     }
+
+    // Build the non-secret event payload before entering the transaction: no
+    // allocation is allowed to turn a confirmed COMMIT into a reported failure.
+    const QString notificationPath = QString::fromStdString(databasePath);
+    CredentialEvents& notificationEvents = events();
 
     Credential candidate;
     CredentialWiper candidateWiper(candidate);
@@ -855,7 +915,7 @@ bool CredentialService::add(
 
     Database database;
 
-    if (!openDatabase(databasePath, database, error)) {
+    if (!openDatabase(databasePath, database, error, generationalAdmission)) {
         sodium_memzero(candidate.id.data(), candidate.id.size());
         return false;
     }
@@ -879,6 +939,8 @@ bool CredentialService::add(
     credential.id = candidate.id;
     credential.version = candidate.version;
     sodium_memzero(candidate.id.data(), candidate.id.size());
+
+    notifyCommitted(notificationEvents, notificationPath, CredentialMutation::Added);
 
     return true;
 }
@@ -1173,7 +1235,8 @@ bool CredentialService::update(
     const std::string& databasePath,
     const SecureBuffer& dataKey,
     const Credential& credential,
-    std::string& error)
+    std::string& error,
+    BackupTriggerMode triggerMode)
 {
     error.clear();
 
@@ -1187,17 +1250,22 @@ bool CredentialService::update(
     }
 
     storage::VaultOperationGuard mutation;
-    if (!prepareMutation(databasePath, mutation, error)) return false;
+    if (!prepareMutation(databasePath, mutation, error, triggerMode)) return false;
+    const bool generationalAdmission = triggerMode == BackupTriggerMode::Generational;
 
     services::VaultKeyMetadata metadata{};
 
-    if (!loadMetadata(databasePath, metadata, error)) {
+    if (!loadMetadata(databasePath, metadata, error,
+            generationalAdmission ? &mutation : nullptr)) {
         return false;
     }
 
+    const QString notificationPath = QString::fromStdString(databasePath);
+    CredentialEvents& notificationEvents = events();
+
     Database database;
 
-    if (!openDatabase(databasePath, database, error)) {
+    if (!openDatabase(databasePath, database, error, generationalAdmission)) {
         return false;
     }
 
@@ -1287,14 +1355,17 @@ bool CredentialService::update(
         return false;
     }
 
-    return commit(database.handle, "Modification", error);
+    if (!commit(database.handle, "Modification", error)) return false;
+    notifyCommitted(notificationEvents, notificationPath, CredentialMutation::Updated);
+    return true;
 }
 
 bool CredentialService::remove(
     const std::string& databasePath,
     const SecureBuffer& dataKey,
     const EntryId& entryId,
-    std::string& error)
+    std::string& error,
+    BackupTriggerMode triggerMode)
 {
     error.clear();
 
@@ -1304,17 +1375,22 @@ bool CredentialService::remove(
     }
 
     storage::VaultOperationGuard mutation;
-    if (!prepareMutation(databasePath, mutation, error)) return false;
+    if (!prepareMutation(databasePath, mutation, error, triggerMode)) return false;
+    const bool generationalAdmission = triggerMode == BackupTriggerMode::Generational;
 
     services::VaultKeyMetadata metadata{};
 
-    if (!loadMetadata(databasePath, metadata, error)) {
+    if (!loadMetadata(databasePath, metadata, error,
+            generationalAdmission ? &mutation : nullptr)) {
         return false;
     }
 
+    const QString notificationPath = QString::fromStdString(databasePath);
+    CredentialEvents& notificationEvents = events();
+
     Database database;
 
-    if (!openDatabase(databasePath, database, error)) {
+    if (!openDatabase(databasePath, database, error, generationalAdmission)) {
         return false;
     }
 
@@ -1366,7 +1442,9 @@ bool CredentialService::remove(
         return false;
     }
 
-    return commit(database.handle, "Suppression", error);
+    if (!commit(database.handle, "Suppression", error)) return false;
+    notifyCommitted(notificationEvents, notificationPath, CredentialMutation::Removed);
+    return true;
 }
 
 } // namespace passwall::services

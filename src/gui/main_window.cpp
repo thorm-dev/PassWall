@@ -7,6 +7,7 @@
 #include "services/vault_preferences_store.hpp"
 #ifdef Q_OS_LINUX
 #include "services/automatic_backup_coordinator.hpp"
+#include "services/global_backup_preferences_store.hpp"
 #endif
 #include "storage/vault_operation_guard.hpp"
 #include "ui_main_window.h"
@@ -24,9 +25,11 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QEvent>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -61,6 +64,11 @@
 #include <limits>
 #include <string>
 #include <utility>
+#ifdef Q_OS_UNIX
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 namespace passwall::gui
 {
     namespace
@@ -72,6 +80,28 @@ namespace passwall::gui
         {
             return std::find(autoLockDurations.begin(), autoLockDurations.end(), minutes)
                 != autoLockDurations.end();
+        }
+        bool admissibleLastVaultPath(const QString& path)
+        {
+            if (path.isEmpty() || !QFileInfo(path).isAbsolute())
+                return false;
+#ifdef Q_OS_UNIX
+            const QByteArray encoded = QFile::encodeName(path);
+            const int descriptor = ::open(encoded.constData(),
+                O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+            if (descriptor < 0)
+                return false;
+            struct stat information {};
+            const bool admissible = ::fstat(descriptor, &information) == 0
+                && S_ISREG(information.st_mode) && information.st_nlink > 0
+                && (information.st_mode & (S_IRUSR | S_IRGRP | S_IROTH));
+            (void)::close(descriptor);
+            return admissible;
+#else
+            const QFileInfo information(path);
+            return information.exists() && information.isFile()
+                && information.isReadable() && !information.isSymLink();
+#endif
         }
         void wipeQString(QString &value);
         std::uint64_t clipboardCopyGeneration = 0;
@@ -515,13 +545,27 @@ namespace passwall::gui
         }
     } // namespace
     MainWindow::MainWindow(QWidget *parent)
+#ifdef Q_OS_LINUX
+        : MainWindow(services::BackupTriggerMode::Historical, parent)
+    {}
+
+    MainWindow::MainWindow(services::BackupTriggerMode backupTriggerMode,
+                           QWidget *parent)
+#endif
         : QMainWindow(parent),
           inactivityTimer_(this),
           ui_(new Ui::MainWindow)
     {
         ui_->setupUi(this);
 #ifdef Q_OS_LINUX
-        automaticBackup_ = new services::AutomaticBackupCoordinator(this);
+        if (backupTriggerMode == services::BackupTriggerMode::Historical) {
+            automaticBackup_ = new services::AutomaticBackupCoordinator(this);
+        } else {
+            automaticBackup_ = new services::AutomaticBackupCoordinator(
+                services::VaultPreferencesStore(),
+                services::BackupJob::siblingWorkerPath(), 20000, 3000,
+                backupTriggerMode, this);
+        }
         automaticBackup_->setPaused(true);
         connect(automaticBackup_, &services::AutomaticBackupCoordinator::notification, this,
             [this](const QString&, const QString& message) {
@@ -536,6 +580,15 @@ namespace passwall::gui
             this, &MainWindow::queueExportClose);
         connect(automaticBackup_, &services::AutomaticBackupCoordinator::activityChanged,
             this, [this](bool) { updateExportAction(); });
+        connect(automaticBackup_,
+            &services::AutomaticBackupCoordinator::generationalShutdownDrainChanged,
+            this, [this](services::GenerationalShutdownDrainState state) {
+                if (!generationalCloseDrainRequested_)
+                    return;
+                if (state.status == services::GenerationalShutdownDrainStatus::Completed
+                    || state.status == services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension)
+                    queueGenerationalDrainClose();
+            });
 #endif
         inactivityTimer_.setObjectName(QStringLiteral("vaultInactivityTimer"));
         // An absent preference uses one minute. A legacy/invalid preference
@@ -623,8 +676,12 @@ namespace passwall::gui
                 }
             });
         ui_->stackedWidget->setCurrentWidget(ui_->pageWelcome);
-        // Restaurer le dernier chemin de coffre utilisé.
-        ui_->unlockPathEdit->setText(settings.value("vault/lastPath").toString());
+        // Une indisponibilité peut être temporaire : ne pas effacer la
+        // préférence, mais ne jamais proposer un chemin absent ou ambigu.
+        const QString lastPath = settings.value("vault/lastPath", QString{}).toString();
+        ui_->unlockPathEdit->setText(settings.status() == QSettings::NoError
+                && admissibleLastVaultPath(lastPath)
+            ? lastPath : QString{});
         connect(ui_->createPageButton, &QPushButton::clicked,
                 this, [this]
                 { ui_->stackedWidget->setCurrentWidget(ui_->pageCreate); });
@@ -688,12 +745,23 @@ namespace passwall::gui
                 { editCredential(); });
         setLifecycleProtectionAvailable(lifecycleProtectionAvailable_);
     }
+#ifdef Q_OS_LINUX
+#ifdef PASSWALL_GUI_TESTING
+    std::unique_ptr<MainWindow> MainWindow::createForGenerationalTests(
+        QWidget* parent)
+    {
+        return std::unique_ptr<MainWindow>(new MainWindow(
+            services::BackupTriggerMode::Generational, parent));
+    }
+#endif
+#endif
     MainWindow::~MainWindow()
     {
         revokeReplacement();
 #ifdef Q_OS_LINUX
-        if (automaticBackup_) automaticBackup_->shutdown();
         exportCloseRequested_ = true;
+        if (automaticBackup_ && !vaultPath_.isEmpty())
+            automaticBackup_->requestPendingMutationsForLock(vaultPath_);
         if (backupJob_)
         {
             disconnect(backupJob_, nullptr, this, nullptr);
@@ -710,6 +778,7 @@ namespace passwall::gui
         }
         lockVault();
 #ifdef Q_OS_LINUX
+        if (automaticBackup_) automaticBackup_->shutdown();
         delete std::exchange(restoreController_, nullptr);
         delete std::exchange(backupSettingsController_, nullptr);
         delete std::exchange(recoveryController_, nullptr);
@@ -1120,8 +1189,6 @@ namespace passwall::gui
         if (!path.isEmpty())
         {
             ui_->unlockPathEdit->setText(path);
-            // Mémoriser le chemin choisi.
-            persistUiPreference("vault/lastPath", path);
         }
     }
     void MainWindow::createVault()
@@ -1271,8 +1338,27 @@ namespace passwall::gui
             {
 #ifdef Q_OS_LINUX
                 automaticBackup_->trackVault(registration);
+                // Inactive in current production: the default coordinator is
+                // Historical. This is the real session-cycle hook for the
+                // future immutable Generational selection. It carries no key
+                // or password, and the potentially long inspection runs on a
+                // dedicated thread owned indirectly by the coordinator.
+                if (automaticBackup_->triggerMode()
+                    == services::BackupTriggerMode::Generational) {
+                    services::AuthenticatedBackupSession backupSession;
+                    backupSession.vault = registration.file;
+                    backupSession.sessionGeneration = sessionGeneration_;
+                    backupSession.pendingMutationGeneration = 0;
+                    backupSession.authenticated = true;
+                    const auto launch =
+                        automaticBackup_->startInitialBackupInspectionAsync(
+                            services::GlobalBackupPreferencesStore().load(),
+                            std::move(backupSession),
+                            QDateTime::currentDateTimeUtc());
+                    Q_UNUSED(launch);
+                }
 #endif
-                persistUiPreference("vault/lastPath", path);
+                persistUiPreference("vault/lastPath", QFileInfo(path).absoluteFilePath());
                 return;
             }
         }
@@ -1523,8 +1609,14 @@ namespace passwall::gui
             return;
         }
         std::string error;
+#ifdef Q_OS_LINUX
+        const auto triggerMode = automaticBackup_ ? automaticBackup_->triggerMode()
+            : services::BackupTriggerMode::Historical;
+#else
+        constexpr auto triggerMode = services::BackupTriggerMode::Historical;
+#endif
         const bool success = services::CredentialService::add(
-            vaultPath_.toStdString(), dataKey_, credential, error);
+            vaultPath_.toStdString(), dataKey_, credential, error, triggerMode);
         wipeCredential(credential);
         if (!ensureLifecycleProtection())
             return;
@@ -1604,8 +1696,14 @@ namespace passwall::gui
         {
             return;
         }
+#ifdef Q_OS_LINUX
+        const auto triggerMode = automaticBackup_ ? automaticBackup_->triggerMode()
+            : services::BackupTriggerMode::Historical;
+#else
+        constexpr auto triggerMode = services::BackupTriggerMode::Historical;
+#endif
         const bool success = services::CredentialService::update(
-            vaultPath_.toStdString(), dataKey_, updated, error);
+            vaultPath_.toStdString(), dataKey_, updated, error, triggerMode);
         wipeCredential(updated);
         if (!ensureLifecycleProtection())
             return;
@@ -1663,8 +1761,14 @@ namespace passwall::gui
             return;
         }
         std::string error;
+#ifdef Q_OS_LINUX
+        const auto triggerMode = automaticBackup_ ? automaticBackup_->triggerMode()
+            : services::BackupTriggerMode::Historical;
+#else
+        constexpr auto triggerMode = services::BackupTriggerMode::Historical;
+#endif
         const bool success = services::CredentialService::remove(
-            vaultPath_.toStdString(), dataKey_, entryId, error);
+            vaultPath_.toStdString(), dataKey_, entryId, error, triggerMode);
         if (!success)
         {
             showError(QString::fromStdString(error));
@@ -1692,7 +1796,14 @@ namespace passwall::gui
         const QScopedValueRollback<bool> locking(vaultLockInProgress_, true);
 #ifdef Q_OS_LINUX
         if (restoreController_) restoreController_->onLock(reason == LockReason::Security);
-        if (automaticBackup_) automaticBackup_->setPaused(true);
+        if (automaticBackup_) {
+            if (reason != LockReason::ReplacementPreparation && !lockedSource.isEmpty()
+                && !externalLockClosing_)
+                automaticBackup_->requestPendingMutationsForLock(lockedSource);
+            else
+                automaticBackup_->stopModificationGrouping();
+            automaticBackup_->setPaused(true);
+        }
 #endif
         inactivityTimer_.stop();
         if (!vaultPath_.isEmpty() || !dataKey_.empty())

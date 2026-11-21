@@ -321,13 +321,53 @@ bool validateSnapshot(sqlite3* database, std::string& error)
     return true;
 }
 
+bool inspectSnapshotContents(sqlite3* database, SnapshotVaultContents& contents,
+    std::string& error)
+{
+    SnapshotVaultContents observed;
+    Statement metadata;
+    if (!prepare(database, "SELECT vault_id FROM vault_metadata WHERE id=1;",
+            metadata, error)) return false;
+    const int metadataCode = sqlite3_step(metadata.value);
+    if (metadataCode != SQLITE_ROW)
+        return sqlFailure(database, metadataCode,
+            "Lecture du vault_id impossible", error);
+    if (!blobOfSize(metadata.value, 0, 16))
+        return fail(error, "vault_id incompatible avec PassWall V1.");
+    std::memcpy(observed.vaultId.data(), sqlite3_column_blob(metadata.value, 0),
+        observed.vaultId.size());
+    const int metadataEnd = sqlite3_step(metadata.value);
+    if (metadataEnd != SQLITE_DONE)
+        return sqlFailure(database, metadataEnd,
+            "Fin de lecture du vault_id impossible", error);
+
+    Statement entries;
+    if (!prepare(database, "SELECT EXISTS(SELECT 1 FROM entries LIMIT 1);",
+            entries, error)) return false;
+    const int entriesCode = sqlite3_step(entries.value);
+    if (entriesCode != SQLITE_ROW)
+        return sqlFailure(database, entriesCode,
+            "Détection des entrées impossible", error);
+    if (sqlite3_column_type(entries.value, 0) != SQLITE_INTEGER)
+        return fail(error, "État de peuplement du coffre incompatible.");
+    observed.hasEntries = sqlite3_column_int(entries.value, 0) != 0;
+    const int entriesEnd = sqlite3_step(entries.value);
+    if (entriesEnd != SQLITE_DONE)
+        return sqlFailure(database, entriesEnd,
+            "Fin de détection des entrées impossible", error);
+    contents = observed;
+    return true;
+}
+
 } // namespace
 
 bool VaultSnapshotService::prevalidateVaultSource(const std::string& path,
-    std::string& error, SnapshotSourceIdentity* identity)
+    std::string& error, SnapshotSourceIdentity* identity,
+    SnapshotVaultContents* contents)
 {
     error.clear();
     if (identity) *identity = {};
+    if (contents) *contents = {};
     try {
         if (!validPath(path)) return fail(error, "Chemin de sauvegarde invalide.");
         const std::filesystem::path source(path);
@@ -351,9 +391,13 @@ bool VaultSnapshotService::prevalidateVaultSource(const std::string& path,
             return fail(error, "La sauvegarde n'est manifestement pas un fichier SQLite.");
 
         Database database;
+        SnapshotVaultContents observedContents;
         if (!openDatabase(path, true, database, error)
             || !validateSnapshot(database.value, error)
-            || !validateMetadata(database.value, error)) return false;
+            || !validateMetadata(database.value, error)
+            || (contents != nullptr
+                && !inspectSnapshotContents(database.value, observedContents, error)))
+            return false;
         if (database.close() != SQLITE_OK)
             return fail(error, "Fermeture du contrôle SQLite impossible.");
 
@@ -374,6 +418,7 @@ bool VaultSnapshotService::prevalidateVaultSource(const std::string& path,
             return fail(error, "La sauvegarde a changé pendant sa prévalidation.");
         if (identity) *identity = {
             std::uint64_t(original.st_dev), std::uint64_t(original.st_ino)};
+        if (contents) *contents = observedContents;
         return true;
     } catch (...) {
         try { error = "Prévalidation de la sauvegarde interrompue."; }
@@ -437,9 +482,13 @@ bool createSnapshotImpl(const std::string& sourcePath,
         return fail(error, "Des chemins absolus sans composante ambiguë sont requis.");
     storage::VaultOperationGuard ownedReservation;
     if (reservation) {
-        if (!reservation->matchesReservation(sourcePath, error))
-            return fail(error, "Réservation de la source non confirmée.");
-    } else if (!ownedReservation.tryReserve(sourcePath, error)) {
+        const bool confirmed = permission.check
+            ? reservation->matchesReservation(sourcePath, error)
+            : (reservation->matchesSnapshotAccess(sourcePath, error)
+                || reservation->matchesReservation(sourcePath, error));
+        if (!confirmed)
+            return fail(error, "Accès réservé à la source non confirmé.");
+    } else if (!ownedReservation.trySnapshotAccess(sourcePath, error)) {
         return false;
     }
     if (!permission.check && !VaultPreferencesStore::checkRecoveryAccess(sourcePath, error)) return false;

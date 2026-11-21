@@ -23,10 +23,19 @@ public:
     explicit BackupJob(QObject* parent = nullptr);
     explicit BackupJob(QString workerPath, QObject* parent = nullptr);
     ~BackupJob() override;
+    // Manual export entry point: retain an exclusive reservation until the
+    // worker has effectively terminated, including after an unknown result.
     bool start(const QString& source, const QString& destination);
     // Finalization runs on the owner thread, BEFORE releasing the reservation,
     // including after a facade was destroyed. It must not capture that facade.
     using Finalizer = std::function<void(BackupResult&, const storage::VaultOperationGuard&)>;
+    // New keyless snapshot path: shared with business SQL, serialized with
+    // other snapshots and incompatible with replacement reservations.
+    bool startSnapshotReserved(const QString& source, const QString& destination,
+        storage::VaultOperationGuard access, Finalizer finalize,
+        std::optional<SnapshotDirectoryIdentity> directory = {});
+    // Historical automatic-backup path. It intentionally remains exclusive
+    // until its persistent dirty/catalogue finalization is replaced.
     bool startReserved(const QString& source, const QString& destination,
         storage::VaultOperationGuard reservation, Finalizer finalize,
         std::optional<SnapshotDirectoryIdentity> directory = {},
@@ -53,6 +62,10 @@ private:
     bool started_ = false;
     bool active_ = false;
     QString startError_;
+    bool startWithAccess(const QString& source, const QString& destination,
+        storage::VaultOperationGuard access, Finalizer finalize,
+        std::optional<SnapshotDirectoryIdentity> directory,
+        std::optional<AutomaticBackupContext> automatic, bool snapshotAccess);
     friend class BackupProcessSession;
 };
 } // namespace passwall::services

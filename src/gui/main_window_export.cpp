@@ -37,8 +37,16 @@ void MainWindow::updateExportAction()
         || !lifecycleProtectionAvailable_ || hasOpenCredentialEditor());
     // Presentation only: do not poll/invalidate lifecycle protection while
     // updating a widget. Every real export boundary validates it explicitly.
+    const bool automaticOperationCompatible = !automaticBackup_
+        || automaticBackup_->admitUserOperation(
+            services::BackupUserOperation::ManualExport, vaultPath_).compatible;
+    const bool historicalAutomaticWorker = automaticBackup_
+        && automaticBackup_->triggerMode()
+            == services::BackupTriggerMode::Historical
+        && automaticBackup_->isActive();
     ui_->exportVaultButton->setEnabled(!exportInProgress_ && !exportCloseRequested_
-        && (!automaticBackup_ || !automaticBackup_->isActive())
+        && !historicalAutomaticWorker
+        && automaticOperationCompatible
         && !hasOpenCredentialEditor() && lifecycleProtectionAvailable_
         && !externalLockBlocksAccess() && !vaultLockInProgress_
         && !vaultPath_.isEmpty() && !dataKey_.empty() && sessionGeneration_ != 0);
@@ -50,7 +58,10 @@ bool MainWindow::exportAuthorizationCurrent(native::VaultLease lease, const QStr
 }
 void MainWindow::exportVault()
 {
-    if (automaticBackup_ && automaticBackup_->isActive()) {
+    if (automaticBackup_
+        && automaticBackup_->triggerMode()
+            == services::BackupTriggerMode::Historical
+        && automaticBackup_->isActive()) {
         statusBar()->showMessage(tr("Une sauvegarde automatique est déjà en cours."));
         return;
     }
@@ -62,6 +73,14 @@ void MainWindow::exportVault()
     const auto lease = acquireLease();
     const QString source = absoluteSourcePath(vaultPath_); // Non-secret authorization context only.
     if (!lease.unlocked || source.isEmpty()) return;
+    if (automaticBackup_) {
+        const auto admission = automaticBackup_->admitUserOperation(
+            services::BackupUserOperation::ManualExport, source);
+        if (!admission.compatible) {
+            statusBar()->showMessage(admission.diagnostic);
+            return;
+        }
+    }
     const QPointer<MainWindow> guarded(this);
     exportInProgress_ = true;
     bool handedOff = false;
@@ -109,8 +128,32 @@ void MainWindow::exportVault()
     // The dialogs may run nested Qt loops. Same path is insufficient: require
     // the original generation, current lifecycle protection and no editor.
     if (!exportAuthorizationCurrent(lease, source)) return;
+    QString admissionError;
+    std::shared_ptr<services::ManualBackupOperationAdmission> manualAdmission;
+    if (automaticBackup_
+        && automaticBackup_->triggerMode()
+            == services::BackupTriggerMode::Generational) {
+        auto admission = automaticBackup_->acquireUserOperation(
+            services::BackupUserOperation::ManualExport, source,
+            admissionError);
+        if (!admission.valid()) {
+            statusBar()->showMessage(admissionError.isEmpty()
+                ? tr("Export différé : une sauvegarde automatique a pris la priorité.")
+                : admissionError);
+            return;
+        }
+        try {
+            manualAdmission = std::make_shared<
+                services::ManualBackupOperationAdmission>(std::move(admission));
+        } catch (...) {
+            statusBar()->showMessage(
+                tr("Impossible de conserver l'admission de l'export."));
+            return;
+        }
+    }
     exportLockPending_ = true;
-    requestExternalLock([guarded, source, destination](bool cleaned) {
+    requestExternalLock([guarded, source, destination,
+                         manualAdmission = std::move(manualAdmission)](bool cleaned) mutable {
         if (!guarded) return;
         guarded->exportLockPending_ = false;
         if (!cleaned || guarded->exportCloseRequested_) {
@@ -122,11 +165,13 @@ void MainWindow::exportVault()
         }
         // The existing acknowledgement runs only after the OUTER lock returned,
         // and blocks fresh sessions through the end of this callback.
-        guarded->startVaultExport(source, destination);
+        guarded->startVaultExport(source, destination,
+            std::move(manualAdmission));
     });
     handedOff = true;
 }
-void MainWindow::startVaultExport(const QString& source, const QString& destination)
+void MainWindow::startVaultExport(const QString& source, const QString& destination,
+    std::shared_ptr<services::ManualBackupOperationAdmission> admission)
 {
     if (!isFullyLocked() || exportCloseRequested_ || backupJob_) {
         exportInProgress_ = false;
@@ -186,11 +231,17 @@ void MainWindow::startVaultExport(const QString& source, const QString& destinat
     });
     // No GUI event processing between confirmation of cleanup and start().
     // Its deferred child launch happens only after this callback returns.
-    const bool started = job->start(source, destination);
+    QString admittedStartError;
+    const bool started = admission && admission->generational()
+        ? admission->startExport(*job, source, destination,
+            admittedStartError)
+        : job->start(source, destination);
     if (!started) {
         backupJob_.clear();
         job->deleteLater();
-        dialog->showResult({services::BackupOutcome::FailedBeforePublication, job->startError()}, false);
+        dialog->showResult({services::BackupOutcome::FailedBeforePublication,
+            admittedStartError.isEmpty() ? job->startError()
+                                         : admittedStartError}, false);
     }
     dialog->show(); // Modeless, no nested loop during backup.
 }
@@ -205,6 +256,16 @@ void MainWindow::queueExportClose()
 {
     QTimer::singleShot(0, this, [this] { close(); });
 }
+void MainWindow::queueGenerationalDrainClose()
+{
+    if (generationalDrainCloseQueued_)
+        return;
+    generationalDrainCloseQueued_ = true;
+    QTimer::singleShot(0, this, [this] {
+        generationalDrainCloseQueued_ = false;
+        close();
+    });
+}
 void MainWindow::closeEvent(QCloseEvent* event)
 {
     exportCloseRequested_ = true; // Fail-closed while asynchronous close runs.
@@ -212,10 +273,63 @@ void MainWindow::closeEvent(QCloseEvent* event)
     // requests cancellation, never waits in a QProcess destructor or reports a
     // positive cleanup acknowledgement while an unconfirmed child holds secrets.
     if (restoreJob_) restoreJob_->cancel();
+    const bool generational = automaticBackup_
+        && automaticBackup_->triggerMode()
+            == services::BackupTriggerMode::Generational;
+    if (generational) {
+      const bool firstDrainClose = !generationalCloseDrainRequested_;
+      const auto drainState = automaticBackup_->generationalShutdownDrainState();
+      const bool terminal = drainState.status
+	== services::GenerationalShutdownDrainStatus::Completed
+	|| drainState.status
+	== services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension;
+      if (!generationalCloseDrainRequested_ || !terminal) {
+	event->ignore();
+	ui_->centralwidget->setEnabled(false);
+	if (!generationalCloseDrainRequested_) {
+	  generationalCloseDrainRequested_ = true;
+	  QString drainError;
+	  if (!automaticBackup_->beginGenerationalShutdownDrain(drainError)) {
+	    // No progressive state can be supervised.  Fall back to
+	    // the pre-existing fail-closed shutdown path; do not
+	    // claim that an unstarted generation was saved.
+	    automaticBackup_->shutdown();
+                    if (!automaticBackup_->canClose())
+                        return;
+                    queueGenerationalDrainClose();
+                    return;
+                }
+            }
+            // lockVault() captures a committed generation before clearing the
+            // session, synchronously wipes keys and prevents new GUI work.
+            // The drain has already captured the current generation, but its
+            // queued dispatch still cannot run before this cleanup returns.
+            if (firstDrainClose) lockVault();
+            const auto current = automaticBackup_->generationalShutdownDrainState();
+            if (current.status == services::GenerationalShutdownDrainStatus::Completed
+                || current.status == services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension)
+                queueGenerationalDrainClose();
+            return;
+        }
+        // A terminal drain has no active worker.  Do not call shutdown(): its
+        // immediate semantics are intentionally distinct from the drain.
+        externalLockClosing_ = true;
+        lockVault();
+        if (exportDialog_) exportDialog_->accept();
+        QMainWindow::closeEvent(event);
+        return;
+    }
+    // Capture the last committed generation synchronously before entering the
+    // fail-closed window state. Delivery remains deferred and cannot delay the
+    // cleanup below.
+    if (automaticBackup_ && !vaultPath_.isEmpty())
+        automaticBackup_->requestPendingMutationsForLock(vaultPath_);
     if (automaticBackup_ && !automaticBackup_->canClose()) {
         automaticBackup_->shutdown();
         if (!automaticBackup_->canClose()) {
             event->ignore();
+            // Secret cleanup and Native Messaging invalidation never wait for
+            // actual child termination.
             lockVault();
             return;
         }

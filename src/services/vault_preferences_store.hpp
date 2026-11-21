@@ -143,6 +143,11 @@ public:
     // errors and ambiguous known identities fail closed. No backup is started.
     [[nodiscard]] bool prepareMutation(const QString& path,
         storage::VaultOperationGuard& access, QString& error) const;
+    // Generation-based CRUD admission: keep the business reservation,
+    // historical recovery fence and registered physical identity checks, but
+    // do not update backupRequired or any other historical backup state.
+    [[nodiscard]] bool admitGenerationalMutation(const QString& path,
+        storage::VaultOperationGuard& access, QString& error) const;
     [[nodiscard]] bool beginAutomaticBackup(const VaultRegistration& expected,
         const SnapshotDirectoryIdentity& directory, const QString& destination,
         const QString& attempt, const storage::VaultOperationGuard& reservation, QString& error,
@@ -175,31 +180,32 @@ public:
         VaultFileIdentity& output, QString& error);
 
 private:
-    [[nodiscard]] bool updatePreferencesImpl(const QString& localId,
-        const VaultRegistration* expected, const VaultBackupPreferences&, QString& error) const;
-    friend class VaultReplacementAuthorization;
+  [[nodiscard]] bool updatePreferencesImpl(const QString& localId,
+					   const VaultRegistration* expected, const VaultBackupPreferences&, QString& error) const;
+  friend class VaultReplacementAuthorization;
+  friend class ManualBackupOperationAdmission;
 #ifdef PASSWALL_REPLACEMENT_TESTING
-    friend class ReplacementTestAccess;
+  friend class ReplacementTestAccess;
 #endif
-    [[nodiscard]] static bool inspect(const QString& path,
-        const storage::VaultOperationGuard* reservation, VaultFileIdentity& output, QString& error);
-    [[nodiscard]] static bool inspectReserved(const QString& path,
-        const storage::VaultOperationGuard& reservation, VaultFileIdentity& output, QString& error);
-    [[nodiscard]] bool writeReplacementIntent(const QString& localId,
-        const VaultFileIdentity& expected, const VaultReplacementIntent& intent, QString& error) const;
-    [[nodiscard]] bool resolveReplacement(const QString& localId,
-        const VaultReplacementIntent& expected, const VaultFileIdentity& observed,
-        bool completed, QString& error, RegistryPersistence* persistence = nullptr) const;
-    [[nodiscard]] bool confirmReplacementIdentity(const QString& localId,
-        const VaultReplacementIntent& expected, const VaultFileIdentity& observed,
-        QString& error, RegistryPersistence* persistence = nullptr) const;
-    // Recovery-only two-write abort: first persist the proved unchanged
-    // principal WITHOUT lifting the fence, then retain a bounded abort receipt.
-    [[nodiscard]] bool confirmPreparedAbandonment(const QString&, const VaultReplacementIntent&,
-        const VaultFileIdentity&, QString&) const;
-    [[nodiscard]] bool resolvePreparedAbandonment(const QString&, const VaultReplacementIntent&,
-        const VaultFileIdentity&, QString&) const;
-    QString settingsFile_;
+  [[nodiscard]] static bool inspect(const QString& path,
+				    const storage::VaultOperationGuard* reservation, VaultFileIdentity& output, QString& error);
+  [[nodiscard]] static bool inspectReserved(const QString& path,
+					    const storage::VaultOperationGuard& reservation, VaultFileIdentity& output, QString& error);
+  [[nodiscard]] bool writeReplacementIntent(const QString& localId,
+					    const VaultFileIdentity& expected, const VaultReplacementIntent& intent, QString& error) const;
+  [[nodiscard]] bool resolveReplacement(const QString& localId,
+					const VaultReplacementIntent& expected, const VaultFileIdentity& observed,
+					bool completed, QString& error, RegistryPersistence* persistence = nullptr) const;
+  [[nodiscard]] bool confirmReplacementIdentity(const QString& localId,
+						const VaultReplacementIntent& expected, const VaultFileIdentity& observed,
+						QString& error, RegistryPersistence* persistence = nullptr) const;
+  // Recovery-only two-write abort: first persist the proved unchanged
+  // principal WITHOUT lifting the fence, then retain a bounded abort receipt.
+  [[nodiscard]] bool confirmPreparedAbandonment(const QString&, const VaultReplacementIntent&,
+						const VaultFileIdentity&, QString&) const;
+  [[nodiscard]] bool resolvePreparedAbandonment(const QString&, const VaultReplacementIntent&,
+						const VaultFileIdentity&, QString&) const;
+  QString settingsFile_;
 };
 
 } // namespace passwall::services

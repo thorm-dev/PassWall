@@ -2,6 +2,7 @@
 #include "services/vault_lifecycle_service.hpp"
 #include "services/credential_service.hpp"
 #include "storage/sqlite_connection_config.hpp"
+#include "storage/vault_operation_guard.hpp"
 #include "storage/vault_storage.hpp"
 #include "posix_test_io.hpp"
 
@@ -853,7 +854,12 @@ TEST_F(VaultSnapshotServiceTest, ConcurrentReaderAndCommittedWriterProduceOneCoh
     destination = directory.filePath("concurrent.pwdb").toStdString();
     probe = Probe{};
     probe.betweenSteps = [&] {
-        // A real second connection commits BETWEEN incremental source reads.
+        // A cooperating business connection and a real SQLite connection commit
+        // BETWEEN incremental source reads. Replacement remains excluded.
+        passwall::storage::VaultOperationGuard business, replacement;
+        std::string guardError;
+        ASSERT_TRUE(business.tryAccess(source, guardError)) << guardError;
+        EXPECT_FALSE(replacement.tryReserve(source, guardError));
         // Mutate ciphertext as opaque data; no key is available to this job.
         execute(source, "BEGIN IMMEDIATE; UPDATE entries SET ciphertext=zeroblob(length(ciphertext)); COMMIT;");
     };

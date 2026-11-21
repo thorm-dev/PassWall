@@ -1,26 +1,61 @@
-# PassWall — Documentation technique du projet et état des réalisations
+# PassWall — Référence technique unique
 
-**Version :** 1.29
-**Date :** 16 novembre 2026
-**Statut :** GUI 8A/8B, récupération utilisateur 8C-1c et verrouillage automatique obligatoire 8C-2 implémentés. La restauration 1.29 prévalide désormais les sources manifestement invalides avant verrouillage/`prepared` et résout automatiquement les refus structurés certainement non engagés, uniquement par l'abandon contrôlé existant. Le build CMake courant est limité aux exécutables de production et à leurs dépendances ; tests et outils indépendants restent disponibles par cibles explicites. La version applicative provient de CMake et `passwall_app --version`/`-v` l'affiche sans initialiser Qt ni les services. La version 1.26 est validée sur GitHub ARM64 ; les versions 1.27 à 1.29 restent à confirmer après publication. Nettoyage des artefacts et états insuffisamment prouvés restent ouverts.
+**Révision documentaire :** 22 novembre 2026 — vidange générationnelle et fermeture GUI de test (2I-4F-4A/4B), validations ciblées
 
-## 1. Présentation
+**Version applicative actuelle :** 1.29.0
 
-PassWall est un gestionnaire de mots de passe dont le développement vise d'abord Linux sur Raspberry Pi 5. L'arbre courant contient un coffre chiffré local, une interface graphique indépendante du moteur et une intégration Firefox par Native Messaging. Le fichier de coffre chiffré est autonome : une copie cohérente peut être ouverte avec son mot de passe maître sur une installation compatible, sans autorisation de la machine d'origine. Les copies évoluent indépendamment, sans propagation automatique ; l'utilisateur assure leurs transferts et leur cohérence.
+**Plateforme prioritaire :** Linux ARM64, Raspberry Pi 5, Debian 13, Qt 6
 
-La priorité est la sécurité : chiffrement au repos, protection des clés, réduction de la durée de présence des secrets en mémoire, verrouillage du coffre et contrôles locaux des opérations et de récupération.
+**Portée :** état réel du code, architecture cible validée, garanties, limites et travaux restants
 
-Ce document distingue décisions validées, composants implémentés et travaux non implémentés. « Implémenté et testé » désigne du code présent, des tests correspondants et une validation antérieure rapportée dans le périmètre indiqué ; la présence d'un fichier ou d'un contrat ne suffit pas. Il ne constitue pas une certification de sécurité. Le TODO décrit les prochains travaux sans répéter tous les contrats détaillés ici.
+## 1. Objet et statuts
 
-## 2. Environnement connu
+Ce fichier est l'unique référence technique de PassWall. Il remplace la séparation historique entre documentation et TODO. Le code actuel reste la source de vérité pour les comportements présents ; les décisions validées ci-dessous définissent la cible sans présumer qu'elle est déjà implémentée.
 
-| Élément | Valeur relevée |
+Les statuts employés sont :
+
+- **VALIDÉ** : décision approuvée pour l'architecture cible ;
+- **IMPLÉMENTÉ** : comportement réellement présent dans le code ;
+- **TESTÉ** : comportement vérifié dans le périmètre explicitement indiqué ;
+- **À FAIRE** : modification, validation ou fonctionnalité encore nécessaire ;
+- **À DÉFINIR** : choix technique ou fonctionnel non résolu.
+
+Une fonctionnalité peut donc être **VALIDÉE** mais non **IMPLÉMENTÉE**. Un résultat **TESTÉ** sur un composant, un bus privé ou un coffre fictif ne constitue pas une certification générale ni une validation sur toutes les plateformes.
+
+## 2. Périmètre du produit
+
+### 2.1 Fonctions présentes
+
+- **IMPLÉMENTÉ** — coffres SQLite chiffrés, autonomes et portables ;
+- **IMPLÉMENTÉ** — création, ouverture, verrouillage et opérations CRUD sur les identifiants ;
+- **IMPLÉMENTÉ** — interface Qt 6 Widgets, générateur de mots de passe et validation des champs obligatoires ;
+- **IMPLÉMENTÉ** — intégration Firefox par Native Messaging ;
+- **IMPLÉMENTÉ** — verrouillage automatique obligatoire, protection Linux par logind et coordination avec swaylock ;
+- **IMPLÉMENTÉ** — instantanés SQLite, export manuel, sauvegardes automatiques, rotation et processus auxiliaire ;
+- **IMPLÉMENTÉ** — restauration par remplacement complet, worker asynchrone, supervision et récupération contrôlée fondée sur des preuves persistantes historiques ;
+- **VALIDÉ** — la cible simplifie cette restauration sans journal permanent PassWall ni reprise automatique ou semi-automatique après interruption ;
+- **IMPLÉMENTÉ** — version applicative issue de CMake et options `--version` / `-v` ;
+- **À FAIRE** — refonte des préférences et sauvegardes selon la cible de la section 5 ;
+- **À FAIRE** — TOTP, passkeys et audit des mots de passe ;
+- **À FAIRE** — installation et distribution reproductibles ;
+- **À FAIRE** — validation Windows ; iOS reste ultérieur.
+
+### 2.2 Hors périmètre actuel
+
+- **VALIDÉ** — aucun serveur de référence, synchronisation automatique ou fusion entre copies ;
+- **VALIDÉ** — aucun mécanisme d'autorisation ou de révocation des appareils ;
+- **VALIDÉ** — aucune récupération cryptographique possible sans le mot de passe maître ;
+- **VALIDÉ** — les copies d'un même coffre évoluent indépendamment et leurs divergences relèvent de l'utilisateur.
+
+## 3. Environnement et construction
+
+### 3.1 Environnement de développement connu
+
+| Élément | Version ou environnement relevé |
 |---|---|
-| Matériel | Raspberry Pi 5, 8 Go |
-| OS | Debian 13.7 Trixie |
-| Bureau | labwc / wlroots |
-| Navigateur | Firefox |
-| Éditeur | Visual Studio Code |
+| Matériel prioritaire | Raspberry Pi 5, 8 Go |
+| Système | Debian 13.7 Trixie, ARM64 |
+| Bureau | labwc / wlroots / Wayland |
 | Compilateur | GCC/G++ 14.2.0 |
 | CMake | 3.31.6 |
 | Ninja | 1.12.1 |
@@ -28,956 +63,882 @@ Ce document distingue décisions validées, composants implémentés et travaux 
 | libsodium | 1.0.18 |
 | SQLite | 3.46.1 |
 | Git | 2.47.3 |
-| GoogleTest | installé et détecté par CMake |
 
-Ces versions proviennent des relevés communiqués pendant le développement et doivent être revérifiées sur la machine actuelle.
+Ces valeurs sont des relevés de développement et doivent être revérifiées avant une diffusion.
 
-## 3. Technologies et périmètre fonctionnel
+### 3.2 CMake et exécutables
 
-Technologies : C++20, Qt 6 Widgets/Core/Network/DBus, Qt Designer, QSS, libsodium, SQLite, JavaScript, CMake et GoogleTest. Le générateur CMake peut être Ninja ou Make selon le répertoire de compilation.
+- **IMPLÉMENTÉ** — `project(PassWall VERSION 1.29.0 ...)` est la source unique de version.
+- **IMPLÉMENTÉ** — `passwall_app --version` et `passwall_app -v` écrivent `PassWall 1.29.0` puis quittent avant l'initialisation de Qt et des services.
+- **IMPLÉMENTÉ** — une compilation sans cible explicite construit les cinq exécutables Linux de production et leurs dépendances : `passwall_app`, `passwall_backup_worker`, `passwall_restore_worker`, `passwall_native_host` et `passwall-session-lock`.
+- **IMPLÉMENTÉ** — tests, probes, `passwall_env_check` et `passwall_argon2_benchmark` sont exclus du build courant mais restent compilables explicitement.
+- **IMPLÉMENTÉ** — la cible `passwall_all_tests` construit les binaires enregistrés auprès de CTest.
+- **IMPLÉMENTÉ** — la cible CMake canonique est `SQLite3::SQLite3`, avec alias de compatibilité local si la version de CMake ne la fournit pas ; aucun hook `CMAKE_PROJECT_INCLUDE` externe n'est requis.
 
-Périmètre v1 défini :
-- coffre chiffré et gestion des identifiants — implémentés ;
-- extension Firefox pour rechercher un compte et remplir les champs — implémentée et essayée manuellement avec Firefox le 6 novembre 2026 ; installation locale manuelle, non empaquetée dans le dépôt ;
-- générateur de mots de passe — implémenté et testé ;
-- registre local, exclusion métier, suivi des modifications, moteur d'instantané, auxiliaire de sauvegarde, export manuel Qt, sauvegardes automatiques et rotation — implémentés ; l'interface de réglage et de reprise 8B réutilise ces composants, sans second moteur ;
-- restauration par remplacement d'un principal existant — moteur unique 6B, auxiliaire asynchrone 7 et parcours GUI 8A ; récupération utilisateur limitée aux preuves reconnues en 8C-1, pas un déblocage universel ;
-- TOTP — à développer ;
-- portabilité du fichier sans lien cryptographique à une machine — présente dans le format et le chemin d'ouverture ; contrôles locaux et limites de validation détaillés en sections 4.3 et 5.10 ;
-- passkeys — à développer ;
-- audit des mots de passe — à développer.
-
-L'intégration aux applications locales du système a été reportée après stabilisation du coffre et de Firefox.
-
-La synchronisation automatique, la résolution de conflits entre copies et un serveur de référence ne font pas partie du périmètre actuel. Ce sont d'éventuelles évolutions nécessitant une nouvelle décision, pas des fonctionnalités déjà planifiées.
-
-## 4. Décisions de conception validées
-
-### 4.1 Stockage et modèle
-
-- Une base SQLite locale par coffre ; les coffres sont cryptographiquement indépendants.
-- Notes chiffrées avec le reste de l'entrée.
-- Titre, nom d'utilisateur et mot de passe sont obligatoires, à l'ajout comme à la modification. La GUI et les services réutilisent `CredentialService::validate()`. Un titre ou nom d'utilisateur vide ou uniquement composé d'espaces Unicode est refusé, sans normaliser les valeurs acceptées. Le mot de passe est une donnée exacte : chaîne vide refusée, espaces conservés, y compris un mot de passe uniquement composé d'espaces. Les limites de taille restent appliquées.
-- La politique SQLite V1 est appliquée et relue par connexion : `journal_mode=DELETE`, `synchronous=EXTRA` (3), `secure_delete=ON` (1), `temp_store=MEMORY` (2), `busy_timeout=3000` ms, avec `NO_CKPT_ON_CLOSE` établi avant l'inspection du journal. `FULL` correspond à l'ancien état, remplacé après étude et mesures sur le Raspberry Pi. Détails et limites en section 5.2.
-- Si une migration est nécessaire, l'ouverture normale doit être bloquée et une migration contrôlée proposée après sauvegarde. Aucun moteur de migration n'est implémenté ; les versions incompatibles sont refusées. Les moteurs de sauvegarde et de restauration existants ne constituent pas une migration.
-
-### 4.2 Cryptographie
-
-Choix techniques documentés :
-- libsodium ;
-- Argon2id pour dériver une clé depuis le mot de passe maître, avec 3 itérations et 256 Mio de mémoire (`VaultArgon2Operations=3`, `VaultArgon2Memory=256 MiB`) ;
-- XChaCha20-Poly1305 pour le chiffrement authentifié ;
-- chiffrement individuel des entrées ;
-- `SecureBuffer` pour les clés et certains buffers sensibles.
-
-Le mot de passe maître est nécessaire pour déverrouiller le coffre. Aucun mécanisme de récupération n'est prévu si ce mot de passe est perdu.
-
-### 4.3 Portabilité des coffres et récupération
-
-- Aucun système d'appareils autorisés n'existe : ni enrôlement, approbation, liste de confiance, clé d'autorisation par appareil ou révocation. Ce modèle est abandonné, pas en attente d'implémentation.
-- Le fichier contient les métadonnées cryptographiques nécessaires au déchiffrement par son mot de passe maître. Le registre QSettings d'origine n'est pas requis et ne doit pas être transféré pour autoriser son ouverture.
-- Chaque copie est indépendante : modifier `password.db` copié de A vers B ne change pas le fichier resté sur A. L'utilisateur est responsable des transferts et de la cohérence ; aucune fusion ou résolution automatique des conflits n'est réalisée.
-- La récupération dépend de copies ou sauvegardes utilisables et du mot de passe maître. Aucune récupération centralisée ni contournement de la perte du mot de passe n'est prévu.
-
-« Autonome » décrit le fichier cryptographique, pas une dispense des protections de l'installation destinataire : version compatible, accès au stockage, politique SQLite, exclusion métier, surveillance Linux et porte de récupération restent applicables. Le registre local associe des préférences de sauvegarde à un fichier, pas un droit d'utilisation à une machine. L'inspection du chemin d'ouverture et ses limites sont détaillées en section 5.10 ; Windows et iOS ne sont pas validés par ce constat.
-
-### 4.4 Copies, sauvegardes et migrations
-
-- Fonctionnement local hors ligne, sans serveur ni infrastructure de confiance entre machines.
-- Pour transférer un coffre, privilégier un export/instantané confirmé par le mécanisme existant. Une copie directe n'est acceptable qu'une fois toutes les connexions et opérations d'écriture sur la source terminées ; être verrouillé visuellement ne prouve pas à lui seul cette quiescence, notamment si un auxiliaire est actif. Ne pas copier isolément le fichier principal pendant une transaction ou une restauration. Après incident, ne pas supprimer un journal/WAL/SHM pour fabriquer artificiellement un fichier autonome : faire établir un état cohérent par les chemins pris en charge.
-- Les préférences de sauvegarde sont locales, dans un seul fichier global QSettings, jamais dans le coffre SQLite. Chaque enregistrement possède trois réglages : automatique désactivé, destination non définie, sept versions conservées par défaut. L'ancienne piste de rétention de sept jours est remplacée par un nombre de versions.
-- Une activation demande une première copie ; les mutations marquent ensuite le coffre à sauvegarder et une demande est faite au verrouillage. Pas de copie supplémentaire si aucune modification n'est en attente. Un échec suspend les nouvelles tentatives jusqu'à une reprise explicite ; ni boucle de répétition automatique, ni destination de secours, ni reprise de fichier interrompu.
-- Aucune durée maximale globale pour une sauvegarde saine. Les limites de contention SQLite et les délais d'escalade après annulation sont distincts.
-- Export manuel : autorisation depuis une session déverrouillée, verrouillage et nettoyage effectifs avant démarrage. Les modifications non enregistrées d'un éditeur ne sont pas abandonnées pour lancer une sauvegarde.
-- Sauvegardes automatiques : `NomDuCoffre_JJ-MM-AAAA_HH-MM-SS.db`, suffixe d'opération en cas de collision. Rotation seulement des versions automatiques suffisamment identifiées, après nouvelle copie confirmée ; jamais des exports manuels, fichiers inconnus ou copies exceptionnelles de précaution.
-- Restauration V1 : remplacer intégralement un coffre principal existant, sans fusion, en conservant son association locale et ses anciennes sauvegardes ; le laisser verrouillé. Le fichier source est choisi librement, indépendamment du dossier automatique. Si les sauvegardes automatiques sont désactivées, une copie préalable obligatoire du principal, à l'emplacement choisi par l'utilisateur, doit réussir. Si elles sont activées, aucune copie supplémentaire ni condition de sauvegarde récente/disponibilité du dossier habituel n'est imposée. Le parcours GUI 8A existe ; la résolution utilisateur des opérations interrompues reste en 8C.
-- Pendant une sauvegarde ou restauration, interdire les écritures métier incompatibles sur le coffre concerné tout en gardant l'interface réactive. Une annulation demandée ne prouve pas qu'une publication a été empêchée. Un verrouillage de sécurité pendant la phase sensible de restauration demande son annulation (option A), à distinguer du verrouillage volontaire de préparation.
-- Exporter la configuration globale est une fonction distincte encore à développer ; son import n'est pas défini et n'est pas à inventer.
-
-Les sauvegardes locales ont donc été développées, mais le support NAS/systèmes de fichiers réseau n'est pas acquis : les destinations non prises en charge sont refusées sans repli. Aucun moteur de migration n'existe. La synchronisation entre copies n'est ni implémentée ni engagée dans le périmètre actuel. Les sauvegardes d'exécutables et de configuration labwc de la section 5.9 restent distinctes des sauvegardes de coffres.
-
-### 4.5 Interface et verrouillage
-
-- Interface Qt indépendante du moteur.
-- Interface modifiable sans modifier le moteur.
-- Qt Designer et QSS prévus.
-- Verrouillage manuel et par inactivité implémenté dans `MainWindow` : durée obligatoire de 1, 5, 15, 30 ou 60 minutes, défaut une minute. Il invalide la session native et nettoie la clé, les résumés en mémoire, les champs de saisie et le presse-papiers PassWall lorsqu'il est inchangé. Migration et réglage GUI : section 5.5 ; suivi au TODO, section 3.4.
-- Sous Linux, `LinuxSessionMonitor` traite les préparations de suspension/hibernation (`PrepareForSleep`) et d'arrêt/redémarrage (`PrepareForShutdown`) de logind, avec un inhibiteur de délai et une politique fail-closed. Cela ne constitue pas une interception garantie de toute fermeture de session, de tout crash ou arrêt forcé.
-- Le verrouillage d'écran par les raccourcis labwc configurés passe par `passwall-session-lock`, qui demande `Control1.Lock()` et attend son acquittement de nettoyage avant de tenter `/usr/bin/swaylock -p`, dans la limite du budget D-Bus de 1 500 ms. L'absence de réponse ne bloque pas la tentative de verrouillage de l'écran.
-- Décision définitive : `SessionGuard1` est supprimé ; aucune garde persistante globale, authentification globale supplémentaire ou modification du code de swaylock/labwc n'est retenue. Chaque coffre reste cryptographiquement indépendant et s'ouvre avec son propre mot de passe maître, sans obligation de rouvrir le dernier coffre. Le déverrouillage Linux ne restaure aucune ancienne session PassWall.
-
-## 5. Architecture logicielle connue
-
-| Domaine | Responsabilité |
-|---|---|
-| `core` | cryptographie, buffers sensibles, générateur de mots de passe et rapprochement d'origines Web |
-| `storage` | schéma et métadonnées SQLite, configuration vérifiée des connexions et exclusion coopérative |
-| `services` | credentials, cycle de vie, registre local, instantanés, pilotage des sauvegardes, catalogue/rotation et moteurs de restauration |
-| `models` | structures métier |
-| `gui` | interface Qt |
-| `native` | hôte Native Messaging Firefox, socket Unix local et traitement métier commun des requêtes |
-| `platform` | intégration Linux : logind, instance unique, service D-Bus de verrouillage et coordinateur d'écran |
-| `tests` | tests unitaires et d'intégration |
-
-Ce découpage est confirmé dans les sources inspectées. Les composants nouveaux et leurs limites sont détaillés en sections 5.10 à 5.19.
-
-La source unique de la version applicative est `project(PassWall VERSION 1.29.0 ...)` dans `CMakeLists.txt`. CMake transmet `PROJECT_VERSION` à la seule cible `passwall_app` par la définition privée `PASSWALL_VERSION`. Au tout début de `main()`, avant verrou d'instance Linux, `QApplication`, bridge ou lecture de préférences, `--version` et `-v` écrivent exactement `PassWall 1.29.0` suivi d'un retour à la ligne sur la sortie standard, puis terminent avec le code 0. Sans ces options, le chemin de démarrage reste inchangé.
-
-### 5.1 Moteur cryptographique
-
-Fichiers attestés : `crypto_engine.hpp` et `crypto_engine.cpp`.
-
-Fonctions connues : initialisation libsodium, génération de clés, dérivation Argon2id, chiffrement/déchiffrement XChaCha20-Poly1305 et gestion de `SecureBuffer`.
-
-`SecureBuffer` utilise `sodium_malloc`, initialise son buffer, interdit la copie, autorise le déplacement et nettoie/libère sa mémoire dans son destructeur. L'affectation par déplacement nettoie et libère la mémoire précédemment détenue par la destination.
-
-### 5.2 Stockage et cycle de vie
-
-Composants implémentés :
-- `vault_storage` ;
-- `vault_key_service` ;
-- `vault_lifecycle_service`.
-
-Ils participent à la création et à l'ouverture du coffre. La création utilise un fichier temporaire, des permissions `0600`, une synchronisation `fsync`, puis une publication qui refuse tout écrasement de destination existante. Le coffre stocke les métadonnées de clé et les entrées chiffrées, sans colonnes de credentials en clair.
-
-`VaultStorage` protège par RAII connexions, statements, messages SQLite et fichiers temporaires de création. Les statements sont finalisés avant la fermeture effective de leur connexion. Les nettoyeurs ne construisent pas de diagnostics allouants. Une exception avant publication nettoie le temporaire détenu ; une erreur ultérieure de synchronisation ou de suppression du nom temporaire ne doit jamais effacer le coffre final déjà publié.
-
-`storage::configureSqliteConnection()` (`sqlite_connection_config.hpp/.cpp`) est commun aux ouvertures de `VaultStorage`, de `CredentialService` et aux inspections/copies qui l'utilisent. Les réglages sont vérifiés avant les opérations métier, hors transaction :
-
-| Réglage | Contrôle effectif |
-|---|---|
-| `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` | Activation puis interrogation, valeur 1 exigée avant tout PRAGMA |
-| `main.journal_mode` | Nouveau fichier : demande explicite DELETE et vérification ; existant : lecture seulement, `delete` exigé |
-| `main.synchronous` | EXTRA, valeur 3 relue |
-| `main.secure_delete` | ON, valeur 1 relue |
-| `temp_store` | MEMORY, valeur 2 relue, options de compilation `TEMP_STORE` compatibles et vérifiables exigées |
-| `busy_timeout` | API `sqlite3_busy_timeout(3000)` contrôlée puis valeur 3000 relue |
-
-La configuration n'est pas supposée héritée d'une connexion précédente : le mode de journal est aussi inspecté à la réouverture et les autres réglages sont réappliqués. Toute valeur obligatoire absente ou invérifiable refuse l'opération. Un coffre WAL ou dans un autre mode inattendu est refusé sans conversion et sans suppression manuelle de WAL/SHM. `NO_CKPT_ON_CLOSE` empêche le checkpoint automatique à la fermeture de cette connexion, pas une récupération SQLite ni l'action d'autres connexions ; l'index `-shm` peut changer. Ce n'est pas une garantie d'immuabilité de tous les fichiers.
-
-EXTRA a été retenu pour renforcer la synchronisation liée à la suppression du journal DELETE. Les mesures FULL/EXTRA rapportées ne sont pas une expérience de coupure électrique et ne prouvent pas la durabilité physique d'un matériel donné. `secure_delete` et `temp_store` ne garantissent pas l'effacement de l'historique d'un SSD, d'un système de fichiers à snapshots, du swap ou des copies externes.
-
-### 5.3 Modèle Credential
-
-Le fichier communiqué `src/models/credential.hpp` définit :
-- `EntryId`, identifiant de 16 octets ;
-- version ;
-- titre ;
-- URL ;
-- nom d'utilisateur ;
-- mot de passe ;
-- notes.
-
-Les champs textuels sont des `std::string`. Le type reste une structure simple ; l'invariant V1 et les limites de taille sont imposés par `CredentialService::validate()`, réutilisé par la GUI. Le modèle ne garantit pas à lui seul l'effacement sécurisé de ses champs à la destruction.
-
-`CredentialSummary` contient uniquement l'identifiant, la version, le titre, l'URL et le nom d'utilisateur. Il ne contient ni mot de passe ni notes et sert à l'affichage et à la recherche sans collection durable de credentials complets dans `MainWindow`.
-
-### 5.4 CredentialService
-
-`CredentialService` gère l'ajout, la lecture, la liste, la modification et la suppression des entrées.
-
-Le fichier `src/services/credential_service.cpp` a été communiqué et examiné. Les champs d'une entrée sont sérialisés, chiffrés puis stockés dans SQLite ; la désérialisation reconstruit un objet `Credential`.
-
-`listSummaries()` traite les entrées une par une : déchiffrement temporaire, extraction des métadonnées et nettoyage du credential avant de poursuivre, sans vecteur intermédiaire de credentials complets. `get()` permet le chargement ciblé d'une entrée.
-
-`add()` construit d'abord un candidat vide et arme son `CredentialWiper` avant l'affectation des champs. Une exception pendant une copie partielle déclenche ainsi le nettoyage de l'objet déjà construit. `update()` évite la copie complète entrante, authentifie l'ancienne entrée puis l'efface avant de chiffrer la nouvelle ; l'entrée appartenant à l'appelant n'est pas effacée. Les tests d'injection d'allocation et de panne SQL couvrent ces chemins. Le chantier ciblé de durcissement mémoire est terminé, sans prétendre effacer toutes les anciennes allocations C++/Qt/SQLite.
-
-Les mutations gardent `BEGIN IMMEDIATE`, écriture puis `COMMIT`. L'ajout ne publie l'`EntryId` et la version qu'après commit réussi et état de fin confirmé. Les diagnostics sauvegardent le code primaire/étendu initial avant nettoyage et consultent `sqlite3_get_autocommit()` / `sqlite3_txn_state()` : annulation automatique avant commit, transaction active puis rollback confirmé, rollback échoué, état inconnu, ou absence de transaction après erreur de commit sont distingués. Autocommit actif après erreur ne prouve ni un rollback ni une réussite durable ; aucune reprise aveugle n'est tentée. Une erreur peut donc décrire une écriture déjà effectuée avec résultat non confirmé. Les diagnostics transactionnels n'incluent pas les valeurs des entrées ou le SQL lié.
-
-`authenticateAll()` parcourt et authentifie toutes les entrées, une à une avec nettoyeur armé avant lecture, sans collection complète durable. Il est utilisé par le moteur de restauration existant. L'exclusion et le suivi persistant avant mutation sont décrits en section 5.11.
-
-### 5.5 Interface graphique
-
-Fichiers attestés : `src/gui/main_window.hpp` et `src/gui/main_window.cpp`, ainsi qu'une interface Qt Designer associée.
-
-Fonctions présentes dans la version examinée : création/déverrouillage du coffre, affichage/filtrage, ajout, modification, suppression et verrouillage.
-
-La version examinée comporte un timer d'inactivité, le nettoyage de champs de saisie, le nettoyage de la liste au verrouillage et un mécanisme d'effacement conditionnel du presse-papiers. Des fonctions utilitaires de nettoyage de `QString`, `std::string` et `Credential` sont présentes. Le timer est armé avant le rafraîchissement d'une session utilisable ; aucune préférence ne permet désormais sa désactivation.
-
-**Politique obligatoire 8C-2 :** le menu « Sécurité → Délai de verrouillage automatique… » propose exactement 1, 5, 15, 30 et 60 minutes. `security/autoLockMinutes` conserve une valeur autorisée ; une préférence absente donne une minute, sans notification. Les anciennes valeurs 0, 10 et toute valeur invalide sont converties uniformément vers une minute avant publication d'une session. La migration utilise le mécanisme existant de persistance QSettings, avec validation préalable du registre et synchronisation atomique. Un registre illisible ou occupé n'est pas réécrit de force. En cas d'échec, une minute reste appliquée en mémoire et l'erreur est signalée ; la migration pourra être retentée au prochain démarrage. Une notification non modale annonce la migration, sans réapparaître lorsque la valeur enregistrée est déjà valide. Un échec d'enregistrement du choix GUI ramène également la protection en mémoire à une minute.
-
-Le `Qt::PreciseTimer` est démarré avant la publication de la session et les éventuelles boucles modales du rafraîchissement. Les événements utilisateur clavier, souris, molette, toucher et tablette observés par l'application réarment uniquement un timer déjà actif. Un changement de durée réarme une session encore utilisable ; après verrouillage, fermer ou accepter tardivement le dialogue ne réactive ni timer ni ancienne session. Les activités Native Messaging et les tâches de fond ne constituent pas une activité utilisateur. Le timeout emprunte le nettoyage existant de `lockVault()`, y compris les éditeurs ouverts, l'invalidation native et l'annulation de restauration sensible attendue par l'acquittement global.
-
-Cette politique mesure l'inactivité dans PassWall, pas celle de tout le bureau. Un thread GUI bloqué ou un processus suspendu peut retarder le traitement du timeout ; les protections logind restent complémentaires et aucune borne temps réel de nettoyage n'est promise. Les opérations asynchrones conservent leurs réservations et leur supervision : la modification du réglage n'ouvre aucun coffre et ne remplace pas les confirmations de terminaison ou de nettoyage distant.
-
-`MainWindow::lockVault()` invalide la génération Native Messaging et les transmissions encore détenues par l'application avant de détruire la clé. Les éditeurs nettoient immédiatement leurs champs et credentials temporaires avant leur rejet, sans dépendre de la fermeture d'une notification modale ; les nettoyeurs RAII restent une protection supplémentaire. Le nettoyage et l'acquittement externe restent sur le thread Qt propriétaire, avec protection contre les réentrances. Les événements logind et le coordinateur utilisent ce même verrouillage (section 5.9).
-
-**Migration mémoire réalisée :** l'ancienne collection `MainWindow::credentials_` de credentials complets a été remplacée par des `CredentialSummary`. L'édition et la récupération native utilisent un chargement ciblé et temporaire ; les credentials locaux disposent de nettoyeurs RAII. Cela réduit l'exposition durable sans garantir l'effacement de toutes les copies créées par les chaînes, les dialogues ou Qt.
-
-`createVault()` et `unlockVault()` arment les nettoyeurs du mot de passe maître avant remplissage. `takePassword()` limite les conversions, protège aussi les temporaires `QString`/UTF-8 et n'alloue pas volontairement dans les nettoyeurs de déroulement de pile ; seules les allocations Qt effectivement détachées sont effaçables sans copie supplémentaire. Les mots de passe locaux sont nettoyés avant les notifications ; erreur, mauvais mot de passe et exception ne publient pas de session. `addCredential()` nettoie son credential dès le retour du service, avant notification ou rafraîchissement, avec RAII conservé.
-
-La fenêtre enregistre/reconnaît le coffre après authentification, raccorde les demandes automatiques après nettoyage du verrouillage, et fournit l'export manuel via `main_window_export.cpp` / `VaultExportDialog`. Le menu « Coffre → Restaurer depuis une sauvegarde… » utilise `VaultRestoreDialog` et `VaultRestoreController`, reliés aux API internes 6A/7 de `main_window_replacement.cpp` (section 5.18). Le même menu propose les trois préférences et la reprise via `VaultBackupSettingsDialog`/`VaultBackupSettingsController` (section 5.19). Export de configuration et récupération complète restent absents.
-
-### 5.6 Extension Firefox et pont natif
-
-Le parcours de production effectivement utilisé est :
-
-Firefox → Extension PassWall → `passwall_native_host` → `NativeBridgeServer` → `MainWindow::handleNativeRequest()` → `NativeRequestProcessor` → `NativeVaultAccess` → Coffre PassWall.
-
-L'extension contient `popup` et `fill_script`. `popup.js` contacte l'hôte Native Messaging `org.passwall.native` ; `passwall_native_host` (`native_host.cpp`) communique avec `NativeBridgeServer` par socket Unix local. La réponse repart par le bridge et l'hôte vers l'extension.
-
-`NativeRequestProcessor` constitue l'unique implémentation métier du traitement Native Messaging. `MainWindow::handleNativeRequest()` est l'adaptateur lié à l'interface ; il délègue le traitement au processeur, tandis que `MainWindow` implémente `NativeVaultAccess` pour fournir l'état de session, les résumés et le chargement ciblé d'une entrée. Le processeur est compilé par `passwall_app` et par la cible de tests.
-
-Le popup revalide l'origine avant la récupération, et le script injecté la revalide avant de remplir les champs. Le mot de passe n'est récupéré qu'après la sélection d'un credential. `parseCanonicalEntryId()` exige exactement 32 caractères hexadécimaux minuscules pour les 16 octets ; le paramètre JSON doit être une chaîne. Le processeur vérifie origine et lease avant/après chargement et refuse les entrées disparues ou dont l'origine a changé. L'URL fournie par un client local n'est pas une preuve cryptographique du site visité ; les processus sous le même compte restent une hypothèse de confiance.
-
-`NativeRequestResponse` possède un `SecureBuffer` non copiable, transféré par déplacement au bridge, sans `QByteArray` propriétaire ni second buffer `framed` contenant le secret. Le JSON sensible est construit avec contrôle UTF-8/échappement sans placer le mot de passe dans un `QString`/`QJsonValue`. La limite commune est de 1 048 576 octets JSON après échappement, hors préfixe de quatre octets. Le bridge envoie préfixe puis payload par segments d'au plus 64 Kio, contrôle la génération avant les écritures et annule les réponses anciennes lors du verrouillage. Des tests déterministes de cette invalidation existent au niveau composant ; ils ne prouvent pas tous les entrelacements réels avec Firefox. L'hôte protège également sa réponse par `SecureBuffer`, gère les écritures partielles/EINTR et SIGPIPE, et refuse le lancement automatique si `open()`/`dup2()` ne permettent pas une redirection correcte des flux. Les copies internes Qt/noyau restent hors d'un effacement exhaustif garanti.
-
-Le fichier `firefox-extension/manifest.json` confirme l'identifiant `passwall-native-test@passwall.local` dans `browser_specific_settings.gecko.id`. Il s'agit de l'extension de test actuellement versionnée, nommée « PassWall - Test natif », utilisée temporairement pour la campagne manuelle. Cela ne constitue pas une validation du packaging ou de l'identifiant d'une future diffusion.
-
-**Installation locale Linux, actualisée au 7 novembre 2026 :**
-
-| Élément | Chemin installé |
-|---|---|
-| Application | `$HOME/.local/bin/passwall_app` |
-| Native Host | `$HOME/.local/bin/passwall_native_host` |
-| Manifeste Firefox | `$HOME/.mozilla/native-messaging-hosts/org.passwall.native.json` |
-
-Le champ `path` du manifeste pointe vers `$HOME/.local/bin/passwall_native_host`. Les deux exécutables sont installés avec les permissions `0755` ; leurs empreintes SHA-256 ont été comparées et correspondent aux versions compilées et testées, selon les vérifications d'installation rapportées. Le Host retrouve `passwall_app` dans son propre répertoire. L'application a été actualisée pour exposer `Control1.Lock()` ; le Native Host, déjà identique au candidat récent, n'a pas été remplacé. Le manifeste Firefox est resté inchangé.
-
-Cette installation est locale et manuelle. Le manifeste installé hors du dépôt ne doit pas être confondu avec un modèle versionné : le projet ne fournit toujours pas de procédure reproductible intégrée pour installer le Native Host et l'extension sur une nouvelle machine. Les essais réels sont détaillés en section 6.5.
-
-### 5.7 SiteMatcher
-
-`SiteMatcher` est implémenté et testé. Il accepte HTTP/HTTPS, compare schéma, hôte et port effectif, rejette les URL malformées et les informations d'utilisateur, et interprète une URL enregistrée sans schéma comme HTTPS. Les chemins et redirections ne participent pas à la comparaison d'origine.
-
-### 5.8 Générateur de mots de passe
-
-`PasswordGenerator` est implémenté sous forme d'en-tête, utilisé dans la boîte d'édition et testé. Il produit des mots de passe de 8 à 128 caractères avec `randombytes_uniform`, garantit la présence de chaque catégorie sélectionnée et mélange le résultat sans biais modulo.
-
-### 5.9 Verrouillage de session Linux
-
-Le parcours nominal configuré sur Raspberry Pi 5 / Debian 13 / labwc 0.20.2 est :
-
-`Ctrl+Alt+L` ou `Ctrl+Super+L` → `$HOME/.local/bin/passwall-session-lock` → bus D-Bus utilisateur → `org.passwall.PassWall.Control1.Lock()` → `MainWindow::requestExternalLock()` → `lockVault()` → acquittement après nettoyage → tentative de `/usr/bin/swaylock -p`.
-
-- `SessionLockService` expose `Lock() -> ()` sur le nom `org.passwall.PassWall`, chemin `/org/passwall/PassWall`. Il n'expose ni déverrouillage ni accès aux secrets. Une réponse positive sans argument acquitte le nettoyage applicatif vérifié ; une erreur ne l'acquitte pas.
-- Le coordinateur utilise un auxiliaire D-Bus sans activation automatique de PassWall. Son budget d'attente D-Bus est de 1 500 ms, démarrage de l'auxiliaire compris, et non une garantie temps réel globale. À l'expiration, il demande l'arrêt de l'auxiliaire sans attendre sa terminaison avant la tentative de lancement du verrouilleur.
-- PassWall absent, indisponible, refus ou délai expiré : le verrouillage de l'écran est tout de même tenté, sans annoncer un nettoyage du coffre confirmé. Le coordinateur déduplique ses invocations concurrentes par `flock`, sous réserve d'un répertoire d'exécution sûr ; les lancements directs de swaylock restent hors de cette coordination.
-- `LinuxSessionMonitor` et son backend Qt DBus restent indépendants du coordinateur. L'inhibiteur `delay` de logind pour `sleep:shutdown` est conservé jusqu'à l'acquittement du nettoyage sur le thread propriétaire. Sa validité effective est contrôlée par `poll()`, notamment avant d'autoriser une nouvelle session. Une perte de protection refuse l'accès aux secrets ; la récupération ne déverrouille jamais le coffre automatiquement. Un thread bloqué, un événement manqué ou l'expiration du délai accordé par logind restent des limites.
-- `LinuxInstanceLock` assure l'instance unique. `Control1.Lock()` est ponctuel : après son acquittement, une nouvelle authentification manuelle du coffre choisi est permise si les protections système et la porte de récupération de ce coffre l'autorisent. Il n'existe plus de `SessionGuard1`, de jeton de garde à libérer ni de registre de garde globale Wayland. Le registre local de préférences et les intentions de récupération par coffre sont des mécanismes distincts (sections 5.10 et 5.16).
-
-Le coordinateur est installé dans `$HOME/.local/bin/passwall-session-lock`, mode `0755`, propriétaire. Le fichier utilisateur `$HOME/.config/labwc/rc.xml` définit `C-A-l` vers ce chemin et conserve `C-W-l` avec `onRelease="yes"`. Labwc est lancé avec `--merge-config` (`-m`) : les définitions utilisateur identiques remplacent les définitions système, actions comprises, sans lancer les deux commandes. Le fichier `/etc/xdg/labwc/rc.xml` conserve sa définition originale `C-A-l` vers `swaylock -p`, désormais surchargée, et n'a pas été modifié.
-
-L'installation reste locale et manuelle. Aucun code de swaylock ou labwc n'a été modifié. Le verrouillage Wayland et son déverrouillage restent entièrement assurés par le système officiel, sans surveillance de leur état réel par PassWall.
-
-La déduplication utilise un fichier régulier privé `0600` dans `XDG_RUNTIME_DIR` (répertoire appartenant à l'utilisateur, mode `0700`), jamais supprimé au fil des invocations. Chaque invocation demande le nettoyage de PassWall, même si un coordinateur est déjà actif ; elle ne lance pas un deuxième verrouilleur si l'autre reste actif. Si l'exclusion ne peut pas être établie, un avertissement est émis et l'écran reste prioritaire, sans garantie de déduplication. Un crash du coordinateur ou une daemonisation du verrouilleur peut aussi interrompre ce suivi. L'indication du raccourci dans `pishutdown` peut disparaître, sa recherche de la commande directe `swaylock -p` ne reconnaissant pas nécessairement le coordinateur ; ce point reste ergonomique et ne justifie pas de modifier le paquet système.
-
-**Sauvegardes d'installation et retour arrière :** les relevés du 7 novembre situent les copies suivantes sous `$HOME/.local/share/passwall/backups/`, dans des répertoires privés `0700`, avec empreintes vérifiées lors des interventions :
-
-1. `pre-linux-pilot-20261107T030441Z-d0_ttewl/` : ancienne application, Host de précaution, métadonnées, empreintes, manifeste et configurations labwc avant le pilote.
-2. `labwc-pilot-shortcut-20261107T031234Z-IYlDvm6L/rc.xml` : configuration utilisateur avant ajout de `C-W-l`.
-3. `labwc-ctrl-alt-l-20261107T185614+0100-umwOy0vK/rc.xml` : avant surcharge de `C-A-l`, avec `C-W-l` déjà présent ; SHA-256 `f4651e422e179b0aeb52f05f65922bf2a9296664c36a2ac894fa2a3350e38408`. `SHA256SUMS` et `original-metadata.txt` sont dans le même répertoire.
-
-Pour revenir au seul raccourci habituel direct, sauvegarder d'abord la configuration courante et réconcilier les éventuels réglages ajoutés depuis. Le bloc suivant est une procédure de recours, non exécutée lors de cette mise à jour :
-
-```sh
-(
-set -eu
-passwall_backup="$HOME/.local/share/passwall/backups/labwc-ctrl-alt-l-20261107T185614+0100-umwOy0vK"
-(cd "$passwall_backup" && sha256sum --check SHA256SUMS)
-passwall_temp=$(mktemp "$HOME/.config/labwc/.rc.xml.retour.XXXXXX")
-cp --preserve=all "$passwall_backup/rc.xml" "$passwall_temp"
-mv -fT "$passwall_temp" "$HOME/.config/labwc/rc.xml"
-/usr/bin/labwc --reconfigure
-)
-```
-
-`Ctrl+Alt+L` retrouve alors l'action système directe, sans acquittement PassWall ; `Ctrl+Super+L` conserve le coordinateur. La deuxième sauvegarde permet aussi de retirer le pilote, avec les mêmes précautions. Un retour d'exécutables exige l'arrêt normal des processus, la vérification des empreintes/permissions et de la compatibilité application/Host. L'ancienne application ne possède pas `Control1.Lock()` : adapter les raccourcis si elle est restaurée. Le Host étant resté identique, son remplacement n'est pas nécessaire. Ne supprimer aucune sauvegarde ni restaurer de fichier système pour ce retour arrière. Ces copies ne sont pas des sauvegardes de coffres SQLite.
-
-Les chemins et validations d'installation ci-dessus sont des relevés historiques, pas une vérification des empreintes installées au 9 novembre. Les nouvelles fonctions de sauvegarde/restauration présentes dans les sources ne sont pas, pour autant, attestées dans les exécutables de `~/.local/bin`. Le futur déploiement doit aussi fournir l'auxiliaire de sauvegarde à côté de l'application.
-
-### 5.10 Registre local et préférences — étape 1
-
-`VaultPreferencesStore` utilise le fichier de `QSettings("PassWall", "PassWall").fileName()`, clé `vaultRegistry/data` contenant un registre JSON version 1. Ce fichier global conserve aussi les autres réglages de l'application. Il ne contient ni mot de passe maître, ni clé, ni credential déchiffré ; les chemins et métadonnées qu'il contient restent privés.
-
-Chaque `VaultRegistration` possède un UUID local indépendant du `vault_id` cryptographique. L'identification combine chemin, périphérique/inode et date de naissance lorsque disponible, avec lecture du `vault_id`. Les liens et identités ambiguës sont refusés. Une copie distincte ne reçoit pas les préférences ni les autorisations locales de sauvegarde du principal : elle peut obtenir un nouvel enregistrement par défaut lorsque l'original est identifiable ; un déplacement, remplacement inattendu ou original manquant peut imposer une réassociation explicite. Ni `vault_id` ni l'identité physique ne constituent seuls une preuve cryptographique ou une continuité garantie après toutes les copies/déplacements. Ce sont des contrôles de gestion locale, pas des autorisations d'appareil.
-
-Les trois préférences sont `automatic=false`, `directory` vide et `retainedVersions=7`. La GUI tente l'enregistrement après création/ouverture authentifiée ; création du coffre et publication du registre ne sont pas une transaction unique. Les appels directs au cycle de vie n'enregistrent pas automatiquement un coffre. Un échec tardif d'enregistrement ne doit donc pas être présenté comme une preuve que le fichier de coffre n'a pas été créé.
-
-Les mises à jour contrôlent les octets réellement présents, la structure du registre, l'identité attendue et la concurrence par un verrou de registre non bloquant. La synchronisation atomique QSettings est suivie de contrôles de permissions et de `fsync` du fichier/répertoire : parent privé `0700`, fichier `0600` sous Unix. Une configuration corrompue n'est pas réinitialisée silencieusement. Une erreur après publication peut laisser une modification visible sans durabilité confirmée.
-
-Un incident ordinaire d'association, avec registre lisible sans intention de restauration, peut laisser une session authentifiée utilisable avec avertissement non modal. Depuis 6A, un registre illisible/ambigu ne permet pas d'écarter une récupération en cours et refuse les accès concernés (section 5.16). La GUI de préférences 8B est décrite en section 5.19 ; la réassociation utilisateur et l'export global sans écrasement restent à développer, l'import à définir.
-
-**Portabilité vérifiée par lecture du code :**
-
-| Niveau | Comportement présent |
-|---|---|
-| Ouverture cryptographique | `VaultLifecycleService::unlockVault()` lit les métadonnées puis appelle `VaultKeyService::unlock()` ; la dérivation/désencapsulation utilise mot de passe, sel, paramètres et AAD du coffre, sans identité de machine ni clé QSettings |
-| Registre absent sur l'installation destinataire | `readRegistryOnDisk()` accepte l'absence du fichier ; `accessRegistry()` part d'un registre vide et `recoveryAccess()` autorise le fichier non enregistré si la configuration locale est accessible/sûre et aucun autre contrôle ne le refuse |
-| Enregistrement après ouverture GUI | `registerAuthenticatedVault()` appelle `recognizeOrRegister()` après authentification ; dans un registre neuf, nouvel UUID local et préférences désactivé/dossier vide/sept versions, sans héritage de la source |
-| Sécurité et ambiguïtés locales | Registre occupé, illisible ou corrompu : accès refusé faute d'état fiable ; intention 6A correspondant au chemin/inode : récupération requise. Une association ordinaire ambiguë est distincte d'un échec cryptographique et n'applique pas de préférences non confirmées |
-
-Aucune incompatibilité liée à la seule absence du registre d'origine n'a été identifiée dans ces chemins. Des tests existants couvrent registre absent, copies à préférences indépendantes et refus de récupération (`test_vault_preferences_store.cpp`, `test_vault_preferences_gui.cpp`, `test_vault_replacement.cpp`). Ils ne constituent pas un essai complet de transfert entre deux machines ; ce contrôle ciblé n'a exécuté aucun test. Supprimer un registre local contenant une intention 6A ou déplacer ses artefacts n'est pas une procédure de portabilité/récupération : cette information locale ne voyage pas automatiquement dans la copie et son absence ne prouve pas qu'une restauration d'origine était terminée.
-
-### 5.11 Exclusion métier et suivi persistant — étapes 2 et 3
-
-`VaultOperationGuard` utilise des `flock` coopératifs Linux : accès partagés conservés pendant toute la connexion métier, réservations exclusives non bloquantes pour les copies et opérations incompatibles. Deux identités sont protégées : répertoire parent + nom, et périphérique/inode du fichier. Cela couvre les alias physiques et conserve la réservation du nom lors d'un remplacement. Les fichiers de verrouillage privés sous `/tmp/.passwall-vault-operations-UID` ne sont pas supprimés au fil des opérations, pour éviter des espaces de verrouillage divergents.
-
-Les connexions de `VaultStorage`, `CredentialService` et les opérations de cycle de vie utilisent ces protections. Les descripteurs exclusifs sont transmis explicitement à l'auxiliaire, validés et conservés jusqu'à sa terminaison effective, même si son résultat est déjà `Unknown` ou si sa façade Qt a disparu. Une session déverrouillée de `MainWindow` ne conserve pas de garde partagé permanent : une réservation ne prouve donc pas l'effacement de la clé ; l'autorisation 6A traite précisément ce point.
-
-Avant le premier accès SQLite d'une mutation, `prepareMutation()` vérifie l'identité locale et persiste `backupRequired=true` si l'automatique est activé. Si cette persistance/durabilité échoue, le CRUD est refusé avant SQL. Le marqueur peut rester vrai après rollback ou exception : ce faux positif conservateur est accepté. Seule une sauvegarde confirmée peut le lever. Registre et SQLite ne partagent pas de transaction ; aucun événement GUI seul ne sert de preuve de modification sauvegardée.
-
-Cette exclusion n'est pas un verrou système imposé aux programmes tiers : elle suppose des participants coopératifs, le même espace `/tmp` et l'absence de suppression administrative de ses fichiers. Elle ne protège pas contre tous les processus malveillants du même UID, ni contre des espaces de montage isolés. Le support interprocessus hors Linux n'est pas validé.
-
-### 5.12 Moteur d'instantané SQLite
-
-`VaultSnapshotService::createSnapshot()` est un moteur synchrone sans clé. Il utilise l'API SQLite backup pour produire une copie cohérente des octets chiffrés, vérifie la structure, travaille dans un staging privé puis publie sans écrasement par `linkat`, après synchronisation du fichier. La synchronisation du répertoire confirme ensuite la durabilité demandée ; une erreur après le lien ne supprime jamais le fichier final. Une source nécessitant une récupération en écriture est refusée, sans ouverture de secours en lecture-écriture et sans `immutable=1`.
-
-Le moteur n'authentifie pas cryptographiquement les entrées par lui-même ; un hook interne de vérification de la copie privée est utilisé par la restauration. Les protections de chemins, permissions et identité sont maintenues au-delà des vérifications préalables.
-
-`createSnapshot()` conserve la porte de récupération, même avec une réservation exclusive fournie. L'exception préparée pour une copie de précaution est uniquement `VaultReplacementAuthorization::snapshotPrincipal()` (section 5.16) : elle ne transforme pas une réservation ordinaire en autorisation de restauration.
-
-Il n'existe plus de budget global de cinq secondes : une copie saine peut continuer et redémarrer selon SQLite sans plafond arbitraire. Trois résultats consécutifs `BUSY`/`LOCKED` arrêtent une tentative ; une progression `SQLITE_OK` remet ce compteur à zéro. Le timeout SQLite V1 reste distinct. L'annulation coopérative est contrôlée entre étapes et immédiatement avant publication ; une publication déjà engagée peut gagner la course et ne doit pas être rétractée.
-
-Les destinations admises sont locales et explicitement limitées : ext2/3/4, tmpfs, XFS, Btrfs, F2FS et overlayfs, avec support effectif de lien/synchronisation contrôlé. Les chemins ambigus, liens symboliques, destinations existantes et répertoires non sûrs sont refusés. NAS, systèmes réseau, FAT/exFAT et dossiers synchronisés ne constituent pas des supports validés ; aucune destination de repli n'est créée. Les appels système bloqués ne sont pas bornés par un timeout global.
-
-### 5.13 Auxiliaire de sauvegarde et pilotage asynchrone
-
-`passwall_backup_worker` et `BackupJob` séparent copie/rotation du thread GUI. L'auxiliaire est recherché par chemin explicite à côté de l'application, jamais dans `PATH`. Il ne reçoit aucune clé de déchiffrement. Le protocole privé de sauvegarde est un JSON versionné délimité par ligne, distinct du framing Native Messaging ; il transporte chemins, contexte et résultats bornés, pas des secrets.
-
-Les résultats distinguent réussite publiée, échec avant publication, durabilité non confirmée, annulation confirmée avant publication et `Unknown`. Un enregistrement terminal valide et une terminaison normale sont nécessaires après lancement : une sortie de processus seule ne vaut pas réussite. `copyConfirmed`, `finished` et `processTerminated` ont des sens différents ; une erreur de rotation ne transforme pas une copie confirmée en échec de copie.
-
-Après demande d'annulation, les délais d'escalade sont de 1 s coopérative, puis 1 s après SIGTERM, puis 1 s avant signalement d'arrêt non confirmé après SIGKILL. Ce ne sont ni des limites de durée de sauvegarde, ni une promesse qu'un enfant bloqué dans le noyau termine immédiatement. Un superviseur indépendant évite de détruire un `QProcess` actif et d'attendre dans son destructeur ; il conserve les réservations jusqu'à terminaison réelle. Fermeture du canal parent, signal de mort du parent et fermeture de l'application demandent l'arrêt, sans effacer une publication finale. Un arrêt forcé peut laisser du staging privé. Le processus auxiliaire n'est pas un sandbox complet.
-
-### 5.14 Export manuel et sauvegardes automatiques — étape 4
-
-L'export Qt (`main_window_export.cpp`, `VaultExportDialog`) est implémenté : sélection/confirmation autorisées par le lease initial, refus d'un éditeur ouvert, véritable acquittement de nettoyage avant lancement, affichage modeless du progrès/résultat et annulation. Les boucles modales de sélection ne permettent pas de réutiliser une ancienne session. Le coffre reste verrouillé ; le résultat ne sélectionne ni n'ouvre automatiquement un autre coffre.
-
-`AutomaticBackupCoordinator`, sans clé, est raccordé à `MainWindow`. Il traite l'activation des préférences, les demandes après verrouillage et la reprise explicite. Les contrôles de destination n'inventent pas de diagnostic : une erreur identifiable est expliquée, sinon le message reste générique. Un échec arme une suspension persistante et ne notifie pas à chaque nouvelle mutation. La reprise crée une nouvelle copie de l'état courant, sans conserver d'instantané ni de transfert à reprendre.
-
-Un accès occupé ou un éditeur fait différer la demande, sans jeter une saisie ni suspendre les sauvegardes pour une fausse panne. Les traitements sont reportés hors de la pile critique du verrouillage/acquittement. Les transitions système, l'export et la fermeture suspendent le dispatch approprié ; le nettoyage de sécurité demeure prioritaire. Une intention de restauration fait différer la demande sans armer de nouvelle tentative ou rotation, sans modifier sa suspension ; un prochain verrouillage normal ou une reprise explicite pourra redemander une copie.
-
-Les réglages par coffre et « Reprendre la sauvegarde » sont désormais proposés par 8B (section 5.19), sans changer les règles de ce coordinateur. Les essais Wayland historiques concernent l'export manuel ; ils ne valident pas la nouvelle fenêtre de préférences.
-
-### 5.15 Catalogue et rotation sécurisée — étape 5
-
-Le catalogue est conservé dans le même registre QSettings : opération, chemin, ordre de publication, génération de destination, durabilité et preuves du fichier chiffré. La rétention par défaut porte sur sept versions, pas sept jours. Un changement de dossier crée une nouvelle génération de destination ; revenir vers un ancien dossier ne réautorise pas silencieusement la suppression de ses anciennes versions.
-
-L'auxiliaire réalise la rotation après copie et association au catalogue confirmées, sous réservation continue du principal. `BackupRotationService` vérifie aussi la nouvelle copie, réserve les candidats et contrôle identités, répertoire/support, dates disponibles et SHA-256 des octets chiffrés avant suppression. Un nom ressemblant à une sauvegarde ne suffit jamais. Exports manuels, fichiers inconnus, versions anciennes sans preuves suffisantes, fichiers modifiés, liens et fichiers enregistrés comme principaux restent protégés. Des preuves de naissance/montage manquantes interdisent la suppression automatique plutôt que d'être inventées.
-
-Une intention persistante de rotation `prepared`/`running`, avec candidat de suppression, empêche de rejouer aveuglément une suppression après résultat inconnu. Échec de suppression, de synchronisation ou de catalogue conserve les preuves et ne provoque pas de suppression compensatrice d'autres fichiers. Une rotation échouée ne réarme pas à elle seule `backupRequired` et ne suspend pas une copie déjà réussie. Elle peut rester bloquée sans outil de résolution utilisateur actuel.
-
-Les preuves et empreintes ne sont pas des MAC ni une défense absolue contre un processus malveillant du même UID. La vérification finale du nom et `unlinkat` restent deux appels distincts. L'annulation est coopérative : sa demande n'acquitte ni sa réception ni l'arrêt des suppressions. Le diagnostic et les deux ordres déterministes de régression sont détaillés en section 6.3 ; le moteur et le protocole de production sont inchangés.
-
-### 5.16 Restauration existante et remplacement — étapes 6A, 6A-bis et 6B
-
-**API historique retirée en version 1.23 :** `VaultRestoreService::restoreBackup()`, qui publiait une sauvegarde vers un nouveau fichier, n'avait aucun appelant de production depuis l'adoption du remplacement 6B. Son implémentation, sa cible `passwall_restore_tests` et ses 23 tests dédiés ont été supprimés. Les scénarios encore uniques et applicables ont été transférés dans `VaultReplacementEngineTest` : plaintext correctement authentifié mais invalide au regard du contrat métier, source FIFO refusée sans blocage et échec d'allocation pendant la reconstruction d'un credential avec nettoyage des champs déjà construits. Les autres garanties restent couvertes par les tests de l'instantané, de SQLite V1, de `CredentialService` et du moteur 6B. Les lignes `passwall_restore_tests` plus bas sont conservées uniquement comme résultats historiques de campagnes antérieures ; cette cible n'existe plus dans l'état courant.
-
-**Fondations 6A conservées par le moteur 6B :** `VaultReplacementAuthorization` est une autorisation opaque, non copiable, déplaçable, non reconstructible depuis un booléen ou un UUID. Elle lie identifiant local, identité initiale, opération et réservation exclusive. Seul `MainWindow::requestReplacementAuthorization()` l'émet en production, sur le thread propriétaire, après son vrai acquittement de nettoyage. L'émetteur simulé n'est compilé que dans `passwall_replacement_tests`.
-
-La fenêtre barre les nouvelles ouvertures pendant la transition, refuse les opérations incompatibles/éditeurs sans attendre leur fermeture et réserve le principal avant son verrouillage. Le verrouillage volontaire de préparation se distingue d'un verrouillage de sécurité, qui révoque l'autorisation, même réentrant. Les inspections SQLite et l'empreinte sont réalisées après nettoyage. La validité du nettoyage, de la protection Linux et des réservations est recontrôlée ; aucune session ancienne n'est restaurée. Une réservation exclusive seule n'est jamais assimilée à une preuve d'effacement.
-
-Une intention versionnée dans le registre contient opération, identité précédente/empreinte, candidat éventuel et références de récupération, sans secret. Sa persistance doit réussir avant publication. Les chemins privés assurent la finalisation sous réservation du nom et de l'inode candidat, sans affaiblir `matchesReservation()` des sauvegardes. En 6B, `candidateDigest` lie les octets chiffrés intégralement authentifiés au candidat et à la reprise. Les anciens contrats sans cette empreinte restent lisibles, mais leur état `armed` n'autorise pas la nouvelle reprise spécialisée. Une empreinte n'est pas une authentification : celle-ci précède son enregistrement par le moteur vivant.
-
-**Durcissement 6A-bis :** l'ancien chemin supprimait l'intention avant la confirmation de durabilité du registre. Une publication QSettings suivie d'une erreur d'ouverture/`fsync` pouvait donc retourner un échec tout en laissant disparaître la porte de récupération. La finalisation comporte désormais deux écritures distinctes, sérialisées par le verrou du registre et sous réservation continue du coffre :
-
-| État observable | Informations conservées et accès |
-|---|---|
-| `replacement.phase=prepared` | Identité/empreinte initiales ; nettoyage acquitté ; aucune substitution autorisée ; accès ordinaires bloqués |
-| `replacement.phase=armed` | Candidat et références conservés ; une substitution future pourrait avoir eu lieu ; accès bloqués, jamais de déduction depuis un fichier absent |
-| `replacement.phase=identity-confirmed` | Nouvelle identité dans l'enregistrement et dans `confirmed`, ancienne identité/empreinte et références toujours présentes ; accès **encore bloqués**, même si cette écriture est visible |
-| `resolvedReplacement.phase=resolved` | Reçu de la dernière opération, nouvelle identité et références conservées ; l'intention active est retirée seulement après confirmation durable de l'écriture protégée précédente ; depuis 8C-1b-bis, accès conditionné aussi à une nouvelle revalidation durable du registre courant |
-
-La première écriture enregistre la nouvelle identité **sans lever la protection**, puis vérifie permissions et `fsync` du fichier QSettings et de son répertoire. La résolution n'est tentée qu'après son succès. Sa propre publication peut aussi échouer à la confirmation : l'ancien état possible reste `identity-confirmed` et bloqué ; le nouveau reçu visible repose déjà sur une identité durablement établie. Il n'existe donc pas de suppression finale d'un marqueur indispensable dont on supposerait implicitement la durabilité. Un seul reçu résolu est conservé par coffre dans le registre existant ; une nouvelle préparation autorisée peut le remplacer. Aucun fichier de récupération n'est supprimé. La visibilité (`published`) n'est pas une preuve de durabilité ; `RegistryPersistence` distingue absence de tentative, tentative non confirmée et confirmation durable. Le comportement des autres mises à jour de préférences/sauvegardes n'est pas transformé en un nouveau gestionnaire transactionnel.
-
-**Admission corrigée en 8C-1b-bis :** la visibilité d'un reçu ne prouve pas le succès de son ancien `fsync`. Une nouvelle vérification/synchronisation est exigée avant chaque admission ordinaire du principal portant un reçu, y compris après redémarrage ; aucune mémorisation d'une réussite passée ne la remplace. La preuve porte sur la durabilité actuelle, pas sur l'historique indémontrable. Voir 5.20 pour la vérification du fichier effectivement relu et la portée des erreurs.
-
-Préférences, catalogue, suspensions et états de rotation sont conservés. La règle existante reste inchangée : la résolution positionne `backupRequired=true` si l'automatique est activé, sans effacer un état déjà vrai ; lorsqu'il est désactivé, cet état n'est pas modifié. Aucune sauvegarde ou rotation n'est déclenchée par la finalisation.
-
-Le contrat privé `finalizePublication()` retourne `ReplacementFinalizationResult`, pas un booléen ambigu : `NotStarted`, `RecoveryRequired`, `IdentityUnconfirmed`, `IdentityConfirmedResolutionPending`, `SafeResolutionUnconfirmed` ou `Resolved`. Seul `Resolved` confirme complètement la résolution. `SafeResolutionUnconfirmed` ne signifie ni remplacement annulé ni réussite complète : une variante encore bloquée ou un reçu sûr peut être observable. L'identité finale doit correspondre au candidat ; l'ancien inode doit être retrouvé au nom technique du candidat, avec métadonnées/empreinte initiales intactes. Les fichiers et répertoires concernés sont synchronisés avant confirmation du registre. La réservation reste détenue pendant ces vérifications et écritures ; l'erreur laisse une preuve persistante, pas seulement un verrou en mémoire.
-
-`VaultReplacementAuthorization::resumeFinalization(store, localId, operationId)` prépare une reprise spécialisée après interruption. Elle n'émet aucune autorisation, ne substitue aucun fichier et ne déverrouille rien. Elle refuse `prepared`, `armed`, un autre UUID, les identités ambiguës, un principal inattendu et, pour `identity-confirmed`, l'absence ou l'altération de l'ancien artefact. Elle réserve principal et ancien artefact, vérifie les identités et l'empreinte, reconfirme la durabilité protégée puis résout. Un reçu `resolved` du même UUID peut être reconfirmé de manière idempotente, sans nouvelle substitution. La porte refuse aussi les anciens artefacts techniques et un reçu ne correspondant plus au principal physique ; elle n'impose pas une empreinte immuable au principal après résolution, pour préserver les CRUD légitimes.
-
-**Lecture exceptionnelle limitée :** `snapshotPrincipal(destination, result, cancellation)` ne reçoit aucun chemin source ni booléen de contournement. Elle exige une autorisation vivante liée au même principal, à sa réservation, à son intention et à la phase `prepared`. Identité et empreinte de l'ancien principal sont vérifiées au début et avant publication ; l'autorisation est revalidée aux points de contrôle de copie/validation/publication, notamment après les callbacks d'annulation. Le moteur partage l'implémentation SQLite/staging/publication existante, sans garde partagé incompatible sur la source. Un maintien local de l'état évite une référence pendante si le callback révoque l'autorisation. Une réservation seule, un ancien UUID, la phase `armed` ou une révocation ne permettent pas cette lecture. CRUD, export et sauvegarde ordinaire conservent leurs portes habituelles. Le moteur 6B utilise ce chemin avant armement pour la copie de précaution obligatoire.
-
-La porte de récupération est appliquée aux services, pas seulement aux boutons : reconnaissance, cycle de vie, CRUD, ouvertures SQLite/instantanés et accès natifs concernés sont refusés si une intention l'exige ou si le registre n'est pas interprétable. Un autre coffre indépendant reste utilisable lorsque le registre le permet. Aucune réassociation ou authentification ne lève implicitement cette porte. L'abandon par l'autorisation vivante n'est permis qu'avant engagement, après vérification de l'identité et de l'empreinte initiales ; destruction de l'autorisation ou absence du candidat ne suffit jamais à lever une intention ambiguë. Aucun rollback destructeur ni nettoyage automatique des artefacts de récupération n'est implémenté.
-
-Il s'agit d'une protection de récupération **par coffre**, pas du retour de `SessionGuard1` ni d'une garde globale de session Wayland. La suppression externe du registre ne peut pas être distinguée dans tous les cas d'une première configuration absente ; les protections restent conditionnées à sa conservation et aux participants coopératifs. Les confirmations `fsync` ne constituent ni une simulation de panne électrique ni une garantie physique absolue du support. Les transitions d'identité des tests historiques 6A-bis sont modélisées ; les nouveaux tests 6B exercent réellement la substitution et des interruptions de processus sur fichiers fictifs.
-
-**Moteur 6B :** `VaultReplacementAuthorization::replacePrincipal(principal, source, SecureBuffer, precautionDestination, result, control)`, implémenté dans `vault_replacement_service.cpp`, exige l'autorisation existante et le chemin exact auquel elle est liée. Il n'ajoute ni émetteur ni booléen de preuve. Les trois chemins sont figés dans des copies locales avant tout callback de contrôle : modifier l'état Qt de l'appelant ne peut pas rediriger la substitution. Le mot de passe est transféré par déplacement, sans copie supplémentaire. `passwall_vault_replacement` porte directement ses dépendances d'authentification ; il reste séparé du worker de sauvegarde sans clé.
-
-1. Ouvrir la source sans suivre de lien, refuser alias physiques/liens durs et chemins ambigus ; retenir descripteur, identité du parent, taille, dates de modification/changement et empreinte. Les contrôles de stabilité entourent la copie et l'authentification ; une mutation détectable interdit la substitution.
-2. Réutiliser l'instantané SQLite avec validation structurelle et un hook privé : même `vault_id`, mot de passe, paramètres bornés, déchiffrement de la DEK et `authenticateAll()` entrée par entrée. Mot de passe propriétaire, DEK et credentials temporaires sont nettoyés avant publication du candidat privé, a fortiori avant échange. Les anciennes allocations Qt/C++/SQLite n'ont pas de garantie exhaustive d'effacement.
-3. Automatique désactivé : exiger une destination explicite inexistante, sans alias du principal/source ; créer la copie supplémentaire via `snapshotPrincipal()` pendant `prepared`. Seul `SnapshotPublication::Published` permet de poursuivre ; une copie publiée à durabilité non confirmée est conservée mais insuffisante. Cette copie n'entre pas au catalogue. Automatique activé : aucune copie supplémentaire, sauvegarde récente ou disponibilité du dossier habituel n'est imposée.
-4. Préparer le candidat chiffré `répertoire-du-principal/.passwall-restore-UUID/candidate.db` (dossier 0700, fichier 0600, même système de fichiers local pris en charge). Vérifier son empreinte authentifiée, synchroniser fichier et répertoires, enregistrer candidat/empreinte/références puis `armed` durablement. Ne jamais revenir à `prepared`.
-5. Revalider autorisation, identités, contenus et répertoires ; effectuer `renameat2(..., RENAME_EXCHANGE)` ([contrat Linux de l'échange atomique](https://man7.org/linux/man-pages/man2/rename.2.html)). Le chemin du principal reçoit le candidat complet et **l'ancien inode reste à `candidate.db`**. Aucun effacement préalable, copie en place, fenêtre volontaire d'absence ou rollback supposé. Si l'échange est indisponible, refuser sans repli non atomique. Les réservations du nom et des deux inodes restent détenues.
-6. Enregistrer immédiatement le fait de substitution, synchroniser les deux répertoires puis utiliser la finalisation 6A-bis : nouvelle identité, ancien inode/empreinte et empreinte du candidat vérifiés, fichiers/répertoires synchronisés, écriture protégée `identity-confirmed`, puis reçu `resolvedReplacement`. Préférences, identifiant local, catalogue, suspensions et états de rotation restent conservés ; `backupRequired` est positionné si automatique activé, sans copie/rotation immédiate ni ouverture de session.
-
-`ReplacementOutcome` distingue `NotReplaced`, `CancelledBeforeEngagement`, `EngagedRecoveryRequired`, `ReplacedDurabilityUnconfirmed`, `ReplacedFinalizationPending` et `Replaced`, en conservant le résultat détaillé de finalisation et celui de précaution. Seul `Replaced` confirme complètement l'opération. Une annulation avant armement ne supprime pas implicitement l'intention ; tant que l'autorisation reste valide, l'appelant peut demander `abandonPreparation()` avec preuves initiales intactes. Après tentative d'armement, l'autorisation est consommée et une annulation/erreur laisse les éléments persistants ; aucune annulation tardive ne prétend défaire un échange. Pas de délai global ni suppression d'une copie déjà publiée.
-
-**Reprise contrôlée 6B :** `recoverReplacement(store, localId, operationId, Inspect|FinalizeExchanged)` n'émet aucune autorisation et ne fait jamais de substitution. Elle acquiert de nouvelles réservations et compare identités/empreintes des fichiers réellement présents avec l'intention. `prepared` intact est inspectable mais non libéré automatiquement ; `armed` avant échange reste bloqué, sans seconde substitution ; `armed` après échange n'est finalisable qu'avec le candidat authentifié au nom principal et l'ancien contenu exact au nom technique. Les identités déjà confirmées/reçus résolus utilisent la reprise 6A-bis. Fichier absent, empreinte/identité inattendue, UUID obsolète ou registre illisible conservent le blocage. Aucun nettoyage automatique de l'ancien inode n'est proposé ; il reste conservé avec ses références même après réussite. Un crash avant enregistrement du candidat peut laisser un dossier privé orphelin, jamais interprété comme une autorisation ni supprimé à l'aveugle.
-
-**Frontière des étapes :** 6B reste un moteur synchrone sans widgets ; `vault_replacement_service.cpp` implémente `VaultReplacementAuthorization::replacePrincipal()`, pas une seconde classe de service. Ses appels directs protégés restent disponibles, mais ne doivent pas effectuer de longues E/S sur la GUI. L'étape 7 ci-dessous délègue son exécution au processus spécialisé ; 8A ajoute l'action GUI sans second moteur. La récupération utilisateur limitée des préparations interrompues est décrite en section 5.20 (8C-1).
-
-**Historique de l'audit préalable du 9 novembre :** un simple transfert de verrous ne préservait ni le callback GUI vivant, ni la réactivité de l'émission, ni l'acquittement des secrets d'un enfant. L'implémentation a d'abord été arrêtée ; les trois adaptations ont ensuite été explicitement validées et implémentées. Les 449 tests historiques 6B ne sont pas une validation de ces nouveaux contrats.
-
-### 5.17 Auxiliaire de restauration, délégation et nettoyage global — étape 7
-
-Composants : `restore_job.hpp/.cpp`, `restore_delegation.hpp`, `restore_protocol.hpp`, `restore_worker_main.cpp` (`passwall_restore_worker`), intégration interne `MainWindow::startReplacementOperation()` et préparation dans `main_window_replacement.cpp`. Le worker de sauvegarde reste distinct et sans clé. Aucun framework de processus générique ni second moteur de remplacement n'a été créé.
-
-**Préparation 6A réactive :** réservation et inspection sans secret hors GUI, retour au propriétaire pour vérifier la session/cible puis verrouiller réellement, empreinte/persistance hors GUI sous réservation continue, enfin revalidation propriétaire avant émission. Une génération spécifique change aussi lors des verrouillages répétés alors que le coffre est déjà fermé ; la génération native, l'identité physique, le nettoyage et les protections Linux sont revérifiés. Les tâches sans secret ne détruisent pas un thread actif avec la fenêtre et ne touchent aucun widget depuis leur thread. Une révocation durant les E/S ne ferme pas leurs FD sous leurs pieds ; aucune réponse tardive ne délivre l'autorisation. Une intention déjà rendue visible peut rester protégée même si l'émission est finalement refusée.
-
-**Délégation limitée :** le superviseur consomme une vraie autorisation 6A et conserve son état vivant côté parent. `delegate()` et `receiveDelegation()` sont privés ; aucun constructeur public, UUID, document JSON, intention persistante ou verrou seul n'autorise l'exécution. Le worker vérifie les arguments et FD hérités, le socket Unix, `SO_PEERCRED`, le PID parent vivant et l'identité physique de son exécutable attendu (`passwall_app` à côté du worker, fichier régulier protégé appartenant au même utilisateur), avant réception du secret. L'import interne vérifie registre, UUID, principal, identité/vault_id/empreinte initiale et réservation. Le registre de ce parent est aussi celui des contrôles de stockage ordinaires du worker.
-
-**Permissions et admission locale :** sous Linux, CMake fixe explicitement `passwall_app` et `passwall_restore_worker` à `0755` après édition de liens et dans la règle d'installation ; les binaires de test qui participent à la même vérification reçoivent aussi ce mode dans le build isolé. Le parcours GUI vérifie avant verrouillage, réservation et écriture de `prepared` que le worker est un fichier régulier appartenant à l'utilisateur, exécutable et non inscriptible par groupe/autres, puis que le processus courant correspond par périphérique/inode au `passwall_app` attendu. `RestoreJob` recontrôle le worker juste avant lancement et l'enfant conserve tous ses contrôles de socket, parent et inode après `exec` : le précontrôle ne remplace donc aucune défense contre les courses. Une reconstruction remplaçant l'inode impose un redémarrage de PassWall.
-
-Un `exit=77` normal sans aucun octet reçu est présenté comme un refus d'admission locale (permissions, identité ou provenance), et non comme un protocole invalide. Une trame partielle, mal formée, dupliquée ou supplémentaire conserve le diagnostic de protocole invalide et le résultat conservateur. Les refus synchrones de chemin, permission ou lancement sont transmis à la fenêtre sans chemin sensible, mot de passe ni donnée du coffre. Un changement intervenant après la préparation peut encore laisser `prepared`, conformément à la politique fail-closed et au parcours de récupération 8C-1.
-
-Les deux passerelles privées `RestoreDelegation` et `RestoreWorkerAdmission` séparent les rôles : le superviseur peut déléguer une autorisation existante, l'enfant peut seulement importer après vérification de son origine. Ni l'un ni l'autre n'est ami de l'autorisation complète et ne peut appeler l'émetteur 6A (`reserve`/`acknowledge`). Des assertions de compilation contrôlent ces refus d'accès ; leurs classes de sonde ne sont jamais liées aux exécutables.
-
-Le canal est créé par le parent avec `socketpair`, non bloquant côté GUI, `CLOEXEC` sauf héritage explicitement autorisé. Lancement par chemin absolu, sans shell, sans recherche PATH. Le worker initialise libsodium avant `SecureBuffer`, surveille la disparition du parent et reçoit `SIGTERM` par `PR_SET_PDEATHSIG`. Ces contrôles locaux ne constituent ni sandbox ni protection absolue contre la compromission d'un processus sous le même compte. Le worker de test est un **autre exécutable**, autorisant uniquement les parents de test et instrumentant mémoire/interruptions ; aucune de ces exceptions n'est compilée dans le worker de production.
-
-**Protocole privé v1 :** préfixe little-endian de longueur sur quatre octets, puis type sur un octet et payload ; la longueur compte le payload, hors ces cinq octets. Métadonnées JSON ≤ 32 768 octets ; mot de passe brut ≤ 1 048 576 octets, rejet sans troncature au-delà. Les messages portent l'opération et un identifiant de session éphémère ; les validations vivantes ont un numéro de séquence. Ordre : délégation → validations vivantes → `Ready` → `Password` → `Received` → authentification → `Cleaned` → phases/résultat → terminaison. Les erreurs/refus peuvent rejoindre le nettoyage sans phase sensible. Tailles, types, ordre, doublons, EOF et identités inattendues sont refusés. Le transport entre pilote et worker ne place le mot de passe ni dans JSON, `QString`, `QByteArray` propriétaire, arguments, environnement, fichiers ou diagnostics : transfert direct par `send`/`recv` depuis/vers les `SecureBuffer` (la saisie GUI et ses temporaires Qt sont distincts, section 5.18). Les buffers parent sont détruits après réception acquittée, refus ou annulation ; une écriture réussie ne remplace pas `Received`. Les copies noyau et allocations internes de la cryptographie ne sont pas une garantie d'effacement physique.
-
-**Autorité vivante et moteur unique :** l'enfant n'interroge jamais un widget ; il demande une admission au parent, qui vérifie sur son thread l'état 6A et la protection Linux actuelle. L'enfant conserve les contrôles persistants/physiques 6B, avec une nouvelle vérification vivante après les inspections potentiellement longues. `authenticateAll()` peut être annulé entre entrées sans changer son ancien appel ni son nettoyage RAII. Les phases 6A-bis, la précaution conditionnelle, l'échange et la reprise restent ceux du moteur commun. Le résultat identifie aussi un échec d'authentification de source, sans interpréter un message d'erreur.
-
-Une admission reçue constitue une frontière : une annulation en transit ne peut rappeler un appel système déjà admis/engagé. Les checkpoints avant/après `armed`, échange et synchronisation conservent les résultats de récupération réels, jamais un rollback destructeur. Le principal et l'ancien inode ne sont pas supprimés pour masquer une erreur ; aucun nouvel échange ni nettoyage d'artefact n'est lancé automatiquement après crash.
-
-**Nettoyage global :** `lockVault()` invalide Native Messaging et nettoie immédiatement clé, éditeurs et champs locaux. Le verrouillage volontaire de préparation n'annule pas l'opération ; un verrouillage de sécurité, une fermeture ou perte de protection la révoque et demande l'annulation. Les acquittements positifs `Control1.Lock()`/`lifecycleSecretsCleared` attendent en plus soit `ConfirmedByWorker` (RAII de toute la phase sensible achevée), soit `ConfirmedProcessTermination`. `Pending`/`Unknown`, EOF demandé, signal envoyé ou résultat métier ne constituent pas cette preuve. Les observateurs sont détenus par le superviseur indépendant : détruire la façade n'enlève pas le suivi de nettoyage. Le délai maximal de l'inhibiteur logind, un thread principal bloqué et un enfant bloqué dans le noyau interdisent toute promesse absolue de nettoyage avant suspension.
-
-**Supervision et exclusion :** `RestoreJob` est à usage unique, sur le thread propriétaire. `resultReceived` n'est ni `finished` ni `processTerminated`. Le résultat distingue refus, transport, authentification, états 6B et `Unknown`. `replacementStatusKnown=false` interdit d'interpréter le `NotReplaced` initial comme une preuve après perte de résultat. Si le résultat métier a été reçu puis que la supervision devient incertaine/anormale, ses informations connues (dont remplacement et artefact) sont conservées à côté d'`Unknown`. Un résultat complet exige un enregistrement valide cohérent avec les phases, les preuves de nettoyage et la sortie normale attendue ; le code zéro seul ne suffit pas. Le parent conserve les verrous initiaux ; l'enfant conserve aussi ceux du candidat/nouvel inode jusqu'à sa sortie, même si 6B a finalisé/réinitialisé son autorisation. Une façade détruite ne détruit ni n'attend un `QProcess` actif. Le moniteur de sortie seul libère les ressources du parent ; un `Unknown` avec enfant vivant ne les libère pas.
-
-La lecture contrôle aussi la fin du flux après le résultat terminal : drainage borné à la terminaison, refus d'une trame dupliquée ou du moindre octet supplémentaire. Une désynchronisation invalide la supervision, n'autorise plus de nouvelle preuve de nettoyage par le protocole et conserve les informations métier déjà validées ; seule la terminaison effectivement constatée peut alors fournir une preuve de nettoyage manquante.
-
-L'annulation ferme le sens d'écriture du canal, efface le buffer parent et interrompt aussi proprement une réception de mot de passe tronquée, sans insérer une commande au milieu de ses octets. L'enfant distingue la réception de cette interruption de la fin réelle. Après demande d'annulation uniquement : délai coopératif 1 000 ms, puis `terminate()`, 1 000 ms, puis `kill()`, 1 000 ms, puis résultat `Unknown` si toujours actif ; le superviseur reste vivant sans attendre dans un destructeur. Aucun budget global ne limite une restauration saine. La lecture GUI traite une trame par activation et l'écriture au plus 64 Kio, pour laisser passer les événements de verrouillage/minuteur.
-
-**Limites du jalon 7 :** il ne livrait pas de GUI de restauration ; 8A l'ajoute en section 5.18. Une boîte de récupération limitée est ajoutée en 8C-1 (5.20), sans déploiement de ce worker dans `~/.local/bin`. L'ouverture GUI de nouvelles sessions reste conservativement bloquée pendant la préparation/délégation ; l'exclusion métier, elle, reste par coffre et n'interdit pas les services d'un autre coffre indépendant. Depuis 1.29, les issues structurées et certainement antérieures à `armed` peuvent rejoindre l'abandon contrôlé décrit ci-dessous ; une issue incertaine ou engagée reste protégée. Aucun nettoyage automatique de l'ancien principal ni reprise automatique d'un remplacement n'est ajouté. La distribution devra conserver les binaires compatibles et leurs permissions ; `/proc`, le parent attendu et les métadonnées locales doivent être accessibles, sans garantie de durée des appels noyau. Validation Windows/NAS toujours absente.
-
-### 5.18 Interface graphique de restauration sécurisée — étape 8A
-
-Sous Linux, le menu « Coffre → Restaurer depuis une sauvegarde… » ouvre une fenêtre indépendante non modale (`VaultRestoreDialog`), pilotée par `VaultRestoreController`, enfant de `MainWindow`. La lecture du registre se fait hors GUI ; retours et widgets restent sur le thread propriétaire. Les sélecteurs de fichiers utilisent `open()`, sans boucle `exec()` imbriquée. Le principal enregistré doit être choisi explicitement, sans sélection par défaut ; son chemin est affiché. Le filtre propose d'abord `*.db` puis explicitement tous les fichiers : l'extension est ergonomique, jamais une preuve de sécurité, et un coffre valide renommé reste admissible. Le remplacement intégral, l'absence de fusion, la lignée cryptographique requise et les limites d'annulation sont expliqués avant confirmation.
-
-**Prévalidation 1.29 :** avant verrouillage du coffre et création de `prepared`, une tâche sans secret ouvre la source en lecture seule, sans suivre les liens, vérifie fichier régulier/propriétaire protégé, en-tête SQLite, schéma exact V1, métadonnées publiques compatibles, formes bornées des entrées et `integrity_check`. Elle recontrôle l'identité et les dates du fichier autour de la lecture. Un refus laisse la session et le principal inchangés, sans intention persistante. Ce contrôle peut être long mais ne s'exécute pas sur le thread GUI. Il n'authentifie ni maître ni entrée et n'autorise aucune substitution : après 6A, le worker conserve toutes les ouvertures protégées, empreintes, contrôles de lignée, authentifications et revalidations existantes. Une modification entre les deux contrôles est donc refusée si elle rend la source incompatible ; l'absence d'une liaison cryptographique persistante à la prévalidation n'est pas présentée comme une autorisation.
-
-**Parcours en deux temps :** la confirmation volontaire précède « Verrouiller et préparer ». L'éventuel autre coffre ouvert est effectivement verrouillé avec le motif volontaire existant, sans déclencher une sauvegarde automatique. Le véritable émetteur 6A réserve ensuite le principal choisi, prépare hors GUI et revalide génération, nettoyage, identité et protection Linux sur son thread. Aucun maître de restauration n'est saisi pendant cette émission. Au retour, une comparaison privée non mutante relie l'autorisation à l'identité locale/physique et aux trois préférences affichées au consentement ; si elles ont changé, le parcours refuse avant saisie/transfert. Cette comparaison ne crée ni autorisation ni accès SQLite et ne remplace aucun contrôle 6A/7.
-
-Seulement après cette préparation, le champ maître est activé et « Authentifier et restaurer » consomme l'autorisation via `MainWindow::startReplacementOperation()` → `RestoreJob` → `passwall_restore_worker` → moteur unique 6B. Les chemins et choix sont figés ; les modifier avant préparation retire la confirmation. Automatique désactivé : une destination explicite de copie exceptionnelle est obligatoire, sans écrasement ; sa publication confirmée conditionne l'échange. Automatique activé : champ de copie masqué, aucune copie supplémentaire ni disponibilité du dossier automatique exigée. Le résultat ne sélectionne ni n'ouvre le principal, et ne déclenche ni sauvegarde automatique ni rotation.
-
-**Secrets et verrouillage :** le champ utilise l'écho mot de passe. Des nettoyeurs sont armés avant remplissage des temporaires `QString` et UTF-8 ; le champ est vidé immédiatement, les allocations détachées contrôlées sont effacées et les octets sont copiés directement vers un `SecureBuffer` propriétaire, sans normaliser le maître ni passer par `std::string`/JSON. Les temporaires Qt sont nettoyés avant le transfert au pilote. Aucun maître n'est conservé par le contrôleur. Les copies historiques/internes Qt, le système et le fonctionnement d'une allocation échouée n'offrent pas de garantie exhaustive d'effacement. `lockVault()` nettoie synchroniquement aussi ce champ, sous sa protection de réentrance ; `isFullyLocked()` le contrôle avant acquittement. Un verrouillage de sécurité annule préparation ou worker, contrairement au verrouillage volontaire. Les générations et acquittements globaux 7 restent appliqués ; un retour obsolète n'active pas le champ ni une ancienne session.
-
-**Supervision et fermeture :** progression par phases réellement reçues, sans pourcentage inventé. Résultat métier, nettoyage confirmé et terminaison effective restent distincts. Le texte de réussite exige un résultat 6B `Replaced`/finalisation `Resolved`, une supervision `EngineResult`, le nettoyage et la terminaison constatée ; ni `resultReceived` ni un code zéro seul ne suffisent. Un `finished(Unknown)` ne peut pas être surclassé par une notification métier tardive ; le contrôleur refuse une nouvelle restauration GUI de ce principal pendant sa durée de vie. Ce dernier suivi est en mémoire, pas une nouvelle garde persistante : après redémarrage, les preuves et portes du registre 6A-bis/6B déterminent l'accès. Les issues engagée, durabilité non confirmée, finalisation en attente, annulation et résultat inconnu ont des textes distincts.
-
-Fermer la fenêtre de restauration demande l'annulation sans détruire le pilote actif. Fermer/détruire `MainWindow` nettoie les champs et laisse le superviseur 7 conserver les réservations jusqu'à terminaison effective ; aucune attente bloquante n'est ajoutée au destructeur. Une opération déjà engagée n'est jamais présentée comme annulée avant échange. Les limites d'un processus complet arrêté, d'un noyau bloqué et du délai logind restent celles de 7, sans promesse d'arrêt instantané.
-
-**Récupération au jalon 8A, étendue par 8C-1 et 1.29 (5.20) :** un enregistrement avec intention de remplacement ou une supervision GUI incertaine bloque une nouvelle préparation et explique la récupération nécessaire. Aucun bouton de réinitialisation, nouvelle substitution ou suppression d'ancien inode n'est ajouté. Annulation avant worker, refus du maître, refus de démarrage certain et autres résultats privés structurés `NotReplaced`/`CancelledBeforeEngagement` ne tentent l'abandon existant qu'après nettoyage sensible et terminaison effective lorsqu'un worker a existé. La récupération revalide principal, identités, absence d'opération incompatible et persistance ; seul `Abandoned`/`Resolved` retire le blocage. `Unknown`, worker vivant, engagement, divergence ou échec de synchronisation conservent la récupération manuelle. Aucun chemin n'ouvre automatiquement le coffre. La cryptographie, SQLite V1, les protections Linux et Firefox restent inchangés ; aucune installation utilisateur n'est effectuée par cette étape.
-
-### 5.19 Préférences des sauvegardes automatiques et reprise — étape 8B
-
-Le menu « Coffre → Sauvegardes automatiques… » ouvre `VaultBackupSettingsDialog`, fenêtre non modale pilotée par `VaultBackupSettingsController`. Le contrôleur conserve sa propriété ; la relation transitoire `QWindow` vers `MainWindow`, sans parent `QObject` et avec `WA_QuitOnClose=false`, évite d'ajouter une fenêtre primaire bloquant la fermeture, tout en restant hors de l'arbre des dialogues rejetés par le nettoyage des secrets ([règle Qt 6.8 de fermeture des fenêtres primaires](https://doc.qt.io/qt-6.8/qguiapplication.html#lastWindowClosed)). Le principal enregistré est choisi explicitement, sans sélection du dernier coffre par défaut. Les widgets ne contiennent ni SQL, ni moteur de copie/rotation, ni écriture QSettings. Trois préférences seulement : activation (`false` par défaut), dossier (vide par défaut), rétention (7 par défaut). La rétention accepte les entiers de 1 à 2 147 483 647, même domaine positif `int` que le service ; pas de nouvelle politique ni plafond arbitraire de conservation.
-
-**Consultation sans autorisation :** `VaultPreferencesStore::listForDisplay()` lit les octets physiquement publiés et réutilise les validations INI/registre et de chemin existantes, avec fichier temporaire de validation privé. Elle ne synchronise pas le cache QSettings du registre et n'acquiert pas son verrou d'écriture. Une consultation GUI ne doit pas faire échouer le dispatch/finaliseur de sauvegarde par contention. Ce snapshot peut être périmé ou visible avant confirmation de durabilité : il ne prouve ni succès, ni autorisation d'accès/récupération. Les consultations métier verrouillées restent inchangées. Les réponses GUI sont associées à la génération de lecture/sélection ; une réponse tardive n'applique pas les préférences d'un autre coffre. Les rafraîchissements ne remplacent pas une saisie en cours par des valeurs concurrentes : un changement d'identité/préférences exige « Actualiser ».
-
-**Enregistrement :** validation de destination et persistance s'exécutent dans une tâche sans secret hors GUI. `updatePreferencesIfCurrent()` compare identifiant local, identité physique et préférences affichées sous le même verrou que l'écriture, puis réutilise intégralement l'ancien chemin de réservation exclusive, contrôles d'identité, QSettings atomique et confirmation de durabilité. Les champs internes sont relus, jamais réimportés depuis le formulaire : catalogue, suspension, rotation et récupération restent conservés. Une erreur ne constitue pas une preuve d'absence de publication ; la GUI n'annonce un enregistrement durable que sur retour positif. Cette confirmation n'est pas une réussite de sauvegarde. Un acquittement tardif peut concerner l'enregistrement expressément demandé, mais ne modifie pas le formulaire d'un autre principal.
-
-**Destination :** pour une préférence activée, `VaultSnapshotService::inspectDestinationDirectory()` est réutilisé avant enregistrement : chemin existant absolu, parcours sans liens problématiques, propriétaire/permissions et système de fichiers local admis. Aucun répertoire créé, repli ou estimation d'espace inventé. Le worker revalide ensuite l'identité de la destination et la publication ; un précontrôle ne supprime pas les courses ou les erreurs d'écriture. Hors périmètre : NAS/NFS/CIFS/FUSE/FAT/exFAT. Changer de dossier conserve les anciennes versions, renouvelle l'époque selon le service existant et ne déplace ni ne supprime leurs fichiers.
-
-**Activation et reprise :** le signal existant du registre demande la première copie ; l'ouverture de cette fenêtre seule n'en demande aucune. L'activation fonctionne coffre fermé ou ouvert, sans déverrouiller ni verrouiller arbitrairement le coffre ; une opération incompatible/édition fait différer le coordinateur. Les CRUD marquent `backupRequired` avant SQL, sans copie individuelle ; le verrouillage normal fournit la demande groupée existante. Aucun délai global de sauvegarde ni tentative périodique ajouté. Une suspension survit à la réouverture de la fenêtre/application et au changement des préférences, y compris désactivation/réactivation. Seul le clic « Reprendre la sauvegarde », pour un enregistrement activé/suspendu admissible et un formulaire sans modifications non enregistrées, appelle `resumeAutomaticBackup(localId)`. Le coordinateur recontrôle les protections et la destination, crée une copie fraîche et ne lève l'état persistant que selon son contrat. Demande en attente, double clic, reprise refusée/différée et processus encore actif ne sont pas des réussites.
-
-**Affichage des états :** désactivé, modification en attente, activité, suspension après échec/annulation ou résultat incertain sont distingués lorsque les preuves existent. Après redémarrage, la cause exacte non persistée n'est pas inventée : seule la suspension/absence de confirmation est annoncée. `activeVaultId()` et `resumePending()` sont des consultations propriétaire sans effet métier. La copie et la rotation ont deux zones distinctes : une suppression incertaine peut bloquer la rotation sans suspendre les nouvelles copies. Changer la rétention ne supprime rien dans la GUI et ne remet à zéro aucun marqueur. Aucun succès déduit d'un fichier présent ou d'un simple code de sortie. `Unknown` avec enfant vivant maintient l'indisponibilité de la reprise et les réservations existantes jusqu'à terminaison.
-
-Fermer les préférences ne supprime ni n'annule une sauvegarde déjà autorisée. La fermeture de l'application conserve le chemin existant d'annulation/supervision ; aucune attente de worker ou de tâche QThread n'est ajoutée au destructeur. Les tâches de configuration ne possèdent aucun secret ; après fermeture pendant l'enregistrement, le résultat de persistance peut rester à vérifier. Les précontrôles/finaliseurs de métadonnées du coordinateur existant restent sur son thread propriétaire ; ni leurs appels noyau ni les E/S du worker ne disposent d'une borne absolue de durée. Export de configuration, résolution des suppressions incertaines, récupération de restauration, politique obligatoire du minuteur et essais manuels restent distincts, non livrés par cette interface.
-
-### 5.20 Récupération — contrats 8C-1a/1b/1b-bis et interface 8C-1c
-
-**Reprises après interruption de VSCode :** le contrat d'abandon en deux écritures, les tests et une GUI avaient déjà été ajoutés à l'arbre non commité par la tentative 8C-1. 8C-1a a repris le contrat `prepared` sans retoucher les fichiers GUI/CMake hors périmètre ; 8C-1b puis 1b-bis ont vérifié les reprises engagées et corrigé l'admission. 8C-1c reprend maintenant cette interface, complète sa validation et conserve ces fondations sans les réécrire. Ni politique de minuteur ni nettoyage d'artefacts ne sont ajoutés.
-
-**Contrat `prepared` examiné :** l'absence d'engagement est établie par l'intention exacte encore `prepared` (ou la reprise de son abandon confirmé), les preuves du principal et l'obtention de nouvelles réservations exclusives. Celles-ci excluent une autorisation vivante, un accès incompatible ou un worker possédant encore les descripteurs, même si le parent a fermé sa propre copie. Identifiant local/UUID, identité physique, métadonnées et empreinte doivent concorder ; un candidat enregistré est également vérifié et réservé. Un UUID ou une réservation seuls ne permettent pas de fabriquer une autorisation 6A. Le contrat de récupération est privé, appelé après le nettoyage réel du propriétaire ; les essais métier isolés utilisent un émetteur réservé au binaire de test, pas une preuve de nettoyage GUI.
-
-Les tests complémentaires utilisent de vrais coffres fictifs chiffrés : échec d'authentification de source, annulation avant armement, reprise dans un processus neuf et authentification ordinaire ensuite. Une récupération ne retourne aucune clé et n'ouvre pas le coffre ; le mauvais maître reste refusé après résolution. Les interruptions de processus et erreurs de persistance ne sont pas présentées comme des simulations de panne électrique.
-
-**Contrats après engagement examinés en 8C-1b :** `recoverReplacement()` réserve principal et artefact, confronte les deux identités physiques et empreintes aux preuves persistantes. `armed` avant échange reste bloqué, sans second échange ni abandon implicite. Après échange démontré, seuls les contrôles/synchronisations et transitions 6A-bis sont repris ; aucun rollback ni suppression de l'ancien principal. `resumeFinalization()` réserve également l'ancien artefact en phase `identity-confirmed`, revalide son empreinte ainsi que celle du candidat lorsqu'elle est présente, puis reconfirme la transition protégée. Un reçu `resolved` peut être reconfirmé sans imposer une empreinte immuable après les CRUD légitimes. Une réservation encore détenue refuse la reprise, y compris si seul l'ancien artefact est occupé. Aucune nouvelle autorisation 6A n'est créée.
-
-**Écart identifié en 8C-1b, corrigé en 8C-1b-bis :** `SafeResolutionUnconfirmed` peut coexister avec un reçu `resolvedReplacement` déjà visible après échec du dernier `fsync`. L'ancienne admission contrôlait l'identité physique mais permettait une authentification sur cette seule visibilité, même dans un processus neuf. Le suivi GUI en mémoire n'était pas une protection persistante suffisante. Cette erreur d'admission est corrigée sans déduire du contenu QSettings que l'ancien `fsync` aurait réussi.
-
-**Correction minimale :** `recoveryAllowed()` appelle désormais le vérificateur privé `confirmResolvedAccess()` pour le principal d'un reçu `resolved` ou `abandoned`. Sous le verrou de registre existant, il ouvre sans suivre les liens le fichier de configuration, conserve son descripteur, relit ses octets avec une borne de taille et réutilise la validation INI privée. Le reçu, l'identifiant local, l'identité attendue et l'absence d'intention active doivent correspondre. Il synchronise ce même fichier puis son répertoire, et recontrôle inode nommé, taille, dates de modification/changement pour refuser un remplacement ou une écriture concurrents. Une erreur renvoie une admission refusée avant l'accès métier ; aucun rollback, effacement ou nouveau marqueur. Reconnaissance, préparation de mutation et contrôles de récupération ordinaires partagent cette porte ; affichage `listForDisplay()` et inspection non autorisante n'en deviennent pas des preuves de succès.
-
-Après redémarrage, le programme **ne peut pas distinguer** les deux historiques produisant les mêmes octets QSettings : ancien `fsync` réussi, ou échoué mais reçu encore visible. Il exige donc la nouvelle confirmation actuelle, dans ce processus également. Si elle échoue, l'accès reste refusé. Si elle réussit, une authentification normale peut être admise après cette **revalidation sûre**, sans obliger l'utilisateur à cliquer une nouvelle commande GUI. Cela ne réécrit pas le résultat historique en succès, ne déverrouille pas automatiquement et ne retire pas le suivi GUI conservateur existant : le parcours peut toujours exiger sa récupération explicite. Les transitions `prepared`, `armed`, `identity-confirmed`, leurs reprises/idempotence et l'autorisation 6A restent inchangées ; aucun nouveau protocole persistant, fichier témoin ou bit de confiance.
-
-Cette stratégie conservatrice ajoute lecture/validation et `fsync` du fichier/répertoire à chaque admission portant un reçu, sans cache d'autorisation permanent. Elle peut augmenter la latence des chemins métier synchrones existants ; aucune borne de durée d'un appel noyau n'est promise. GUI et politique de sauvegarde ne sont pas modifiées. Les garanties restent conditionnées au système de fichiers/support et aux participants respectant les réservations/verrous ; une confirmation système ne prouve pas une résistance absolue à la panne électrique ou à un processus malveillant sous le même compte.
-
-**Interface de récupération 8C-1c :**
-
-Le menu « Coffre → Récupérer une restauration interrompue… » ouvre une fenêtre non modale, sans champ secret. `VaultRecoveryController` présente les principaux et reçus du registre, sans sélection implicite. `listForDisplay()` reste une consultation, jamais une admission. L'utilisateur choisit « Verrouiller et examiner », consulte le constat puis confirme séparément l'action proposée. Les chemins internes, empreintes et jetons ne sont pas affichés dans les messages ordinaires.
-
-Cette liste est reconstruite à l'ouverture ou sur actualisation, y compris dans une nouvelle instance de `MainWindow` ; aucun état GUI précédent n'est requis. Les reçus déjà résolus restent consultables pour une reconfirmation facultative : leur présence ne signifie pas à elle seule qu'une panne est constatée. Il n'y a ni scan automatique bloquant au démarrage ni récupération implicite. Une lecture échouée ne conserve pas une liste partielle ou une ancienne proposition. Une inspection révoquée perd aussi sa disposition exploitable avant livraison aux widgets.
-
-`MainWindow::requestReplacementRecovery()` constitue une admission distincte de 6A : nettoyage réel et acquittement global existant, protection Linux, générations et absence d'opération/éditeur incompatible. Il ne fabrique aucune `VaultReplacementAuthorization`. Une fermeture, un verrouillage de sécurité ou une perte de protection révoque le drapeau atomique sans secret utilisé par la tâche. Inspections SQLite, empreintes, synchronisations et transitions du registre s'exécutent hors GUI ; le retour est revalidé sur le thread propriétaire. Une admission ne peut toutefois rappeler un appel système déjà lancé. Les nouvelles réservations refusent aussi un worker étranger encore vivant ; un résultat métier seul n'est pas sa terminaison.
-
-| Constat sous réservations exclusives | Action permise |
-|---|---|
-| `prepared`, identité et empreinte initiales exactes ; candidat éventuel intact et réservé | Abandon contrôlé après confirmation et admission du véritable propriétaire |
-| `abandon-confirmed` | Revalider les preuves, reconfirmer l'écriture protégée puis reprendre la résolution d'abandon |
-| `armed` avant échange | Information seulement : pas d'abandon ni second échange |
-| `armed` après échange, deux identités/empreintes concordantes | Finalisation 6B existante, sans échange ni rollback |
-| `identity-confirmed` | Reprise de finalisation existante, avec contrôles et durabilité 6A-bis |
-| Reçu `resolved` ou `abandoned` | Constater, ou reconfirmer explicitement la persistance de la même opération, sans la réexécuter |
-| Registre indisponible, UUID obsolète, principal/candidat absent ou divergent, preuves insuffisantes | Aucun déblocage ; diagnostic supplémentaire nécessaire |
-
-**Abandon après redémarrage :** le nouvel appel privé `recoverLocked()` réutilise l'inspection ; son action `AbandonPrepared` n'est pas autorisée par l'API publique à partir d'un UUID. Principal enregistré, métadonnées, identité physique et SHA-256 initial sont vérifiés sous réservation continue. Un candidat enregistré doit aussi être réservé, reconnu et conforme à son empreinte ; des références non reconnues sans candidat ne sont pas ignorées. Ni copie SQLite, ni authentification de sauvegarde, ni substitution ne sont lancées pendant cette récupération.
-
-L'abandon emploie deux écritures CAS du registre existant : `replacement.phase=abandon-confirmed`, avec identité confirmée égale au **principal précédent**, reste bloquant ; fichier et répertoire doivent être synchronisés avant de tenter le reçu `resolvedReplacement.phase=abandoned`. Celui-ci conserve UUID, preuves et références sans modifier préférences, `backupRequired`, suspensions, catalogue ni rotation. Le schéma du coffre et les phases d'engagement 6B ne changent pas ; les deux valeurs étendent le registre local, pas l'autorisation de remplacement. Une erreur de la première écriture conserve la porte ; une confirmation du reçu échouée ne devient pas un succès. Comme en 6A-bis, un reçu déjà visible repose sur l'écriture protégée précédente, durable, pas sur une hypothèse d'immutabilité absolue. La GUI garde les accès fermés après une résolution non confirmée jusqu'à reprise explicite réussie ; après redémarrage, l'accès métier dépend des preuves persistantes, pas de ce suivi en mémoire. Une simple lecture du reçu ne confirme pas la durabilité de l'opération à l'utilisateur.
-
-Les retours sont liés au coffre, à l'UUID et aux générations. Un résultat ancien ne modifie pas une autre sélection. Fermer le dialogue ne détruit ni n'attend la tâche ; fermer `MainWindow` révoque l'admission sans libérer les réservations détenues par la tâche encore active. Une transition déjà admise peut finir et laisse les preuves persistantes reconnues. Aucune attente bloquante ni pourcentage inventé. Après résolution confirmée, aucune session ni clé n'est restaurée : le coffre reste fermé et exige une authentification normale. Le suivi GUI 8A d'incertitude n'est levé que pour le principal effectivement résolu.
-
-Une réouverture du dialogue pendant une tâche n'adopte pas son ancien résultat : elle attend sa fin puis demande une actualisation/examen explicites. La fermeture ne vaut pas annulation confirmée d'une transition persistante déjà autorisée. Après échec de synchronisation, même si un reçu final est visible, l'interface annonce une récupération **non confirmée** et maintient son refus d'ouverture jusqu'à reprise explicite réussie. Ce suivi conservateur interdit les nouvelles sessions dans cette `MainWindow` tant qu'une récupération non confirmée subsiste ; il n'altère pas l'indépendance cryptographique des coffres. La revalidation métier 1.18 reste nécessaire, notamment après redémarrage ; aucun cache GUI n'en tient lieu.
-
-**Abandon automatique des issues ordinaires :** au stade de saisie du maître, « Annuler » révoque l'autorisation locale puis demande `AbandonPrepared` par la même admission propriétaire que la récupération manuelle. Aucun worker n'a alors été lancé. Pour un mot de passe refusé, le contrôleur exige le résultat structuré `SourceAuthenticationFailed`, l'opération exacte, `NotReplaced` connu, le nettoyage déjà acquitté par le protocole et la terminaison effective du worker avant toute demande d'abandon. Il ne déduit rien d'un texte d'erreur ou d'une simple demande d'arrêt. La récupération reprend ensuite de nouvelles réservations, vérifie identité et empreinte du principal et synchronise les deux transitions persistantes existantes. « Restauration annulée » ou « Mot de passe maître incorrect » n'est affiché qu'après `Abandoned`/`Resolved`. Échec de persistance, résultat `Unknown`, processus encore actif, UUID différent, engagement ou preuves divergentes maintiennent le verrouillage et imposent la récupération manuelle. Aucune session n'est rouverte automatiquement. Le résultat structuré correspond précisément au refus du déverrouillage de la clé maître ; il ne prétend pas distinguer cryptographiquement une saisie erronée d'une altération des métadonnées enveloppant la clé. Les divergences de lignée et les échecs d'authentification d'entrées ne sont pas reclassés en erreur ordinaire de mot de passe.
-
-Aucun ancien principal, candidat, dossier privé, export, copie exceptionnelle ou version automatique n'est effacé. Les artefacts non enregistrés d'une préparation interrompue restent conservés ; cette étape n'introduit pas de ramasse-miettes. Les participants tiers ignorant les réservations, suppressions externes du registre, E/S noyau bloquées et durabilité physique des supports restent des limites. `armed` avant échange et les preuves divergentes ne disposent volontairement d'aucune réparation automatique.
-
-## 6. État des réalisations
-
-### 6.1 Développement attesté
-
-- projet C++ configuré avec CMake/Ninja ;
-- environnement Qt 6 et libsodium installé ;
-- moteur cryptographique et `SecureBuffer` ;
-- stockage SQLite ;
-- services de gestion de clé et cycle de vie ;
-- `CredentialService` ;
-- modèles `Credential` et `CredentialSummary`, avec `CredentialService::listSummaries()` ;
-- interface Qt ;
-- extension Firefox et scripts de remplissage ;
-- hôte natif / communication extension, avec `NativeRequestProcessor` comme unique traitement métier ;
-- nettoyage immédiat des éditeurs, armement précoce du timer, protection logind, instance unique, `Control1.Lock()` acquitté et coordinateur Linux installé ;
-- `SiteMatcher` ;
-- générateur de mots de passe, intégré à l'interface ;
-- validation commune des trois champs obligatoires et durcissement mémoire ciblé de création/ouverture et CRUD ;
-- configuration SQLite V1 vérifiée, RAII des ressources et diagnostics transactionnels ;
-- registre local, exclusion métier, suivi persistant, sauvegardes par auxiliaire, export Qt, coordination automatique et rotation ;
-- interface Qt des trois préférences locales et de reprise explicite des sauvegardes, avec états de copie et de rotation séparés ;
-- moteur unique 6B de remplacement récupérable, auxiliaire supervisé 7 et GUI de restauration 8A ;
-- tests C++ et JavaScript.
-
-### 6.2 Résultats de tests communiqués
-
-Jalons historiques rapportés :
-
-- 5 tests initiaux réussis (initialisation/libsodium, versions libsodium/SQLite, XChaCha20) ;
-- jalon antérieur : 60/60 tests C++ et 5/5 tests JavaScript ;
-- jalon du 5 novembre 2026 : 69/69 tests réussis après correction d'une erreur de syntaxe dans `crypto_engine.cpp`.
-
-Un journal CTest antérieurement consulté enregistrait 69/69 tests C++ réussis le 5 novembre 2026 à 15:20 CET. Il s'agit d'une observation historique, pas d'une nouvelle vérification du journal ni du nombre actuel de tests.
-
-**Validations automatisées ciblées rapportées pour l'état du 6 novembre 2026 :**
-
-| Suite ou cible | Résultat rapporté | Périmètre |
-|---|---|---|
-| `EntryIdParserTest` | 9/9 | Conversion canonique des identifiants |
-| `NativeRequestProcessorTest` | 27/27 | Traitement métier commun à l'application et aux tests |
-| `NativeRequestResponseTest` | 1/1 | API et propriété du buffer de réponse |
-| `SiteMatcherTest` | 12/12 | Correspondance des origines |
-| `NativeBridgeServerTest` | 21/21 | Transport avec sockets Unix réels dans l'environnement Debian habituel |
-| `passwall_native_host_tests` | 6/6 | Notamment les échecs de redirection des flux au démarrage automatique |
-
-Ces résultats concernent les suites ciblées indiquées, pas une nouvelle exécution complète de tous les tests du projet. Ils sont distincts des observations manuelles avec Firefox (section 6.5). Les échecs historiques `EPERM` lors de `bind(AF_UNIX)` dans le sandbox restreint ne décrivent pas ces exécutions Debian avec sockets réels et ne doivent pas être contournés par une désactivation des tests.
-
-**Validations automatisées du verrouillage Linux rapportées avant l'installation locale :**
-
-| Suite ou cible | Résultat rapporté | Périmètre |
-|---|---|---|
-| `passwall_session_lock_tests` / `SessionLockCoordinatorTest` | 21/21 | Bus privé et faux verrouilleur : ordre de l'acquittement, absence/refus/délai, réponses tardives, concurrence et erreurs de lancement |
-| `SessionLockServiceTest` | 10/10 | Acquittement après nettoyage, paramètres, pertes du bus et rejet de l'ancienne interface de garde |
-
-Les protections internes disposent aussi de tests GUI dans `passwall_gui_tests` : éditeurs, minuteur d'inactivité, invalidation des générations natives et intégration à `MainWindow`. Les tests de `LinuxSessionMonitor`, du backend logind et de l'instance unique utilisent des abstractions simulées, des bus D-Bus privés et des descripteurs réels de test ; ils ne réalisent aucune transition système réelle. Leurs régressions ciblées ont été rapportées comme réussies pendant le développement. Le jalon antérieur de campagne complète 225/225 précède les évolutions ultérieures de l'instance unique, du service de contrôle et du coordinateur : ce n'est pas un décompte de la suite actuelle. Le test isolé de handshake D-Bus bloqué a de nouveau réussi lors de la préparation de l'installation, avec un faux verrouilleur.
-
-**Validations ultérieures rapportées, non additionnables comme une campagne unique :** durcissement des mots de passe maîtres 46 tests ciblés ; champs obligatoires 70 ; RAII stockage 44 ; politique SQLite V1 56 ; export manuel 139 et six vérifications manuelles Wayland ; moteur de restauration existant 153 ; registre local (étape 1) 115 ; exclusion métier (étape 2) 356 ; jalon avant 6A 382. Ces nombres décrivent des sélections de régressions à différents états, pas les seuls tests nouveaux d'un composant. Les sources et cas de test correspondants sont présents ; leur lecture ne reproduit pas ces exécutions.
-
-**Bilan ciblé 6A historique rapporté : 426 cas distincts validés, dont 44 nouveaux**, avec une réserve d'intermittence alors ouverte, traitée ensuite en section 6.3. Répartition de ce jalon, à ne pas confondre avec la nouvelle campagne :
-
-| Cible / périmètre | Résultat rapporté |
-|---|---|
-| `passwall_replacement_tests` — contrats simulés d'autorisation/registre | 32/32 |
-| `passwall_gui_tests` — sélection éditeurs, mots de passe, timer, préférences, export et autorisation réelle | 123 cas distincts validés : passage de 122 puis 11 tests finaux dont 10 communs |
-| `passwall_automatic_backup_tests` — passage historique 6A | 65/65, sans résolution de l'intermittence à ce jalon |
-| `passwall_preferences_tests` | 27/27 |
-| `passwall_dirty_tracking_tests` | 29/29 |
-| `passwall_storage_tests` | 24/24 |
-| `passwall_snapshot_tests` | 19/19 |
-| `passwall_restore_tests` | 23/23 |
-| `passwall_backup_tests` | 23/23 |
-| `passwall_tests` — sélection stockage, cycle de vie, CRUD, mémoire, transactions et gardes | 61/61 |
-
-Les tests 6A de contrats ne prouvent pas un nettoyage réel s'ils simulent l'acquittement ; les tests GUI exercent séparément l'émetteur et le verrouillage réels avec données fictives. Les simulations d'identité finale ne sont pas des tests de remplacement atomique. `VaultOperationGuard`, les défauts SQLite réels (`FULL`, contention), les fautes injectées (`IOERR`, allocation, commit/rollback) et les arrêts de processus sur fichiers isolés disposent de tests distincts. Une injection n'est pas une panne matérielle réelle.
-
-Les seules actualisations documentaires jusqu'à la version 1.6 n'ont exécuté aucun test ni compilation. L'intervention suivante de stabilisation a reconfiguré le répertoire `/tmp/passwall-credential-summary-verification` absent, puis compilé uniquement `passwall_automatic_backup_tests`, `passwall_backup_tests` et `passwall_tests` avec leurs dépendances nécessaires.
-
-**Campagne ciblée de stabilisation de rotation exécutée le 9 novembre 2026, hors sandbox :**
-
-| Sélection | Résultat exécuté |
-|---|---|
-| `AutomaticBackupTest.*` | 66/66, dont le test stabilisé et un nouveau contre-ordre déterministe |
-| `BackupJobTest.*` | 23/23 |
-| `VaultOperationGuardTest.*` | 13/13 |
-| Total distinct de cette sélection séquentielle | 102/102, aucun échec ni test ignoré, 44,04 s |
-
-Les deux tests de la section 6.3 ont aussi réussi chacun 30 passages isolés via `ctest --repeat until-fail:30`, soit 60 exécutions en 5,58 s, sans relance jusqu'à réussite. Ce sont deux cas déjà inclus dans les 102, pas 60 cas distincts supplémentaires. Avant correction, dix passages diagnostiques hors sandbox avaient réussi : cette absence de reproduction naturelle ne démontre pas la cause ; le contre-ordre instrumenté la rend déterministe.
-
-Les premières tentatives sous sandbox refusaient la destination avant rotation : `/tmp` y apparaissait appartenir à `nobody`, contrairement aux exigences de chemin sûr. Elles ne validaient pas le scénario et l'ancien test poursuivait après un échec de préparation jusqu'à une assertion Qt sur une liste vide. Le test corrigé vérifie fatalement sa préparation avant tout accès à cette liste. Les validations ci-dessus ont été exécutées dans l'environnement autorisé, sans affaiblir les contrôles de destination.
-
-Il ne s'agit pas d'une campagne CTest complète. Aucune installation ni transition système n'a été effectuée. Les observations réelles des sections 6.5/6.6 et les six essais Wayland d'export rapportés restent distincts de ces validations automatisées.
-
-**Validation 6A-bis exécutée le 9 novembre 2026 :** compilation ciblée dans `/tmp/passwall-credential-summary-verification`, dont `passwall_app` et les cibles de tests concernées avec leurs dépendances. Tests séquentiels hors sandbox, configurations et coffres fictifs isolés, GUI offscreen. Au terme des sélections et corrections du harnais : **472 cas distincts validés, aucun échec restant ni test ignoré**, pas une exécution unique de toute la suite CTest.
-
-| Périmètre | Dernier résultat validé pendant 6A-bis |
-|---|---|
-| `VaultReplacementTest` | 73/73 : 32 cas existants et 41 nouveaux |
-| `VaultPreferencesStoreTest` | 27/27 |
-| `VaultOperationGuardTest` | 13/13 |
-| `VaultSnapshotServiceTest` | 19/19 |
-| `VaultRestoreServiceTest` | 23/23 |
-| `VaultStorageResourcesTest` | 24/24 |
-| `AutomaticBackupTest` | 66/66 |
-| `BackupJobTest` | 23/23 |
-| Suivi persistant (`VaultDirtyTrackingTest` et `DirectServices/DirtyCrudTest`) | 29/29 |
-| GUI ciblée : contexte éditeurs, `MainWindowEditorLockTest`, préférences, export et mot de passe maître | 123/123, dont l'émetteur 6A et le nettoyage réels |
-| Stockage/clé/cycle de vie, validation/CRUD, mémoire et erreurs transactionnelles, hors gardes déjà comptés | 52/52 |
-
-La sélection initiale de fondations (155 cas, 81,08 s) avait 154 succès et un nouveau test incorrect : il employait `writeMetadata()` comme une mise à jour, alors que cette API insère les métadonnées initiales. Le test vérifie désormais ajout/modification/suppression via `CredentialService`, sans modification de production. La sélection initiale sauvegardes/suivi/ressources (142 cas, 62,31 s) avait 140 succès et deux arrêts de tests SQLite isolés. Les traces GDB ont établi `sodium_malloc → sodium_misuse → SIGABRT` : les deux cas construisaient un `SecureBuffer` sans initialisation de libsodium dans leur processus neuf. La fixture `VaultStorageResourcesTest::SetUp()` initialise explicitement le moteur ; aucune assertion de sécurité ni primitive n'est affaiblie.
-
-Après correction, le cas CRUD a réussi isolément, puis les deux cas SQLite ont réussi isolément (2/2, 0,11 s). La sélection finale `VaultReplacementTest` + `VaultStorageResourcesTest` a réussi 97/97 en 15,18 s. La GUI a réussi 123/123 en 299,60 s, et la dernière sélection métier 52/52 en 66,02 s. Un premier passage de développement 66/66 précédait les sept derniers cas ajoutés. Ces reprises, les vérifications isolées et les sous-processus de diagnostic ne sont pas des cas distincts supplémentaires.
-
-Les nouveaux tests reproduisent notamment une configuration publiée/lisible suivie d'un échec d'ouverture, de `fsync` fichier ou répertoire, des erreurs réelles de `QSettings::sync()` sous permissions restreintes de test, et des exceptions avant/après publication. Ils vérifient un nouveau lecteur et un processus exécuté à neuf, la reprise/UUID/identités, les références conservées, les accès refusés et le snapshot réel sous autorisation, y compris sa révocation pendant la copie et avant publication. Les états post-publication du principal sont **modélisés dans le registre sans substituer les fichiers** ; les snapshots utilisent réellement le moteur sur fichiers fictifs. Cela ne démontre ni remplacement 6B, ni résistance à une coupure électrique, ni nettoyage exhaustif de toutes les allocations historiques. `git diff --check` ne signale aucune erreur ; les fichiers non suivis modifiés ont aussi été contrôlés.
-
-**Validation 6B exécutée le 9 novembre 2026 :** compilation ciblée de `passwall_vault_replacement`, `passwall_replacement_tests`, `passwall_app`, des tests GUI et des cibles de régression concernées dans `/tmp/passwall-credential-summary-verification`. Les sélections finales séquentielles, hors sandbox et exclusivement sur registres/coffres fictifs isolés, valident **449 cas distincts, aucun échec restant ni test ignoré**, dont **62 nouveaux cas** (55 moteur et 7 interruptions). Ce total n'ajoute ni les 472 cas historiques ni les réexécutions, et ne représente pas une campagne CTest complète.
-
-| Périmètre | Résultat pendant 6B |
-|---|---|
-| Contrats `VaultReplacementTest` 6A/6A-bis | 73/73 |
-| Nouveau moteur `VaultReplacementEngineTest` | 55/55 |
-| `RealFiles/VaultReplacementCrashTest` | 7/7 |
-| `VaultPreferencesStoreTest` | 27/27 |
-| `VaultOperationGuardTest` | 13/13 |
-| `VaultSnapshotServiceTest` | 19/19 |
-| Ancienne API `VaultRestoreServiceTest` | 23/23 |
-| `VaultStorageResourcesTest` | 24/24 |
-| `AutomaticBackupTest` / `BackupJobTest` | 66/66 et 23/23 |
-| Suivi persistant (dont trois cas CRUD paramétrés) | 29/29 |
-| Cycle de vie, clés, stockage, validation, CRUD, mémoire et défaillances SQL | 52/52 |
-| Sélection `MainWindowEditorLockTest` (émetteur 6A, verrous, éditeurs, timer, génération native, logind simulé) | 38/38 |
-
-Dernières sélections : remplacement **135/135 en 122,89 s** ; métier/stockage/sauvegardes **276/276 en 221,77 s** ; GUI offscreen **38/38 en 120,15 s**. Le nouveau harnais a d'abord mal ciblé l'injection de synchronisation du registre (ancienne fixture), puis continué après une assertion non bloquante sur un état absent, interrompant la sélection provisoire. Le ciblage et l'assertion ont été corrigés ; les sélections finales ci-dessus passent. Les essais intermédiaires ne sont pas comptés comme nouveaux cas.
-
-**Premier audit préalable 7, le 9 novembre :** ce passage historique avait inspecté les contrats sans compilation, tests ni worker créé. L'arrêt a été suivi de la validation des trois adaptations puis de l'implémentation du 10 novembre (section 5.17). Les résultats 6B ci-dessus ne constituent pas une validation de la délégation ni du nettoyage distant ; la campagne 7 est distinguée ci-dessous.
-
-Les tests 6B authentifient réellement le mot de passe et toutes les entrées (dont corruption volontaire de la deuxième entrée après une première valide), contrôlent les buffers `SecureBuffer` effacés avant publication privée/échange, les mutations de source/candidat/principal, les alias, la copie conditionnelle et ses échecs de publication/durabilité. Ils vérifient un catalogue non vide et ses fichiers conservés, les réservations avant/après échange, les phases persistantes et les erreurs finales. Sept sous-processus s'interrompent sans destruction normale à différentes frontières, sur de vrais fichiers fictifs ; un processus exécuté à neuf inspecte/reprend ensuite les preuves. Des cas séparés refusent fichiers absents, identités/empreintes inattendues, registre corrompu et UUID obsolète. Le callback qui change le chemin principal de l'appelant ne peut pas rediriger l'échange. Les tests n'exercent ni GUI de restauration ni délégation à un worker ; ils ne simulent pas une panne électrique ou un noyau bloqué. Les vérifications de symboles n'exposent pas l'émetteur de test en production et n'introduisent pas le déchiffrement dans le worker de sauvegarde. `git diff --check` et les contrôles des fichiers non suivis sont sans diagnostic.
-
-**Campagne ciblée 7 du 10 novembre : 737 cas distincts réussis, aucun échec ni test ignoré dans les sélections finales.** Les 56 nouveaux cas se répartissent en 20 protocole/worker/supervision, 35 GUI (dont 7 délégations altérées, 5 interruptions paramétrées et 2 rejets de données après résultat terminal) et 1 contrat de revalidation tardive 6A. Le passage GUI initial de 229 cas puis le passage ciblé final de 46 cas se recouvrent sur 44 cas : 231 cas GUI distincts, pas 275. Un test GUI d'assistance est volontairement appelé uniquement comme sous-processus du test de disparition réelle du parent ; il ne constitue pas un cas ordinaire additionnel réussi/ignoré. Les réexécutions et les historiques ne sont pas additionnés. Les assertions de compilation négatives sur les rôles de délégation sont vérifiées séparément, sans les compter comme tests d'exécution.
-
-| Cible / sélection finale | Résultat | Durée rapportée |
-|---|---|---|
-| `passwall_restore_job_tests`, dernière exécution | 20/20 | 4,740 s |
-| `passwall_gui_tests`, hors assistance d'arrêt parent | 229/229 puis 46/46 ; 231 distincts | 250,792 s puis 84,891 s |
-| `passwall_replacement_tests` | 136/136 | 118,397 s |
-| `passwall_tests` : services, buffers, exclusion, origines, parseur et Native Messaging | 139/139 | 44,300 s |
-| `passwall_preferences_tests` | 27/27 | 0,151 s |
-| `passwall_storage_tests` | 24/24 | 12,628 s |
-| `passwall_snapshot_tests` | 19/19 | 3,365 s |
-| `passwall_restore_tests` | 23/23 | 26,519 s |
-| `passwall_backup_tests` | 23/23 | 11,409 s |
-| `passwall_automatic_backup_tests` | 66/66 | 17,358 s |
-| `passwall_dirty_tracking_tests` | 29/29 | 0,325 s |
-
-Durées par passage indiquées ci-dessus, hors compilation et essais préliminaires ; il ne s'agit pas d'une seule exécution globale sans recouvrement. Les derniers 20 et 46 cas passent après le resserrement des passerelles privées ; le second passage GUI couvre également les deux nouveaux contrôles de fin de flux. Exécution séquentielle dans l'environnement autorisé pour l'IPC Unix, GUI offscreen, coffres/registres/destinations fictifs uniquement ; rapports `step7-*.json` sous `/tmp/passwall-credential-summary-verification`. Pas de suite CTest complète, nouveau Firefox réel, transition système, coupure électrique ou noyau réellement bloqué. Les tests de codec/EOF/troncature sont isolés ; les scénarios GUI exercent le véritable émetteur, le worker de test séparé, les FD et les fichiers réels. Son instrumentation contrôle l'effacement avant `sodium_free` et l'absence d'allocation `SecureBuffer` vivante au message `Cleaned`, pas toute allocation historique de Qt/C++/libsodium. `Unknown` avec enfant sensible non arrêté est simulé en retenant une phase et en inhibant les signaux d'arrêt du seul test ; la terminaison ultérieure est réelle. `Control1` utilise un bus privé ; le signal logind est simulé, mais l'inhibiteur FIFO et sa libération sont réels. Un parent GUI de test se termine réellement par `_exit` ; l'inspection suivante constate le blocage `armed`, sans répéter l'échange.
-
-Les premiers essais ont distingué deux problèmes de harnais/environnement : l'envoi Unix échouait sous sandbox alors que le même test isolé réussissait hors sandbox ; le premier pilote GUI appelait le worker de production depuis un parent de test, correctement refusé. Le chemin du worker de test a été instrumenté au point d'appel externe, sans élargir les parents admis en production. Les diagnostics Qt offscreen (`raise`/`propagateSizeHints`) et les avertissements attendus des tests de défaillance D-Bus ne sont pas des échecs.
-
-**Condition historique de compilation de 7 :** cette campagne utilisait un alias SQLite hors dépôt fourni par `CMAKE_PROJECT_INCLUDE`, car CMake 3.31.6 ne définissait pas `SQLite3::SQLite3`. Ce recours temporaire est supprimé par la maintenance ci-dessous ; il ne doit plus être nécessaire à une configuration du projet. Les contrôles de 7 n'exposaient aucun symbole d'émetteur de test ni chemin de parent GUI/test dans le worker de production ; le worker de sauvegarde n'importait pas `crypto_pwhash`/`sodium_malloc`.
-
-**Maintenance ciblée après 7, le 10 novembre :** l'alias conditionnel recommandé par la [documentation CMake](https://cmake.org/cmake/help/latest/module/FindSQLite3.html) est intégré immédiatement après l'unique `find_package(SQLite3 REQUIRED)`. Tous les liens conservent `SQLite3::SQLite3` ; l'ancienne cible n'est utilisée que comme origine de l'alias lorsque la nouvelle manque. Configuration autonome réussie dans `/tmp/passwall-cmake-maintenance-06yEV7`, sans hook ni fichier externe ; l'ancien cache de vérification a aussi été reconfiguré sans son hook. Compilation des cibles concernées réussie avec CMake 3.31.6/GCC 14.2, en `RelWithDebInfo` avec `_FORTIFY_SOURCE=2`, sans avertissement C++ ou CMake relevé dans les journaux.
-
-Les **14 avertissements de retours ignorés**, répartis entre huit fichiers de tests/auxiliaires, sont corrigés sans modification du code métier. `tests/posix_test_io.hpp` limite la duplication : écritures complètes, reprise sur `EINTR`, erreurs/EOF explicitement traités, aucune boucle de reprise sur une erreur réelle. Les synchronisations enfant/parent sont vérifiées ; les injections de collision contrôlent la création et l'écriture du fichier fictif ; l'ouverture du marqueur de sortie est contrôlée. Les réponses volontairement invalides ou tronquées restent telles quelles, sans nouvelle temporisation ni option masquant les avertissements.
-
-Validation de maintenance : **400/400 tests distincts, aucun échec ni test ignoré** — exclusion métier 13, registre 27, snapshots 19, restauration existante 23, sauvegardes 23, automatique/rotation 66, remplacement 136, protocole/worker 20, sélection GUI 73 (instance unique, `Control1`, éditeurs, 6A et supervision). Les dix tests d'instance unique ont également été revérifiés après la dernière recompilation de leur auxiliaire, sans les additionner. Durées cumulées des neuf sélections : 274,734 s, hors compilation et réexécution. Une sonde ponctuelle sous `/tmp`, avec retours système simulés, vérifie séparément huit contrats d'E/S (partiels, `EINTR`, EOF, écriture nulle, erreurs sans boucle) ; elle n'est pas une nouvelle suite CTest versionnée. Journaux et rapports JSON dans le nouveau répertoire temporaire. Les empreintes des 21 fichiers préexistants des étapes 6A à 7 hors CMake/documentation sont inchangées ; `git diff --check` est sans diagnostic. Pas de suite CTest complète, coffre personnel, installation ni transition système. L'utilisateur rapporte ensuite une compilation GitHub Actions ARM64 réussie après publication ; elle n'est pas réexécutée pendant 8A et ne valide pas ses nouvelles modifications GUI.
-
-**Validation GUI 8A du 10 novembre :** compilation ciblée de `passwall_app`, `passwall_gui_tests`, des workers et tests directement concernés dans `/tmp/passwall-credential-summary-verification`, CMake 3.31.6 autonome, sans hook SQLite externe. **29 nouveaux cas** : 22 parcours GUI, une conversion de maître UTF-8 exacte et six présentations paramétrées d'issues 6B. Le parcours complet utilise les widgets, le véritable émetteur 6A de `MainWindow`, `RestoreJob`, le worker de test séparé et les fichiers réellement échangés/finalisés par 6B. Il vérifie restauration d'une source hors catalogue, principal restant verrouillé, ancienne session native invalide, source intacte, état chiffré complet de la copie exceptionnelle et préférences conservées. Les cas d'erreur/précaution, autre principal, annulations avant/après échange, fermeture, réservation conservée, préparation obsolète, consentement devenu invalide et `Unknown` tardif sont distincts.
-
-Les FIFO de test retiennent réellement le worker aux frontières ; la simulation d'une notification métier tardive teste le consommateur GUI, pas une nouvelle autorisation. Les six présentations de résultats sont des tests de formatage, pas six pannes matérielles. Les tests 7 maintenus exercent séparément les acquittements `Control1`, le nettoyage distant et logind simulé. Aucun écran réel verrouillé, aucune restauration manuelle Wayland, installation ou panne électrique pendant cette campagne.
-
-**Incidents de validation 8A :** un premier passage des 27 cas alors présents avait 25 succès et deux assertions de harnais incorrectes : un instantané SQLite ne promet pas l'identité de tous les octets d'en-tête du fichier, et le diagnostic de lignée ne se confond pas avec celui de mauvais maître. Les tests vérifient désormais toutes les données SQL chiffrées/métadonnées et la cause effective, sans changer les moteurs ; les 29 cas ont ensuite réussi. Un libellé de progression GUI distingue aussi la copie exceptionnelle confirmée de son absence légitime lorsque automatique activé.
-
-La sélection de régression GUI a ensuite validé 99 cas (éditeurs, `MainWindow`, préférences), puis s'est interrompue dans `ManualVaultExportTest.RealCleanupPrecedesLaunchAndSnapshotReopensWithOriginalPassword`. GDB a confirmé un callback du test capturant un booléen local expiré, rappelé par le verrouillage du destructeur durant `TearDown()` (`__stack_chk_fail`). Un contexte `QObject` limité au corps du test déconnecte maintenant cet observateur avant disparition de ses captures ; aucune assertion ni logique d'export n'est supprimée. Le cas isolé corrigé réussit, puis les 161 cas GUI restants réussissent en 99,913 s, dont les 29 nouveaux. **260 cas GUI distincts validés**, pas une exécution unique de 260 après le diagnostic ; les cas déjà passés et réexécutions ne sont pas additionnés. Les diagnostics Qt offscreen et les erreurs volontaires de bus privé restent attendus ; aucun avertissement C++/CMake relevé dans les compilations ciblées.
-
-**Bilan 8A : 713 cas ciblés distincts validés, aucun échec restant ni test ignoré**, sans suite CTest complète. Les 29 nouveaux sont inclus dans la ligne GUI, pas ajoutés au total une seconde fois.
-
-| Cible / sélection pendant 8A | Résultat validé | Durée du passage |
-|---|---|---|
-| `passwall_gui_tests`, hors helper d'arrêt parent | 99 avant diagnostic + 161 restants, soit 260 distincts | Suites initiales 141,755 s ; reprise 99,913 s |
-| `passwall_restore_job_tests` | 20/20 | 2,971 s |
-| `passwall_replacement_tests` — contrats 6A/6A-bis, moteur et interruptions | 136/136 | 105,241 s |
-| `passwall_backup_tests` | 23/23 | 11,231 s |
-| `passwall_automatic_backup_tests` | 66/66 | 16,181 s |
-| `passwall_preferences_tests` | 27/27 | 0,108 s |
-| `passwall_snapshot_tests` | 19/19 | 3,017 s |
-| `passwall_restore_tests` — ancienne API vers nouveau fichier | 23/23 | 23,772 s |
-| `passwall_tests` — services, mémoire, SQL, gardes, origines, parseur et Native Messaging | 139/139 | 40,207 s |
-
-Exécutions séquentielles dans l'environnement autorisé, GUI offscreen et IPC réels de test ; rapports `step8a-*.json`/journaux dans le répertoire temporaire de vérification. Le helper GUI d'arrêt parent est exercé uniquement par son test de sous-processus. Les durées ci-dessus n'incluent pas compilation, diagnostics, réexécutions ni validations historiques. Dernière vérification de construction : toutes les cibles concernées à jour (`ninja: no work to do`). `git diff --check` et contrôle de whitespace des cinq nouveaux fichiers sont sans diagnostic. Aucune donnée personnelle, configuration système, politique SQLite, primitive cryptographique, format de coffre ou installation utilisateur modifiés.
-
-**Validation ciblée 8B du 10 novembre : 772 cas distincts validés, aucun échec restant ni test ignoré.** Les 30 nouveaux cas comprennent 25 GUI et cinq du registre : comparaison conditionnelle, identité périmée, conservation d'états internes, lecture d'affichage sans verrou d'écriture et refus d'un snapshot corrompu. Les répétitions et historiques ne sont pas ajoutés au total.
-
-| Cible / sélection pendant 8B | Résultat validé | Durée du passage |
-|---|---|---|
-| `passwall_gui_tests`, hors helper d'arrêt parent | 283/283 puis 25/25, 23 communs : **285 distincts** | 281,365 s puis 7,946 s |
-| `passwall_preferences_tests` | 32/32 | 0,119 s |
-| `passwall_dirty_tracking_tests` | 29/29 | 0,269 s |
-| `passwall_automatic_backup_tests` | 66/66 | 16,797 s |
-| `passwall_backup_tests` | 23/23 | 11,765 s |
-| `passwall_replacement_tests` | 136/136 | 118,238 s |
-| `passwall_restore_job_tests` | 20/20 | 3,443 s |
-| `passwall_snapshot_tests` | 19/19 | 3,724 s |
-| `passwall_restore_tests` | 23/23 | 26,537 s |
-| `passwall_tests` — services/mémoire/SQL/gardes/origines/parseur/Native Messaging | 139/139 | 43,798 s |
-
-Le répertoire `/tmp/passwall-credential-summary-verification` avait disparu ; une configuration neuve autonome CMake 3.31.6/Debug a été recréée, sans `CMAKE_PROJECT_INCLUDE` ni alias externe. Compilation ciblée de l'application, des GUI, workers et cibles ci-dessus ; aucune installation. Les dernières compilations ne présentent pas d'avertissement C++/CMake. Les avertissements Qt offscreen et les erreurs volontaires de bus simulés sont attendus. Rapports `step8b-*.json`/journaux sous ce répertoire ; durées hors compilation et diagnostics, pas une campagne CTest complète. Le helper de disparition du parent est appelé uniquement par le sous-processus prévu.
-
-**Preuves et périmètre :** plusieurs parcours passent réellement par widgets → registre → coordinateur → worker de production → publication/catalogue. Activation coffre fermé/ouvert, CRUD regroupés au verrouillage, reprise après reconstruction avec copie fraîche réelle, destination absente, changement de dossier/rétention sans suppression immédiate et marqueurs conservés sont vérifiés. Les tests 6A à 8A, des éditeurs, de logind, du minuteur et du pont natif restent réussis. Les huit fichiers dédiés à la préparation/autorisation et GUI de restauration 8A relevés avant intervention conservent leurs empreintes ; les points d'intégration communs sont étendus sans retirer leurs protections.
-
-Les fautes de système de fichiers sont simulées via `fstatfs`, la persistance via le wrapper `fsync` existant ; un `fsync` retenu par condition permet de constater des événements Qt pendant l'attente. Un faux worker simule échec/rotation sans réponse ; la reprise est ensuite exercée avec un nouveau coordinateur utilisant le vrai worker. `Unknown` avec enfant vivant est produit en inhibant uniquement les signaux d'arrêt du test ; la réservation puis la terminaison sont réelles, pas une E/S noyau réellement non interruptible. Une notification contradictoire `Unknown` est aussi injectée uniquement dans le consommateur GUI pour vérifier qu'un snapshot lisible n'est pas une preuve de réussite. Le parentage transitoire et la destruction des fenêtres sont contrôlés offscreen, sans prétendre couvrir toute sortie d'application ni labwc réel.
-
-**Incidents de développement corrigés :** les premières lectures GUI avec `list()` pouvaient entrer en concurrence avec le coordinateur et produire une fausse panne de registre. Le nouveau snapshot d'affichage sans verrou, jamais utilisé pour l'admission métier, supprime cette contention ; un test maintient explicitement le verrou d'un autre écrivain et vérifie la séparation lecture/admission. Le premier harnais poursuivait aussi après un échec d'attente dans un helper, jusqu'à une liste vide ; les assertions sont désormais bloquantes au point d'utilisation et attendent la disponibilité réelle du formulaire, sans délai supposé suffisant. Un parent `QObject` tenté pour la fenêtre la faisait rejeter par `lockVault()` pendant la préparation 6A, puis le test accédait à une fenêtre détruite (GDB). La relation finale est uniquement transitoire `QWindow`, avec propriété explicite du contrôleur et `WA_QuitOnClose=false` ; le nettoyeur global n'est pas modifié. Les 25 cas GUI finaux réussissent après cet ajustement ; ils incluent les deux derniers contrôles de fermeture/prudence sur `Unknown`, sans recompter les 23 déjà passés.
-
-Les fichiers et registres sont fictifs et isolés ; IPC Unix exécutés dans l'environnement autorisé. Aucun coffre personnel, préférence personnelle, exécutable installé, paramètre système ou transition système utilisés/modifiés. Aucune nouvelle validation Firefox réel, Wayland, NAS ou GitHub Actions n'est déduite de ces essais. La vérification finale des onze cibles concernées indique `ninja: no work to do`. `git diff --check` et le contrôle de whitespace des cinq nouveaux fichiers ne produisent aucun diagnostic ; aucune modification préexistante n'est restaurée ni supprimée.
-
-Cinq tests JavaScript sont présents, avec le module standard `node:test` : deux dans `fill-script.test.cjs` et trois dans `navigation-security.test.cjs`. Ils restent indépendants de CTest et le dépôt ne contient ni `package.json` ni dépendance npm. Le workflow ARM64 installe explicitement Node.js 24 avec `actions/setup-node` puis exécute `node --test tests/extension/*.test.cjs` dans une étape dédiée ; tout échec rend cette étape non nulle. Les cinq cas réussissent localement avec Node.js 20.19.2, version disponible sur la machine de développement ; la branche 24 retenue pour la CI reste à confirmer par le prochain workflow.
-
-**Reprise ciblée 8C-1a du 10 novembre — `prepared` : 105 cas distincts réussis, aucun échec restant ni test ignoré.** Compilation de `passwall_replacement_tests` avec une seule tâche dans `/tmp/passwall-credential-summary-verification`, sans avertissement C++ relevé ; aucun test exécuté en parallèle de la compilation. Le contrôle Ninja du binaire GUI existant indique qu'il est à jour. Aucun changement de production supplémentaire n'a été nécessaire : contrat privé et transitions persistantes de la tentative interrompue réutilisés. Les fichiers hors périmètre contrôlés (GUI, tests GUI, CMake, `.gitignore`) restent identiques aux empreintes prises au début de la reprise.
-
-| Sélection finale 8C-1a | Résultat | Durée du binaire |
-|---|---|---|
-| `VaultReplacementTest.RecoveryPrepared*` et `VaultReplacementEngineTest.PreparedRecovery*` | 17/17 | 7,640 s |
-| Autres `VaultReplacementTest` et quatre régressions indispensables du moteur 6B | 79/79 | 10,413 s |
-| Six tests existants du véritable propriétaire/worker 6A/7 et trois intégrations `prepared` de la GUI préexistante | 9/9 | 19,350 s |
-
-Quatre tests complémentaires de cette reprise couvrent le principal chiffré réel après mauvais maître puis récupération dans un processus neuf, l'annulation avant armement puis nouvelle authentification, un enfant conservant les réservations après fermeture des descripteurs parent et le candidat enregistré absent/divergent. Les tests existants couvrent UUID, identité principale, échecs des deux écritures, exception, interruptions réelles par `_exit`, nouvelle invocation, préférences et conservation des artefacts. L'émetteur des tests métier simule l'acquittement ; les neuf tests d'intégration distincts exercent le véritable `MainWindow`, son invalidation Native, le worker et l'acquittement du nettoyage distant. Le processus enfant de réservation est une simulation de détenteur de descripteurs, pas le worker délégué lui-même ; le refus avec le véritable worker encore actif est couvert séparément par le test GUI existant.
-
-La première sélection a réussi 12/13 : le test d'exception utilisait un ordinal de `QSettings::sync()` qui n'atteignait pas la publication attendue. L'injection est désormais conditionnée à l'observation effective de `abandon-confirmed`, attestée par assertion. Une exception avant confirmation durable peut laisser soit `prepared`, soit `abandon-confirmed` selon la restauration du cache Qt ; les deux variantes doivent rester bloquées et récupérables. Le résultat n'a pas été transformé en succès ni les assertions de porte supprimées. La sélection finale 17/17 inclut ce test corrigé ; essais initiaux et historiques ne sont pas additionnés aux 105 cas. Journaux et rapports JSON : `step8c1a-*` dans le répertoire de vérification. Avertissements d'affichage Qt offscreen attendus ; aucune nouvelle campagne générale CTest, validation Wayland, installation, modification cryptographique ou panne électrique simulée. `git diff --check` sans diagnostic. GUI de récupération et autres états 8C-1 conservés sans nouvelle réalisation ni validation exhaustive.
-
-**Contrôle historique 8C-1b du 10 novembre, avant correction bis — après engagement : 35 tests distincts réussis, sans échec ni ignoré, mais étape alors non clôturée sur le blocage des résultats incertains.** Cinq cas ajoutés : quatre validations de contrat et une caractérisation explicite de l'écart décrit en 5.20. Ils passent 5/5 en 11,964 s ; les 30 régressions directement concernées passent 30/30 en 38,552 s. Les sélections ne se recouvrent pas ; les historiques 6B/7/8C-1a ne sont pas additionnés.
-
-Les nouveaux cas exercent un coffre chiffré fictif réellement échangé : refus de reprise `armed` après échange et `identity-confirmed` lorsque seul l'ancien artefact reste réservé par un enfant, puis reprise après sa sortie effective ; crash réel par `_exit` après synchronisation du registre protégé, avant résolution, puis deux reprises dans des processus neufs ; refus d'une empreinte du candidat devenue divergente après confirmation. Le détenteur de réservation est un enfant simulé, pas une nouvelle exécution du worker délégué 7. Les régressions réutilisent notamment sept frontières de crash 6B, identités/empreintes divergentes, fichier absent, UUID obsolète, inspection sans finalisation, échecs de synchronisation et reprises/idempotence 6A-bis. Une régression de l'abandon `prepared` vérifie aussi le réemploi inchangé du hook d'interruption.
-
-Au jalon 8C-1b, `CharacterizationEngagedRecoveryUnconfirmedReceiptAllowsAuthentication` passait en reproduisant **l'écart**, pas en prouvant la conformité : `recoverReplacement()` retournait `SafeResolutionUnconfirmed` après échec injecté du dernier `fsync`, le reçu résolu restait visible et une authentification ordinaire réussissait sans nouvelle confirmation. Ce contre-exemple est adapté en 8C-1b-bis pour exiger la revalidation et vérifier le refus sous erreur. Il n'y avait ni ouverture automatique, ni effacement de l'ancien principal, ni nouvelle substitution. L'injection d'E/S ne simule pas une panne matérielle réelle.
-
-Compilation ciblée `passwall_replacement_tests` avec `-j1` dans `/tmp/passwall-credential-summary-verification`, sans avertissement C++ relevé ; exécution après compilation, pas de campagne CTest générale ni test GUI pendant cette intervention. Rapports JSON/journaux `step8c1b-*` dans ce répertoire. Seulement les deux fichiers de tests du remplacement et les deux documents sont retouchés ; empreintes de production/GUI/CMake et autres fichiers hors périmètre contrôlés inchangées. Aucun nouveau moteur, constructeur d'autorisation, état persistant, chiffrement, installation ou paramètre système modifié ; aucun coffre personnel utilisé. `git diff --check` sans diagnostic.
-
-**Correction ciblée 8C-1b-bis du 10 novembre : 117 cas distincts réussis, zéro échec restant/ignoré.** Quatre tests directs passent 4/4 en 3,424 s (trois nouveaux et le contre-exemple adapté), puis 113 régressions sélectionnées passent 113/113 en 54,197 s, sans recouvrement ni addition des historiques. Bibliothèque de production, application et `passwall_replacement_tests` compilées dans `/tmp/passwall-credential-summary-verification` avec `-j1`, tests exécutés séparément ; pas d'avertissement C++ relevé. Rapports JSON/journaux `step8c1bbis-*` sous ce répertoire, pas de suite CTest générale ni d'installation.
-
-Les tests directs prouvent le refus sur erreur du `fsync` fichier ou répertoire à l'admission, même après une confirmation précédente ; le refus d'un renommage atomique concurrent QSettings conservant pourtant le même reçu ; l'application au reçu d'abandon ; le reçu final visible après erreur, l'authentification refusée avec sortie de clé vide tant que la nouvelle synchronisation échoue, le même refus dans un processus neuf, puis la reprise confirmée et l'authentification normale. Les régressions couvrent les réservations, l'ancien principal conservé, les empreintes/UUID divergents, les reprises de `prepared`/`armed`/`identity-confirmed` et sept interruptions réelles de processus 6B. Une première exécution directe a passé 3/4 : le nouveau test multi-erreurs n'avait pas réarmé le compteur d'injection pour sa deuxième et troisième faute ; compteur corrigé sans relâcher les assertions, puis 4/4. Les réexécutions ne sont pas comptées deux fois.
-
-La correction ne déduit aucune preuve de durabilité historique des octets QSettings. Elle exige une preuve système actuelle avant l'accès ; une revalidation saine peut donc suffire sans action GUI supplémentaire. Le résultat initial `SafeResolutionUnconfirmed` n'est pas rétroactivement changé, les transitions restent identiques et le suivi GUI conservateur n'est pas supprimé. Les seuls fichiers retouchés par cette reprise sont `vault_preferences_store.cpp`, les deux tests du remplacement et les deux documents. Aucun changement de cryptographie, SQLite, sauvegardes, GUI, artefact, coffre personnel, installation ou paramètre système. Les limites sont celles de `fsync`, des participants coopératifs et de la latence potentiellement non bornée des E/S ; aucun cache ni témoin persistant n'est ajouté. `git diff --check` sans diagnostic.
-
-**Interface 8C-1c du 10 novembre : 88 tests ciblés distincts réussis, aucun échec restant ni ignoré.** Reprise de la GUI interrompue ; le moteur, le registre, les réservations, les contrats et l'admission 1.18 sont inchangés. Compilation de `passwall_app` et `passwall_gui_tests` avec `-j1` dans `/tmp/passwall-credential-summary-verification`, sans avertissement de compilation relevé ; moteur de tests métier déjà à jour. Tests exécutés après compilation, séquentiellement, sans campagne CTest générale.
-
-| Sélection finale 8C-1c | Résultat | Durée du binaire |
-|---|---|---|
-| `VaultRestoreGuiTest.*`, `VaultRestoreDialogTest.*`, `Outcomes/VaultRestoreResultTest.*` | 45/45, dont 16 parcours de récupération | 39,327 s |
-| 14 régressions ciblées `MainWindowEditorLockTest` : 6A, nettoyage distant/`Control1`, logind simulé, réservations, fermeture, éditeurs, Native Messaging, inactivité | 14/14 | 25,288 s |
-| 29 contrats : `Recovery*`, admission durable, `PreparedRecovery*`, `EngagedRecovery*`, inspection et empreintes divergentes | 29/29 | 25,955 s |
-
-Quatre nouveaux tests GUI complètent les douze préexistants : crash réel avant échange avec `armed` bloqué ; échange réel puis échec injecté de la synchronisation `identity-confirmed`, nouvelle fenêtre et finalisation ; reçu `abandoned` visible malgré échec de son dernier `fsync`, refus effectif d'authentification puis reprise ; inspection révoquée par perte de protection Linux sans action proposée. Le test de fermeture conserve maintenant aussi le dialogue réouvert : le résultat ancien ne l'autorise pas, et la réservation reste détenue jusqu'à la fin de la tâche. L'injection de persistance cible le descripteur du registre après observation de la phase publiée ; elle ne repose pas sur un ordinal fragile et n'est liée qu'au binaire GUI de test.
-
-Le parcours d'intégration mauvais maître → worker réel → `prepared` → confirmation d'abandon → authentification normale a été exécuté sur coffre fictif chiffré, avec le véritable `MainWindow`, ses générations et ses réservations. Les redétections GUI utilisent une nouvelle `MainWindow` sans état préalable ; les contrats après redémarrage sont aussi réexécutés dans des processus neufs par les tests métier. Aucune ouverture automatique, nouvelle substitution, suppression de l'ancien principal ni levée sur résultat incertain. Réactivité vérifiée avec une barrière de synchronisation déterministe, pas avec une garantie de latence absolue des appels noyau.
-
-La première sélection complémentaire a passé 15/16 : une assertion supposait un bouton d'ouverture désactivé, alors que son état visuel reflète la protection logind. Elle vérifie désormais le véritable refus à l'entrée de l'authentification et l'absence de session, sans changer ce contrat GUI ni relâcher la porte de sécurité. Les 12 validations initiales et les réexécutions ne sont pas additionnées aux 88 tests finaux (90,570 s cumulées hors compilation). Journaux/JSON `step8c1c-*` dans le répertoire de vérification. Avertissements Qt offscreen attendus ; pas de nouveau test manuel Wayland, transition système, panne électrique, coffre personnel ou installation. Les deux documents passent en 1.19 ; `git diff --check` sans diagnostic.
-
-**Verrouillage automatique obligatoire 8C-2 du 11 novembre : 64 tests ciblés distincts réussis, aucun échec restant ni ignoré.** Le code de migration et les tests laissés par l'interruption ont été conservés. Les deux cibles `passwall_app` et `passwall_gui_tests`, avec leurs dépendances nécessaires, ont été reconstruites dans `/tmp/passwall-credential-summary-verification` disparu entre les sessions, avec `-j1`, puis vérifiées à jour. Configuration CMake autonome et compilations sans avertissement relevé ; tests séquentiels exécutés après compilation, hors restrictions de sandbox pour les ressources Unix de test, sans suite CTest complète.
-
-| Sélection 8C-2 | Résultat | Durée du binaire |
-|---|---|---|
-| Migration/minuteur, export et réglage pendant restauration/récupération | 23/24 initialement ; le worker refusé est revalidé ci-dessous | 68,323 s |
-| Reprise isolée du test de réglage avec worker sensible | 1/1 | 3,354 s |
-| Expiration après une minute réelle, sans réduction d'intervalle ni émission synthétique de timeout | 1/1 | 62,189 s |
-| Éditeurs, anciennes sessions, Native Messaging, logind simulé et acquittements de nettoyage distant | 23/23 | 35,328 s |
-| Sauvegardes/export, restauration, récupération et préférences partagées | 18/18, dont deux cas déjà sélectionnés initialement : worker sensible renforcé et récupération asynchrone | 24,953 s |
-
-Les sélections se recouvrent : elles représentent **64 cas distincts**, pas la somme des passages. Douze nouveaux cas préparés avant l'interruption sont présents : dix tests de politique/GUI/migration, un export en cours pendant l'inactivité d'un autre coffre et un réglage pendant la phase sensible de restauration. Les anciens tests de désactivation vérifient désormais la migration. Les cinq durées sont sélectionnées, persistées, relues et vérifiées comme intervalles effectivement armés ; les attentes de 5 à 60 minutes ne sont pas réalisées en temps réel. Les dialogues et éditeurs utilisent aussi des expirations Qt accélérées uniquement dans les tests. L'attente réelle d'une minute vérifie le verrouillage et le refus de l'ancien accès natif.
-
-Le seul échec initial provenait de permissions `0775` des exécutables du nouveau build temporaire : `RestoreJob` a correctement refusé le worker inscriptible par le groupe avant sa phase sensible. Les permissions des seuls binaires temporaires et de leur répertoire ont été corrigées ; aucune protection de lancement n'a été relâchée. Le test vérifie maintenant explicitement le démarrage effectif et la phase `BeforeWork`, puis l'absence de réouverture/annulation au changement de durée. Aucun autre changement de production n'a été nécessaire lors de la reprise. Les erreurs de persistance, le registre invalide non réécrit, les notifications non modales, le maintien des réservations et la fermeture/les résultats tardifs sont couverts. Journaux et JSON : `/tmp/passwall-8c2-*` ; avertissements Qt offscreen attendus, aucun essai manuel Wayland ni modification d'installation. `git diff --check` sans diagnostic. Les limites du thread GUI et de l'inactivité locale restent celles de la section 5.5.
-
-**Permissions et diagnostic du worker — 12 novembre 2026 : 67 tests ciblés distincts réussis.** Une configuration et compilation isolées sous `/tmp/passwall-restore-permission-verification` ont produit `passwall_app`, les workers et les pilotes de test en `0755`, sans avertissement relevé ; une installation simulée sous `/tmp` a confirmé `0755` pour les deux binaires de production. Les sélections finales couvrent 18 contrats de protocole/confiance/parent, 4 refus et nettoyages de `RestoreJob`, les 42 parcours `VaultRestoreGuiTest`, puis 3 cas complémentaires : admission `77` sans faux diagnostic et deux vrais flux invalides. Elles incluent le worker `0775`, l'inode parent différent, une permission changée après préparation avec erreur propagée et la restauration complète. Tous passent après compilation avec `-j2`. Le premier passage des protocoles dans le sandbox a échoué/bloqué sur les sockets locaux ; les sélections finales ont été exécutées dans l'environnement autorisé. Une assertion GUI initiale supposait à tort que `deleteLater()` avait déjà retiré l'objet refusé ; elle vérifie désormais son état inactif sans modifier la production. Aucune suite CTest complète, installation utilisateur ou modification de coffre n'a été effectuée.
-
-**Abandon automatique des issues ordinaires — 12 novembre 2026 : 47/47 tests ciblés distincts réussis.** Compilation isolée avec `-j1` : 43 tests `VaultRestoreGuiTest`, trois tests du moteur distinguant refus de la clé maître, lignée divergente et entrée corrompue, plus un test propriétaire `MainWindowEditorLockTest` du nettoyage/refus de publication de session. Les parcours couvrent notamment annulation avant worker, mauvais maître, attente de terminaison réelle, échec de persistance, résultat incertain, worker encore actif et récupération après redémarrage. Ils utilisent exclusivement coffres/registres fictifs et le worker instrumenté. Ils vérifient le maintien de la réservation avant sortie, l'absence d'ouverture automatique, le reçu `abandoned` durable, le principal inchangé et le retour à la récupération manuelle si la résolution échoue. Les exécutions nécessitant l'admission locale du worker ont été réalisées hors sandbox, ses contrôles `/proc`/`SO_PEERCRED` n'y étant pas utilisables ; les refus du sandbox ne sont pas comptés comme défaut applicatif. Aucune suite CTest complète, installation ou essai Wayland n'a été effectué.
-
-**Retrait de `VaultRestoreService` — 15 novembre 2026 : 94/94 tests ciblés distincts réussis.** Configuration et compilation isolées sous `/tmp/passwall-retire-restore-verification` avec `-j1` : `passwall_app`, `passwall_restore_worker`, `passwall_replacement_tests` et `passwall_restore_job_tests`. Les 65 `VaultReplacementEngineTest` et sept interruptions `RealFiles/VaultReplacementCrashTest` réussissent, dont les trois garanties transférées ; les 22 tests de protocole, confiance, supervision et worker réussissent également. La configuration ne contient plus la cible `passwall_restore_tests` ni de référence source à l'ancien service. Les tests nécessitant identités de fichiers, réservations et `SO_PEERCRED` ont été exécutés dans l'environnement autorisé, exclusivement sur des coffres et registres fictifs. Aucune suite CTest complète, installation ou modification de configuration personnelle n'a été effectuée.
-
-**Optimisation CMake — 16 novembre 2026 :** une configuration Ninja neuve sous `/tmp/passwall-cmake-default-BDDI4D`, compilée avec `-j1`, a terminé les 87 actions du build par défaut. Elle produit uniquement `passwall_app`, `passwall_backup_worker`, `passwall_restore_worker`, `passwall_native_host` et `passwall-session-lock`, avec leurs bibliothèques de production ; aucun exécutable de test, faux worker, probe, `passwall_env_check` ou `passwall_argon2_benchmark` n'était alors présent. Les deux outils ont ensuite été compilés explicitement. La cible agrégée `passwall_all_tests` a été résolue par Ninja avec 164 actions restantes, sans cible manquante ; `passwall_preferences_tests` et `passwall_native_host_tests` ont été compilés explicitement puis leurs **38/38** cas découverts par CTest ont réussi en 0,76 s. Ce contrôle ciblé ne constitue ni une compilation locale de toutes les suites, ni une campagne CTest complète. Le workflow ARM64 construit désormais successivement la production et `passwall_all_tests` pour conserver la couverture de compilation des tests ; son exécution GitHub Actions reste à confirmer après publication.
-
-**Exécution CTest automatisée — 16 novembre 2026 :** l'agrégat `passwall_all_tests` a été compilé intégralement avec `-j1`, sans avertissement relevé. CTest enregistre **888 cas** dans 12 exécutables : cœur 162, registre 32, ressources SQLite 24, snapshots 19, restauration supervisée 22, remplacement 165, sauvegardes automatiques 66, sauvegardes 23, suivi persistant 29, GUI 319, Native Host 6 et coordinateur de session 21. Le workflow installe explicitement `dbus-daemon`, fixe `QT_QPA_PLATFORM=offscreen` et exécute `ctest --output-on-failure --no-tests=error --parallel 1` sans filtre : aucun cas CTest n'est exclu et une sélection vide ou un échec rend l'étape non nulle.
-
-La validation locale initiale est restée ciblée : **569/569** cas non-GUI prioritaires ont réussi en 327,91 s, puis **108/108** cas GUI de restauration et protections Linux simulées ont réussi en 111,37 s, soit 677 cas distincts. Un premier passage dans le sandbox a été interrompu après que les contrôles de chemin ont correctement refusé le `/tmp` présenté comme modifiable par autrui et que les sockets Unix ont été bloqués ; le même ensemble a réussi dans l'environnement autorisé, sans relâchement des protections. Les 211 autres cas GUI avaient été compilés et enregistrés, pas rejoués localement. Aucun test n'effectue de vraie transition Wayland/logind ou de vrai verrouillage d'écran : ces validations système restent manuelles. Les cinq tests JavaScript restent hors CTest.
-
-Le workflow GitHub Actions ARM64 n° 43868859895 sur `64d1900` avait exécuté les 888 cas : **885 réussis, deux échoués et un ignoré**. Les deux échecs étaient propres au harnais GUI, sans changement du moteur. Le test du reçu `abandoned` ouvrait la récupération avant la fin de l'abandon automatique asynchrone ; il attend désormais sa terminaison et vérifie le reçu persistant avant d'injecter l'échec du dernier `fsync`. Le test UTF-8 appelait directement `VaultRestoreDialog::takePassword()` dans un processus CTest où aucune fixture n'avait encore initialisé libsodium ; le `main()` du binaire GUI initialise désormais libsodium avant tout test. En Release ARM64 local, le second test réussissait isolément, le premier dix passages consécutifs, puis les **57/57** tests voisins réussissaient. La version 1.26 a ensuite été validée sur GitHub ARM64 : **887 réussis, aucun échec et un auxiliaire volontairement ignoré**.
-
-**Intégration JavaScript 1.27 — 16 novembre 2026 :** les étapes CMake et CTest restent inchangées. Une étape `actions/setup-node@v7` sélectionne explicitement Node.js 24 sans cache de gestionnaire de paquets, puis une étape indépendante exécute `node --test tests/extension/*.test.cjs`. Aucun framework, paquet npm, permission GitHub ou changement de l'extension n'est ajouté. Les cinq tests — deux de remplissage et trois de navigation/origine — réussissent localement ; le workflow 1.27 reste à valider sur GitHub ARM64. Cette couverture ne remplace ni Firefox réel ni les essais Native Messaging de bout en bout.
-
-**Version en ligne de commande 1.28 — 16 novembre 2026 :** configuration Release neuve puis compilation ciblée de `passwall_app` avec `--parallel 1`, sans avertissement relevé. `--version` et `-v` produisent chacun exactement `PassWall 1.28.0\n`, sans stderr, avec le code 0. Une plateforme Qt, un bus et des chemins de configuration volontairement invalides n'affectent pas ces commandes, confirmant leur retour avant initialisation. Le chemin normal sans option a été exercé offscreen avec configuration temporaire isolée et arrêt instrumenté de la boucle événementielle : initialisation puis nettoyage réussis, sans verrou ni socket runtime résiduel. Aucun coffre ou réglage personnel n'a été utilisé.
-
-**Prévalidation et abandon 1.29 — 16 novembre 2026 :** build Debug neuf sous `/tmp`, cinq cibles concernées compilées avec `--parallel 1`, sans avertissement relevé. **157 cas ciblés distincts** sont validés : 49 GUI de restauration/récupération, 21 snapshots/prévalidation, 22 protocoles/confiance/worker et 65 moteur 6B. Ils couvrent texte, absence, permissions, FIFO, alias du principal, schéma incompatible, corruption, source valide renommée, mutation après prévalidation, précaution refusée, annulation, terminaison réelle et échec de persistance de l'abandon. Les contrôles POSIX ont été rejoués hors sandbox après que celui-ci a présenté `/` sous une identité artificielle ; aucune protection n'a été relâchée. `--version` et `-v` affichent `PassWall 1.29.0`. Pas de campagne CTest complète, essai Wayland réel, panne électrique, coffre personnel ni installation.
-
-### 6.3 Incidents corrigés et diagnostic de l'annulation de rotation
-
-Une erreur de compilation dans `tests/test_environment.cpp` signalait que `std::all_of` n'était pas reconnu. Une erreur de syntaxe dans des blocs `catch` de `crypto_engine.cpp` a ensuite été corrigée par l'utilisateur. Le résultat historique communiqué après cette correction était 69/69 tests réussis le 5 novembre 2026 ; les validations ciblées ultérieures figurent en section 6.2.
-
-Le bridge a aussi reçu une correction de destruction des états de connexion avant disparition du suivi `connections_`, et les erreurs de redirection du démarrage natif ont des tests dédiés. Les deux P1 logind (validation fraîche de l'inhibiteur et attentes de résolution/abonnement D-Bus sur le thread GUI) ont été traités : contrôles `poll()`, résolution asynchrone du propriétaire unique et générations de connexion. Les tests privés/simulés ne démontrent pas toutes les transitions physiques du système.
-
-**Intermittence de test résolue le 9 novembre 2026 :** `AutomaticBackupTest.RotationCancellationAfterCopyNeverRetractsPublishedBackup` avait échoué lors d'un passage 6A, puis une fois sur dix répétitions isolées, malgré un dernier passage 65/65 réussi. Le défaut est une relation d'ordre absente dans le test : `cancel()` mettait l'octet `!` en tampon Qt, puis le test libérait le worker sans garantir sa réception avant le dernier contrôle précédant `unlinkat()`. La [mise en tampon Unix de Qt 6.8.2](https://github.com/qt/qtbase/blob/v6.8.2/src/corelib/io/qprocess_unix.cpp#L956-L995) n'est pas un acquittement de lecture.
-
-La séquence de production reste `copie → catalogue durable → confirmation → rotation → terminaison → libération`. Dans la rotation, `ParentChannel::check()` lit le canal non bloquant ; un retour `EAGAIN` signifie qu'aucune demande n'est encore reçue et permet de poursuivre. Le service recontrôle l'annulation après les vérifications finales d'identité, avant suppression. Une demande encore en transit peut donc arriver après une suppression déjà appliquée : elle ne restaure pas l'ancienne version et ne rétracte jamais la nouvelle copie confirmée.
-
-La correction est limitée aux tests et au linkage de leur probe réel :
-
-- Le test initial attend la disponibilité du message (`poll`), puis l'acquittement de sa lecture réelle par un wrapper `read` qui conserve exactement le retour/`errno`. Un second point de contrôle permet d'observer le worker vivant, avant que le résultat `Cancelled` confirme la prise en compte. Attentes conditionnelles bornées, sans délai supposé suffisant ni changement des temporisations de production.
-- `RotationQueuedCancellationCannotUndoAnAlreadyAppliedDeletion` reproduit l'autre ordre : même demande avant libération du point d'arrêt, mais sans dispatcher Qt dans cette portion du test seulement. La lecture réelle retourne `EAGAIN`, puis le véritable `unlinkat` est constaté avant livraison du message. Qt est ensuite relancé, la réception acquittée et l'annulation acceptée. Aucun faux retour de lecture/suppression n'est injecté.
-- Résultats fixes et distincts : annulation reçue à temps → `Cancelled`, zéro suppression, ancienne version intacte ; réception tardive après suppression → `Cancelled`, une suppression, pas de restauration rétroactive. Dans les deux cas, octets de la nouvelle sauvegarde inchangés, copie `Published`, `backupRequired` non réarmé et absence de suspension de copie.
-- Les deux scénarios vérifient la réservation durant la réception et le signal de résultat, puis son relâchement uniquement après terminaison effective. Les régressions existantes couvrent aussi `Unknown` avec enfant encore actif, disparition du parent et conservation des descripteurs hérités.
-
-Les marqueurs d'acquittement sont privés au harnais `passwall_backup_worker_probe` ; ni `BackupJob`, ni le coordinateur, ni les moteurs, ni le protocole `--protocol-v1` / `--rotation-v1` ne sont modifiés. Les 30 répétitions par ordre complètent les preuves de synchronisation, sans constituer une garantie générale contre tous les incidents d'E/S ou d'ordonnancement. Aucune nouvelle anomalie de production n'a été identifiée dans ce périmètre.
-
-### 6.4 Fonctionnalités incomplètes et absentes
-
-Les étapes de sauvegarde 1 à 5, l'export manuel, les moteurs de restauration, le pilotage asynchrone 7 et les GUI de restauration 8A/préférences-reprise 8B sont implémentés, avec les limites décrites ci-dessus. Récupération utilisateur limitée disponible en 8C-1 et minuteur obligatoire en 8C-2 ; restent absents : résolution des états volontairement bloqués, export de configuration, migrations des coffres, TOTP, passkeys, audit de mots de passe et validation Windows/iOS. Le 12 novembre 2026, l'utilisateur a rapporté sous Debian 13/Wayland des essais réels réussis de restauration complète, sauvegarde et récupération contrôlée sur données fictives après correction locale des modes en `0755` ; ces observations ne remplacent ni les tests automatisés ni les scénarios manuels de faute encore ouverts. L'import de configuration n'est pas défini, et ne constitue pas une fonction V1 implicitement promise. Le générateur n'est pas un travail restant. Synchronisation, résolution de conflits entre copies et serveur de référence ne sont pas des fonctions engagées dans le périmètre actuel.
-
-### 6.5 Première campagne manuelle Firefox — 6 novembre 2026
-
-Les résultats ci-dessous sont **rapportés par l'utilisateur**, avec Firefox réel et un coffre contenant uniquement des données fictives. Ce sont des observations manuelles, distinctes des tests automatisés de la section 6.2 ; elles n'ont pas été réexécutées lors de cette mise à jour documentaire.
-
-| Essai manuel | Résultat rapporté |
-|---|---|
-| Chargement de l'extension temporaire dans Firefox | Réussi |
-| Ouverture du popup | Réussi |
-| Démarrage automatique de PassWall | Réussi |
-| Communication Native Messaging | Réussie |
-| Détection du coffre verrouillé | Réussie |
-| Recherche d'identifiants | Réussie |
-| Récupération et remplissage d'un formulaire web | Réussis |
-| Blocage de récupération après verrouillage | Réussi |
-| Isolation des identifiants entre domaines | Réussie |
-| Fermeture puis redémarrage automatique de PassWall | Réussi ; le coffre reste verrouillé |
-| Changement de session pendant une requête | Déclaré fonctionnel lors d'un essai manuel, sans reproduction déterministe de l'instant d'invalidation |
-
-Cette campagne établit un premier fonctionnement de bout en bout observé manuellement sur l'installation locale Linux. Elle ne prouve ni tous les entrelacements possibles du verrouillage et de la transmission, ni la sécurité générale de l'intégration.
-
-Restent à réaliser : installation reproductible du Native Host et de l'extension, tests automatisés de bout en bout avec Firefox, extension des scénarios d'invalidation déterministe à l'intégration réelle, vérifications supplémentaires de sécurité et de robustesse, puis validation sur Windows et les autres plateformes prévues. Des tests déterministes de composant du bridge existent déjà ; ils ne doivent pas être présentés comme absents ni comme preuve du parcours Firefox complet.
-
-### 6.6 Validation manuelle du verrouillage Linux — bilan du 7 novembre 2026
-
-L'utilisateur rapporte les succès suivants sur Raspberry Pi 5 / Debian 13 / labwc, après installation et reconfiguration locales :
-
-1. `Ctrl+Alt+L` déclenche le coordinateur.
-2. PassWall se verrouille avant le verrouillage visible de Linux.
-3. La session Linux se verrouille et se déverrouille normalement.
-4. Le coffre reste verrouillé après le déverrouillage Linux.
-5. Firefox refuse le remplissage tant que le coffre est fermé.
-6. Une nouvelle authentification permet de retrouver le remplissage.
-7. Le raccourci pilote `Ctrl+Super+L` reste disponible.
-
-Un essai réel antérieur avec PassWall absent a également été rapporté comme réussi. L'intégration locale de ces raccourcis est donc fonctionnellement validée ; elle n'est plus une installation ou un premier essai à réaliser. Ces observations manuelles n'ont pas été reproduites pendant la mise à jour documentaire et ne constituent ni des tests automatisés de bout en bout, ni une preuve exhaustive d'effacement mémoire. Le verrouillage visible ne mesure pas les allocations historiques de Qt, les buffers système ou tous les entrelacements de requêtes. Les essais ne démontrent pas la couverture de tous les déclencheurs ni une garantie de nettoyage en cas de blocage/crash ; aucune validation réelle de suspension/hibernation/arrêt n'est déduite de ces essais.
-
-## 7. Sécurité : constats
-
-### Points positifs connus
-
-- libsodium ;
-- Argon2id ;
-- XChaCha20-Poly1305 ;
-- `SecureBuffer` non copiable et nettoyé à la destruction ;
-- chiffrement des entrées avant stockage SQLite ;
-- notes chiffrées avec les autres champs ;
-- coffre cryptographiquement autonome, sans clé d'autorisation liée à une machine ; préférences locales distinctes du déchiffrement ;
-- absence attendue de mots de passe en clair dans la base ;
-- validation de l'origine avant récupération du secret par `NativeRequestProcessor`, appelé par `MainWindow::handleNativeRequest()`, puis de nouveau dans l'extension ;
-- nettoyage explicite de certains champs et buffers de l'interface ;
-- nettoyeurs armés avant remplissage/copie sur les chemins mémoire ciblés, validation métier commune et tests d'exception ;
-- vérification des paramètres SQLite par connexion, diagnostics conservant l'erreur initiale, publication sans écrasement et distinction des résultats incertains ;
-- exclusion coopérative jusqu'à terminaison réelle des auxiliaires, catalogue conservateur et porte de récupération par coffre.
-
-### Points de vigilance
-
-- `std::string` et les types Qt peuvent créer des copies ;
-- nettoyer la zone courante d'une chaîne ne garantit pas l'effacement de toutes les anciennes allocations ;
-- `QByteArray`, `QString` et `QJsonObject` peuvent conserver des copies/références partagées ;
-- la migration vers `CredentialSummary` supprime la collection durable de credentials complets dans la fenêtre, mais pas toutes les copies temporaires ;
-- les chemins ciblés de `CredentialService` ont été durcis, mais la revue globale des temporaires et des nouvelles tâches asynchrones reste nécessaire ;
-- les buffers applicatifs de réponse sont protégés/nettoyés ; leurs copies internes Qt, système et JavaScript restent des limites de durée de vie à auditer ;
-- logs et messages d'erreur à inspecter ;
-- le verrouillage doit couvrir les requêtes natives et les états des services, pas seulement l'écran ; l'essai manuel de changement de session ne remplace pas une validation déterministe pendant la transmission ;
-- les octets déjà acceptés par Qt ou le système ne peuvent pas être rappelés : distinguer cette limite du nettoyage et de l'annulation des données encore détenues par l'application ;
-- un lancement direct de swaylock peut contourner le coordinateur ; en l'absence d'acquittement de PassWall, la tentative de verrouillage d'écran ne prouve pas le nettoyage du coffre ;
-- PassWall ne surveille ni `LockedHint` ni l'état réel de déverrouillage Wayland ; le code de sortie de swaylock n'en constitue pas une preuve. La nouvelle authentification manuelle ne restaure jamais l'ancienne session et ne sert pas de preuve indépendante de cet état ;
-- un support retiré ou une E/S bloquée ne permet pas de promettre une terminaison immédiate ou une durabilité physique ; ne jamais supprimer une publication valide à cause d'une erreur ultérieure ;
-- configuration et SQLite ne sont pas une transaction unique ; changement de fichier, registre corrompu, résultat perdu ou interruption de restauration nécessitent une interprétation conservatrice ;
-- finalisation réelle et interruption de substitution 6B/7/8A sont exercées sur fichiers fictifs, pas sous coupure électrique ; le suivi de secrets distants n'est pas une preuve d'effacement de toutes les anciennes allocations ou copies noyau. La récupération utilisateur 8C-1 reste limitée aux preuves reconnues ; les autres états demeurent bloqués ; la correction ciblée du test de rotation ne certifie pas ces chemins ;
-- l'autonomie cryptographique ne garantit ni la cohérence d'une copie prise en pleine écriture, ni le transport de l'état de récupération local, ni l'application des protections d'une autre plateforme non validée.
-
-Ces constats définissent des surfaces à examiner ; ils ne signifient pas qu'une fuite exploitable a été démontrée.
-
-## 8. Construction et tests
-
-Le répertoire de compilation récent communiqué est `/tmp/passwall-credential-summary-verification/`. Il sert aux vérifications de développement, pas à une installation durable. Les exécutables utilisés par Firefox et les raccourcis de verrouillage sont ceux installés dans `~/.local/bin` (sections 5.6 et 5.9).
-
-Exemples de commandes générales de construction et de tests :
+Commandes de référence :
 
 ```bash
 cmake -S . -B build -G Ninja
 cmake --build build --parallel 1
 
-# Une suite précise, puis sa sélection CTest
-cmake --build build --target passwall_preferences_tests --parallel 1
-ctest --test-dir build --output-on-failure -R '^VaultPreferencesStoreTest\.' -j1
+# Suite ciblée
+cmake --build build --target passwall_snapshot_tests --parallel 1
+ctest --test-dir build --output-on-failure -R '^VaultSnapshotServiceTest\.' -j1
 
-# Toutes les cibles C++ enregistrées auprès de CTest
+# Ensemble des cibles de test, puis CTest
 cmake --build build --target passwall_all_tests --parallel 1
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure --no-tests=error -j1
 
-# Outils de développement indépendants, également exclus du build courant
-cmake --build build --target passwall_env_check passwall_argon2_benchmark --parallel 1
-```
-
-Sans cible explicite, `cmake --build` construit les cinq exécutables Linux de production (`passwall_app`, les deux workers, le Native Host et `passwall-session-lock`) ainsi que leurs dépendances. Les suites GoogleTest, leurs faux workers/probes et les deux outils indépendants portent `EXCLUDE_FROM_ALL` : aucun test n'est supprimé, mais CTest ne les construit pas à la demande. Il faut donc compiler la suite voulue ou `passwall_all_tests` avant de l'exécuter. Les commandes ci-dessus sont des instructions générales ; les résultats ciblés de cette actualisation figurent en section 6.2. Les options CMake restent à adapter à l'environnement, un répertoire déjà configuré conserve son générateur et les tests du bridge nécessitent un environnement autorisant `bind(AF_UNIX)`.
-
-Le workflow GitHub Actions ARM64 conserve son build de production puis compile explicitement `passwall_all_tests`. Il exécute ensuite les 888 cas enregistrés avec `QT_QPA_PLATFORM=offscreen`, `--parallel 1`, `--output-on-failure` et `--no-tests=error`. Les tests GUI utilisent la plateforme Qt hors écran ; les tests D-Bus lancent leur bus privé et le coordinateur emploie un faux verrouilleur. Cela ne constitue pas un essai de Wayland, du vrai logind, de swaylock ou d'une transition système. Les tests JavaScript sont exécutés dans une étape suivante, distincte de CTest, avec Node.js 24 et sans installation npm.
-
-La configuration ne nécessite plus d'alias SQLite externe : le repli de cible est dans `CMakeLists.txt`. Pour un ancien cache contenant le hook temporaire de 7, le retirer avec `cmake -U CMAKE_PROJECT_INCLUDE -S . -B <répertoire>` ; une configuration neuve n'en reçoit aucun. La validation autonome de maintenance est détaillée en section 6.2, distinctement des instructions générales ci-dessus.
-
-Les cibles spécialisées comprennent `passwall_preferences_tests`, `passwall_dirty_tracking_tests`, `passwall_storage_tests`, `passwall_snapshot_tests`, `passwall_backup_tests`, `passwall_automatic_backup_tests`, `passwall_replacement_tests` et `passwall_restore_job_tests`. `passwall_gui_tests` réutilise les sources de la fenêtre, de l'export, de l'autorisation et de la restauration GUI 8A. Les configurations QSettings et coffres des tests sont isolés ; les faux workers, injections d'allocation/appels système et émetteur 6A de test ne doivent pas être activés dans l'application de production. Le worker de sauvegarde reste sans moteur de déchiffrement ; `passwall_restore_worker` est distinct de son homologue instrumenté de test et reste sans widgets, la nouvelle action étant portée par la GUI de l'application.
-
-Les tests JavaScript sont indépendants de CTest :
-
-```bash
+# Tests JavaScript indépendants de CTest
 node --test tests/extension/*.test.cjs
 ```
 
-Cette commande est validée localement avec Node.js 20.19.2 ; le workflow fixe Node.js 24, indépendamment de l'environnement préinstallé du runner. Ces tests unitaires n'exécutent pas Firefox et ne valident pas Native Messaging de bout en bout. L'installation Firefox locale dispose désormais d'un manifeste Native Messaging pour `org.passwall.native` et a été essayée manuellement (sections 5.6 et 6.5). Aucun modèle de manifeste Native Messaging ni automatisation d'installation n'est versionné ; la procédure reproductible pour une nouvelle machine et l'identifiant d'une future diffusion restent à définir.
+### 3.3 Intégration continue
 
-## 9. Plateformes
+- **IMPLÉMENTÉ** — le workflow Linux ARM64 compile la production puis `passwall_all_tests` et exécute CTest avec Qt offscreen, séquentiellement et avec `--no-tests=error`.
+- **TESTÉ** — la version 1.26 a produit 887 réussites CTest, aucun échec et un auxiliaire volontairement ignoré sur 888 cas enregistrés.
+- **IMPLÉMENTÉ** — une étape séparée exécute les cinq tests JavaScript avec le lanceur natif Node.js et Node.js 24.
+- **TESTÉ localement** — les cinq cas JavaScript réussissent avec Node.js 20.19.2.
+- **À FAIRE** — confirmer sur GitHub ARM64 les évolutions 1.27 à 1.29 et maintenir la distinction entre tests offscreen/simulés et essais Firefox, Wayland, logind et swaylock réels.
 
-Ordre de priorité :
-1. Linux sur Raspberry Pi 5 / Debian ;
-2. Windows via machine virtuelle pour les tests ;
-3. iOS après stabilisation Linux/Windows.
+### 3.4 Installation locale connue
 
-Le fonctionnement hors ligne est requis sur chaque plateforme. Le transfert de copies reste manuel et leur cohérence relève de l'utilisateur ; aucun serveur de synchronisation ou mécanisme de confiance entre machines n'est requis. Les contrôles Linux actuels ne sont pas une validation des chemins d'ouverture sur Windows/iOS.
+L'installation pilote Linux rapportée utilise :
 
-La campagne Firefox du 6 novembre et le bilan du verrouillage de session du 7 novembre concernent uniquement l'installation locale Linux ; ils ne valent pas validation Windows, iOS ou des autres plateformes prévues.
+| Élément | Chemin |
+|---|---|
+| Application | `$HOME/.local/bin/passwall_app` |
+| Native Host | `$HOME/.local/bin/passwall_native_host` |
+| Coordinateur de session | `$HOME/.local/bin/passwall-session-lock` |
+| Manifeste Firefox | `$HOME/.mozilla/native-messaging-hosts/org.passwall.native.json` |
 
-## 10. Documents et artefacts manquants
+- **TESTÉ historiquement** — l'application et le Native Host installés ont été comparés aux candidats validés par SHA-256 et contrôlés en `0755` lors des interventions correspondantes.
+- **IMPLÉMENTÉ** — le manifeste local pointe vers le Native Host de `$HOME/.local/bin`.
+- **À FAIRE** — l'état actuel de ces fichiers doit être revérifié avant toute nouvelle installation ; les sources présentes dans le dépôt ne prouvent pas que les binaires installés sont à jour.
+- **À FAIRE** — fournir une installation reproductible incluant les deux workers, leurs permissions attendues, l'application, le Host, le coordinateur et l'extension. L'installation pilote manuelle n'est pas un mécanisme de distribution.
 
-Les deux documents suivants sont présents à la racine :
-- `PASSWALL_DOCUMENTATION_TECHNIQUE.md` — architecture et état réalisé ;
-- `PASSWALL_TODO_TECHNIQUE.md` — feuille de route ;
+## 4. Coffre, cryptographie et stockage
 
-Ces deux documents constituent la référence technique du projet ; l'installation locale du coordinateur et son retour arrière sont décrits en section 5.9.
+### 4.1 Format et portabilité
 
-Les documents suivants sont recommandés mais absents de l'arbre courant :
-- `README.md` — installation, compilation et lancement ;
-- `SECURITY.md` — modèle de menace, choix cryptographiques, limites et signalement ;
-- `CHANGELOG.md` — historique des changements.
+- **IMPLÉMENTÉ** — un coffre est un fichier SQLite autonome contenant ses métadonnées cryptographiques, dont un `vault_id` de 16 octets.
+- **VALIDÉ** — le coffre n'est lié cryptographiquement ni à la machine, ni au registre QSettings, ni à une autorisation d'appareil.
+- **VALIDÉ** — une copie cohérente peut être ouverte sur une installation compatible avec son propre mot de passe maître.
+- **VALIDÉ** — `vault_id` identifie une famille de copies ; ce n'est ni une preuve d'authenticité, ni une autorisation de remplacement ou de suppression.
+- **IMPLÉMENTÉ** — le format est indépendant de l'extension du fichier.
+- **VALIDÉ** — les anciens fichiers `.db` compatibles restent pris en charge ; `.pwdb` devient la convention nominale des nouveaux coffres et sauvegardes, sans migration ou renommage automatique imposé.
 
-Le répertoire `docs/decisions/` et les ADR associés sont également absents. Un modèle versionné de manifeste Native Messaging, une procédure reproductible d'installation du Native Host et de l'extension, ainsi que la procédure de test JavaScript doivent compléter cette documentation. Le manifeste déjà installé localement ne remplit pas ces objectifs de reproductibilité.
+Une copie prise pendant une transaction ou une opération de remplacement n'est pas nécessairement cohérente. Il faut utiliser les mécanismes d'instantané ou attendre la fin effective de toutes les opérations, pas seulement un verrouillage visuel.
 
-## 11. Mise à jour
+### 4.2 Cryptographie
 
-Après chaque étape validée : noter les fichiers modifiés, le comportement avant/après, les commandes et résultats de tests, les limites connues, puis mettre à jour les deux documents racine. Distinguer les faits vérifiés des hypothèses.
+- **IMPLÉMENTÉ** — libsodium est initialisée avant l'usage des buffers protégés.
+- **IMPLÉMENTÉ** — Argon2id dérive la clé depuis le mot de passe maître ; les paramètres de production actuels sont trois opérations et 256 Mio.
+- **IMPLÉMENTÉ** — XChaCha20-Poly1305 assure le chiffrement authentifié.
+- **IMPLÉMENTÉ** — les entrées sont chiffrées individuellement ; les notes sont protégées avec les autres champs.
+- **IMPLÉMENTÉ** — la clé de données est enveloppée et n'est rendue disponible qu'après authentification du maître.
+- **IMPLÉMENTÉ** — `SecureBuffer` est non copiable, nettoie sa zone contrôlée et protège les clés et certains secrets temporaires.
+- **À FAIRE** — audit cryptographique global V1 : sels, nonces, AAD, versionnement du format, paramètres Argon2id sur le matériel annoncé et chemins d'erreur.
 
-Cette version conserve l'audit documentaire du 9 novembre, les réalisations de 7 et la maintenance de compilation, puis les GUI 8A/8B et la récupération 8C-1 du 10 novembre. Les validations ciblées restent distinguées en section 6.2 ; les observations manuelles Wayland rapportées le 12 novembre sont consignées séparément et aucune transition système ni garantie supplémentaire n'est déduite des tests automatisés.
+Le nettoyage d'une zone contrôlée ne prouve pas l'effacement de toutes les copies historiques produites par `std::string`, Qt, SQLite, le noyau, le swap ou le support physique.
+
+### 4.3 Politique SQLite V1
+
+Chaque connexion de production pertinente applique puis relit :
+
+| Paramètre | Valeur imposée |
+|---|---|
+| `journal_mode` | `DELETE` |
+| `synchronous` | `EXTRA` (`3`) |
+| `secure_delete` | `ON` (`1`) |
+| `temp_store` | `MEMORY` (`2`) |
+| `busy_timeout` | `3000` ms |
+| `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` | activé et vérifié avant inspection |
+
+- **IMPLÉMENTÉ** — `configureSqliteConnection()` centralise ces contrôles pour `VaultStorage` et `CredentialService`.
+- **IMPLÉMENTÉ** — un journal WAL ou tout mode inattendu est refusé sans conversion, checkpoint volontaire ni suppression des fichiers auxiliaires.
+- **IMPLÉMENTÉ** — connexions, statements, messages SQLite et temporaires de création disposent de protections RAII.
+- **IMPLÉMENTÉ** — les CRUD utilisent `BEGIN IMMEDIATE` et ne publient leur résultat qu'après `COMMIT` confirmé.
+- **IMPLÉMENTÉ** — les diagnostics distinguent cause initiale, rollback explicite réussi ou échoué, rollback automatique et état transactionnel incertain.
+- **À FAIRE** — aucun moteur de migration de schéma ou de format n'existe. Une version incompatible doit rester refusée jusqu'à définition d'une migration sauvegardée et testée.
+
+`synchronous=EXTRA` et les `fsync` renforcent les garanties demandées à l'OS ; ils ne prouvent pas la durabilité physique face à une panne d'alimentation, un contrôleur défaillant ou un support retiré.
+
+### 4.4 Modèle métier et mémoire sensible
+
+- **IMPLÉMENTÉ** — titre, nom d'utilisateur et mot de passe sont obligatoires à l'ajout et à la modification.
+- **IMPLÉMENTÉ** — titre et nom d'utilisateur vides ou uniquement composés d'espaces Unicode sont refusés.
+- **IMPLÉMENTÉ** — le mot de passe vide est refusé, mais sa valeur exacte n'est jamais normalisée ; un mot de passe composé d'espaces est accepté.
+- **IMPLÉMENTÉ** — `CredentialService::validate()` porte la règle métier commune à la GUI et au service.
+- **IMPLÉMENTÉ** — `CredentialSummary` et `listSummaries()` évitent de conserver durablement tous les mots de passe et notes dans `MainWindow`.
+- **IMPLÉMENTÉ** — les temporaires sensibles ciblés de création, ouverture, ajout et modification sont associés à leurs nettoyeurs avant les appels susceptibles d'échouer.
+- **À FAIRE** — maintenir un audit continu des conversions `QString` / `QByteArray` / `std::string`, du presse-papiers, des messages, propriétés Qt et nouvelles tâches asynchrones.
+
+### 4.5 Responsabilités des composants
+
+| Composant | Responsabilité actuelle |
+|---|---|
+| `CryptoEngine` / `SecureBuffer` | initialisation libsodium, dérivation, chiffrement authentifié et mémoire protégée |
+| `VaultStorage` | schéma, métadonnées, création/publication du fichier et accès SQLite de cycle de vie |
+| `VaultKeyService` | enveloppe et récupération de la clé de données après authentification |
+| `VaultLifecycleService` | création et ouverture d'un coffre, sans publier de session après échec |
+| `CredentialService` | validation, chiffrement, CRUD, résumés, authentification de toutes les entrées et notification en mémoire des mutations confirmées |
+| `MainWindow` | session GUI, clé active, verrouillage, adaptateurs natifs et admissions sensibles |
+| `VaultOperationGuard` | exclusion coopérative intra/interprocessus |
+| `VaultSnapshotService` | copie SQLite cohérente et publication sécurisée |
+| `BackupJob` / `passwall_backup_worker` | exécution et supervision asynchrones sans clé de déchiffrement |
+| `AutomaticBackupCoordinator` | coordination automatique historique et frontière préparée, mais non activée en production, entre générations en mémoire et worker d'instantané |
+| `VaultReplacementAuthorization` | autorité opaque issue du véritable propriétaire GUI |
+| `VaultReplacementService` | moteur unique actuel de remplacement et récupération |
+| `RestoreJob` / `passwall_restore_worker` | délégation, transport privé du maître et supervision du remplacement |
+| `NativeRequestProcessor` | unique traitement métier des requêtes Firefox |
+| `LinuxSessionMonitor` / `SessionLockService` | protection logind et verrouillage externe acquitté |
+
+### 4.6 Utilitaires métier
+
+- **IMPLÉMENTÉ** — `SiteMatcher` accepte HTTP/HTTPS, compare schéma, hôte et port effectif, rejette URL malformées et informations utilisateur, et interprète une URL sans schéma comme HTTPS.
+- **IMPLÉMENTÉ** — `PasswordGenerator` produit de 8 à 128 caractères avec `randombytes_uniform`, garantit chaque catégorie choisie et mélange sans biais modulo.
+- **TESTÉ** — ces deux composants possèdent leurs suites unitaires et sont intégrés aux parcours GUI/Firefox concernés.
+
+## 5. Architecture cible des préférences et sauvegardes
+
+Cette section décrit la cible approuvée. La section 6 décrit séparément l'implémentation historique encore présente.
+
+### 5.1 Préférences globales
+
+- **VALIDÉ** — un seul dossier racine global de sauvegardes est configuré pour l'installation.
+- **VALIDÉ** — une politique globale de rétention s'applique à chaque famille : sept versions par défaut, minimum configurable de sept et aucune limite supérieure arbitraire imposée par la spécification.
+- **VALIDÉ** — la configuration initiale demande clairement la racine et la rétention ; elle ne présente pas de case d'activation.
+- **VALIDÉ** — les sauvegardes automatiques commencent après une configuration initiale valide.
+- **VALIDÉ** — les préférences sont locales et ne sont jamais embarquées dans le coffre.
+- **VALIDÉ** — une configuration globale absente, corrompue ou incomplète ne doit pas empêcher l'ouverture d'un coffre sain. PassWall doit permettre sa reconfiguration et signaler que les sauvegardes automatiques ne sont pas opérationnelles tant qu'une destination valide n'est pas définie.
+- **VALIDÉ** — aucune sauvegarde ne doit être présentée comme active ou réussie sans configuration globale valide.
+- **VALIDÉ** — la reconfiguration des préférences ordinaires ne contourne jamais les protections historiques de restauration encore actives pendant leur transition. La cible n'introduit toutefois aucun journal permanent de remplacement.
+- **VALIDÉ** — changer la racine ne déplace ni ne supprime les anciennes sauvegardes.
+- **VALIDÉ** — PassWall ne modifie pas automatiquement les permissions du dossier choisi par l'utilisateur.
+- **VALIDÉ** — les sous-dossiers gérés et les fichiers créés par PassWall reçoivent des permissions privées appropriées.
+- **À DÉFINIR** — possibilité de désactiver ultérieurement les sauvegardes depuis les paramètres globaux.
+- **IMPLÉMENTÉ — fondation 2I-3A** : `GlobalBackupPreferencesStore` utilise un fichier INI utilisateur distinct, obtenu par `QSettings::IniFormat` avec l'organisation `PassWall` et l'application `BackupPreferences`. Sous Linux, l'emplacement nominal est `~/.config/PassWall/BackupPreferences.ini`; il n'est pas codé en dur et suit les emplacements utilisateur de QSettings sur les futures plateformes.
+- **IMPLÉMENTÉ — schéma 2I-3A** : le fichier versionné contient uniquement `backup/rootDirectory` et `backup/retainedVersions`. La rétention vaut sept par défaut, refuse toute valeur inférieure à sept et utilise un entier non signé sans plafond produit arbitraire. Aucun coffre, `localId`, `vault_id`, secret, état de mutation, tentative ou preuve de récupération n'y est enregistré.
+- **IMPLÉMENTÉ — états 2I-3A** : l'API distingue `Absent`, `Valid`, `Invalid`, `ReadError` et `WriteError`. Une absence ne crée pas le fichier et expose seulement la valeur par défaut de sept ; fichier incomplet, version inconnue, chemin non absolu/non normalisé et rétention invalide restent séparés des erreurs d'accès ou de publication.
+- **IMPLÉMENTÉ — persistance 2I-3A** : QSettings exige une synchronisation atomique, le fichier est limité, relu depuis ses octets physiques, privé pour le propriétaire et synchronisé avec son répertoire. Une publication visible dont la synchronisation finale échoue reste un `WriteError`, jamais une réussite inventée. Le dossier racine choisi n'est ni créé, ni chmodé, ni autrement modifié par ce stockage.
+- **À FAIRE — intégration** : aucun consommateur de production n'utilise encore ces préférences. Le futur chemin générationnel devra exiger l'état `Valid`, puis effectuer séparément ses contrôles opérationnels de destination ; une préférence syntaxiquement valide ne constitue ni une capacité d'écriture ni une preuve que le support est disponible.
+- **À DÉFINIR** — export éventuel du nouveau fichier de préférences ; l'import n'est pas spécifié.
+
+### 5.2 Familles et disposition des fichiers
+
+- **VALIDÉ** — chaque `vault_id` complet correspond à une famille et à un sous-dossier de la racine globale. Le nom de ce sous-dossier est l'encodage du `vault_id` en 32 caractères hexadécimaux minuscules, sans séparateur.
+- **VALIDÉ** — une sauvegarde est une copie SQLite cohérente, autonome et directement ouvrable, conservant le `vault_id` de sa source.
+- **VALIDÉ** — les nouvelles sauvegardes utilisent l'extension nominale `.pwdb`.
+- **VALIDÉ** — le nom nominal est l'horodatage UTC `YYYY-MM-DD_HH-MM-SS.pwdb`.
+- **VALIDÉ** — en cas de collision dans la même seconde, le suffixe `_2`, puis `_3`, `_4`, etc. est ajouté avant `.pwdb`, uniquement lorsque nécessaire.
+- **VALIDÉ** — deux fichiers de travail partageant un `vault_id` alimentent la même famille. PassWall ne fusionne pas leurs divergences et ne choisit pas une branche canonique.
+- **À DÉFINIR** — présentation à l'utilisateur de plusieurs principaux divergents appartenant à la même famille.
+- **À DÉFINIR avant la rotation sans catalogue** — politique de protection de l'historique lorsque des principaux divergents partagent le même dossier familial : une version admissible d'une copie A peut suffire à écarter la première copie de B, et une rétention commune peut évincer les anciennes versions de A au profit de B. Cette conséquence possible de la politique familiale n'autorise ni une nouvelle règle de sauvegarde ni une exclusion de suppression sans décision explicite.
+
+Le `vault_id` et la conformité du nom servent au routage et à l'organisation de la famille. Ils ne suffisent jamais, seuls, à authentifier une sauvegarde, autoriser une restauration ou justifier une suppression.
+
+- **IMPLÉMENTÉ — fondation 2I-3B** : `BackupDestinationPreparer` exige un `vault_id` réel de 16 octets relu depuis le coffre sous une capacité d'instantané liée au périphérique et à l'inode attendus. Il forme le dossier familial avec les 32 caractères hexadécimaux minuscules et conserve en mémoire le coffre, la génération et les identités physiques de la racine et de la famille.
+- **IMPLÉMENTÉ — création privée** : la racine configurée est seulement inspectée ; ses permissions ne sont jamais modifiées. Le sous-dossier familial est créé par `mkdirat` en `0700`, ouvert sans suivre de lien et recoupé avec son entrée nommée. Un dossier existant n'est accepté que s'il appartient à l'utilisateur, reste le même inode et possède déjà les permissions privées attendues.
+- **IMPLÉMENTÉ — nommage préparatoire** : le nom UTC nominal et les suffixes `_2`, `_3`, etc. sont choisis par inspection sans suivi de liens. Aucun fichier de réservation n'est créé : le nom préparé n'est donc ni une publication ni une promesse d'exclusivité. La publication future devra encore utiliser le mécanisme sans écrasement de `VaultSnapshotService`.
+- **IMPLÉMENTÉ — revalidation et transfert** : l'admission 2I-4B recontrôle la source et son `vault_id`, la racine, le dossier familial et l'absence de la destination, puis déplace sans réacquisition la capacité et l'identité familiale vers le moteur d'instantané. Une collision ou substitution postérieure reste refusée par les contrôles du pilote, du worker et de la publication sans écrasement.
+- **IMPLÉMENTÉ — liaison 2I-3C** : une inspection préalable peut désormais imposer au préparateur les identités de racine et de famille qu'elle a observées. Une substitution entre la découverte d'une famille et la préparation de la destination est ainsi refusée au lieu d'être acceptée comme un nouvel emplacement équivalent.
+- **IMPLÉMENTÉ — arbitrage 2I-4C inactif** : le coordinateur accepte désormais sur son thread propriétaire une préparation 2I-4B sous le type transitoire explicite `InitialCopy`. Une génération CRUD et une génération de session restent deux liaisons distinctes ; aucune valeur zéro ou conversion implicite ne transforme la première copie en mutation fictive.
+- **À FAIRE — intégration** : aucun consommateur de production ne démarre encore les offres typées du coordinateur. Le futur consommateur devra utiliser l'admission à usage unique 2I-4B après l'arbitrage 2I-4C, sans traiter l'objet comme une autorisation de restauration ou de suppression.
+
+### 5.3 Déclenchement automatique
+
+- **VALIDÉ** — seuls les coffres effectivement ouverts sont concernés par la gestion automatique. PassWall ne recherche pas les coffres fermés et ne maintient aucune liste permanente des coffres connus à cette fin.
+- **VALIDÉ** — PassWall suit uniquement en mémoire, pour la session du coffre, les modifications métier confirmées. Aucun nouveau registre persistant de modifications n'est créé.
+- **VALIDÉ** — l'indicateur de modification n'est activé qu'après confirmation du `COMMIT` SQLite. Une préparation, une écriture tentée ou une transaction annulée ne le déclenchent pas.
+- **VALIDÉ** — après chaque `COMMIT` métier réussi, une sauvegarde automatique est demandée avec un délai de regroupement de vingt secondes ; chaque nouveau `COMMIT` réussi remet ce délai à zéro.
+- **VALIDÉ** — si le verrouillage intervient avant l'expiration, la demande devient immédiate après le nettoyage des secrets ; le verrouillage ne doit jamais attendre la copie.
+- **VALIDÉ — fermeture normale générationnelle** : une demande de fermeture rend immédiatement éligibles les générations CRUD confirmées, invalide sans attente la session et efface les secrets, puis laisse la vidange se terminer de manière asynchrone. Aucune boîte de dialogue « attendre ou quitter » ni confirmation répétée n'est demandée : la fenêtre se ferme automatiquement lorsque les workers concernés ont effectivement terminé et que la vidange est terminale, y compris en cas d'échec ou de suspension dûment distingué d'une réussite. Une nouvelle demande de fermeture ne doit ni recommencer le nettoyage, ni perdre les générations déjà confirmées ou celles qui se terminent pendant la vidange.
+- **VALIDÉ** — une sauvegarde peut s'exécuter pendant que le coffre reste déverrouillé. Plusieurs modifications regroupées ne produisent qu'une seule copie lorsqu'un même instantané peut les couvrir ; une modification postérieure au lancement reste une demande distincte tant que sa présence dans l'instantané n'est pas démontrée.
+- **VALIDÉ** — un coffre ouvert et peuplé qui ne possède aucune sauvegarde admissible dans la racine actuelle doit recevoir une première sauvegarde, sous réserve d'une configuration globale valide et des règles de déclenchement ci-dessus.
+- **VALIDÉ** — ouvrir puis verrouiller sans modification confirmée un coffre qui possède déjà une sauvegarde admissible ne crée pas de sauvegarde supplémentaire.
+- **VALIDÉ** — pour un nouveau coffre, le premier `COMMIT` d'une entrée déclenche la demande de première sauvegarde selon le délai de regroupement, avec accélération au verrouillage.
+- **VALIDÉ** — après la configuration initiale ou un changement de racine, les coffres déjà peuplés sont progressivement pris en charge lorsqu'ils sont ouverts puis verrouillés. Les coffres fermés ne sont ni recherchés ni sauvegardés en arrière-plan.
+- **IMPLÉMENTÉ — fondation 2I-3C inactive** : `InitialBackupPreparer` reçoit uniquement le contexte transitoire d'une session que son futur propriétaire déclare réellement authentifiée. Sous une capacité d'instantané liée au chemin, au périphérique et à l'inode, il relit la structure, le `vault_id` et la présence d'au moins une entrée. Coffre vide, configuration globale indisponible ou identité divergente ne produisent aucune demande.
+- **IMPLÉMENTÉ — découverte 2I-3C** : pour le seul besoin de décider d'une première copie, une version est provisoirement admissible si elle se trouve dans la famille attendue, porte exactement un nom UTC géré et passe les contrôles complets de structure SQLite/PassWall, de propriétaire, de permissions, de stabilité physique et de `vault_id`. Ce contrôle sans clé n'authentifie pas le contenu chiffré, n'autorise ni restauration ni suppression et ne fixe pas les critères définitifs de rotation encore ouverts.
+- **IMPLÉMENTÉ — demande distincte 2I-3C** : un coffre peuplé sans version admissible produit un `InitialBackupRequest` transitoire lié à la génération de session et à une `PreparedBackupDestination`. Si une génération CRUD est déjà en attente, elle couvre l'obligation de première copie et aucune seconde demande n'est créée. Aucun état de cette décision n'est écrit sur disque.
+- **IMPLÉMENTÉ — cycle de session 2I-3C** : les points d'annulation permettent au futur propriétaire asynchrone de rejeter une session fermée ou remplacée avant le retour. L'inspection est volontairement synchrone au niveau du service et son contrat interdit son exécution sur le thread GUI ; aucun raccordement à `MainWindow`, au coordinateur ou au worker n'est encore actif.
+- **IMPLÉMENTÉ — admission 2I-4B inactive** : `InitialBackupRequest` est désormais un objet mobile à usage unique. Son contexte final distingue explicitement génération de session et génération de mutation, exige le mode `Generational`, une session courante, l'absence de fermeture et l'admissibilité de l'opération, puis revalide source, `vault_id`, racine, famille et nom encore libre sur le thread propriétaire.
+- **IMPLÉMENTÉ — transfert 2I-4B** : après admission, la capacité d'instantané déjà détenue est déplacée directement vers `BackupJob::startSnapshotReserved()` sans nouvel appel à `trySnapshotAccess()` ni exposition publique de la garde. Toute tentative, y compris refus ou échec synchrone de démarrage, consomme la préparation ; RAII libère la réservation si le worker n'en devient pas propriétaire. Le raccordement production reste absent.
+- **IMPLÉMENTÉ — fusion 2I-4C inactive** : l'admission propriétaire relit l'identité du coffre et revalide la préparation avant de l'insérer dans la même file à jetons que les générations CRUD. Une génération CRUD déjà planifiée, offerte, en attente ou active pour le même fichier physique couvre l'obligation de première copie ; la préparation redondante est alors libérée par RAII sans second worker.
+- **IMPLÉMENTÉ — courses 2I-4C** : une mutation confirmée pendant l'inspection, entre préparation et admission, ou après une offre `InitialCopy` gagne l'arbitrage. Une offre initiale non démarrée est invalidée, son jeton devient inutilisable, sa capacité est libérée et le délai CRUD repart du dernier `COMMIT`. Les générations CRUD restent monotones dans leur propre session et une offre remplacée n'est jamais présentée comme publiée.
+- **VALIDÉ** — une sauvegarde automatique n'abandonne jamais silencieusement une édition non enregistrée.
+- **IMPLÉMENTÉ — production historique** : un échec suspend actuellement les tentatives automatiques du coffre dans le registre historique jusqu'à une reprise explicite, sans conserver d'instantané interrompu à reprendre. Ce mécanisme persistant reste actif uniquement avec le moteur `Historical`.
+- **VALIDÉ** — une sauvegarde demandée ou simplement lancée n'est pas une sauvegarde réussie. Tout échec doit être signalé sans annoncer une réussite sur la seule base d'une demande, d'un fichier visible ou de la fin d'un processus.
+- **VALIDÉ — cible** : après `Failed` ou `Unknown`, le moteur générationnel signale l'incident et suspend en mémoire les nouvelles tentatives du coffre jusqu'à une reprise explicite. Les `COMMIT` ultérieurs restent suivis comme non couverts, mais ne déclenchent aucune tentative pendant cette suspension. Il n'existe ni suspension persistante, ni historique d'erreurs, ni boucle de tentatives automatiques, ni journal de reprise ou mécanisme de réparation automatique ; un redémarrage peut donc oublier la suspension.
+- **VALIDÉ — reprise générationnelle** : une reprise explicite n'est admise qu'après terminaison effective de tout ancien worker susceptible d'agir. Elle autorise une seule nouvelle tentative couvrant le dernier besoin connu ; les demandes répétées, anciens jetons et résultats tardifs ne peuvent ni créer un doublon ni lever une suspension plus récente. Une sauvegarde de résultat incertain n'est jamais supprimée pour permettre cette reprise.
+- **IMPLÉMENTÉ — lot 2I-4F-1 inactif** : le coordinateur générationnel conserve une suspension volatile liée au chemin, au `vault_id`, au périphérique et à l'inode, distincte de la session authentifiée et de toute autorisation cryptographique. `Failed` et `Unknown` absorbent les besoins non démarrés du même coffre ; les commits suivants actualisent la génération non couverte sans réarmer le délai. La reprise propriétaire revalide l'identité physique, refuse un worker encore vivant et produit au plus une nouvelle offre. Pour `InitialCopy`, elle demande une nouvelle inspection explicitement forcée afin qu'un fichier incertain mais structurellement lisible ne supprime pas le besoin de copie fraîche. Une époque transitoire empêche un ancien résultat de lever une suspension récente.
+- **TESTÉ — lot 2I-4F-1** : les 138/138 tests ciblés du coordinateur rapportés par l'utilisateur réussissent. Ils couvrent l'échec, le résultat incertain, les commits et verrouillages suspendus, la reprise unique, le worker encore vivant, le résultat obsolète, l'isolation physique, l'absence de persistance et la neutralité historique.
+- **VALIDÉ** — pendant la vie du processus, une première copie échouée reste soumise à la même suspension et exige une reprise explicite avec une nouvelle inspection sécurisée. Après redémarrage, la suspension peut être oubliée et une nouvelle inspection d'un coffre toujours dépourvu de version admissible peut de nouveau proposer une première copie.
+- **VALIDÉ** — aucune durée maximale globale n'est imposée à une sauvegarde saine ; contention SQLite, annulation et erreurs d'E/S restent traitées séparément.
+- **VALIDÉ — conséquence acceptée** : après une interruption brutale avant l'expiration du délai ou avant la publication confirmée, les modifications déjà validées restent protégées par les transactions SQLite, mais l'indicateur en mémoire est perdu. PassWall ne garantit pas le rattrapage automatique de la sauvegarde manquée au redémarrage.
+- **VALIDÉ — conséquence acceptée** : après un plantage, aucun état d'échec ou de modification non sauvegardée n'est restauré depuis un registre. L'utilisateur relance PassWall et peut vérifier ses données ; les sauvegardes déjà publiées restent indépendantes.
+
+Le choix d'un suivi en mémoire ne modifie ni l'atomicité des transactions et journaux internes SQLite, ni les garanties de copie cohérente et de publication sûre. Il accepte en revanche qu'une interruption avant une publication confirmée puisse laisser l'historique de sauvegardes en retard sur l'état durable du coffre.
+
+### 5.4 Publication et rotation
+
+- **VALIDÉ** — la validation d'intégrité de la source et les garanties actuelles de copie cohérente, publication sans écrasement et confirmation de durabilité doivent être préservées.
+- **VALIDÉ** — la rotation ne commence qu'après la publication réussie et suffisamment confirmée de la nouvelle sauvegarde.
+- **VALIDÉ** — la rétention conserve sept sauvegardes par famille par défaut, ne peut être configurée sous sept et ne possède pas de plafond arbitraire dans la spécification.
+- **VALIDÉ** — l'historique correspond aux dernières sauvegardes effectivement publiées, pas nécessairement aux dernières modifications SQLite. Une famille peut contenir moins de sept versions tant que cet historique n'a pas encore été constitué.
+- **VALIDÉ** — aucun catalogue persistant individuel des versions n'est requis dans la cible.
+- **VALIDÉ** — une sauvegarde peut être considérée comme gérée lorsqu'elle se trouve dans le sous-dossier de famille attendu, respecte la convention de nommage et satisfait les contrôles techniques nécessaires.
+- **VALIDÉ** — la rotation n'exige pas une preuve historique individuelle de création ou de publication pour chaque ancienne version. Un fichier déposé manuellement peut donc être pris en compte s'il satisfait les mêmes conditions de dossier, de nommage, d'identité et de sécurité.
+- **VALIDÉ** — elle ne réauthentifie pas cryptographiquement et exhaustivement toutes les anciennes versions avant chaque suppression.
+- **VALIDÉ** — les fichiers ambigus, hors convention, hors sous-dossier familial ou ne satisfaisant pas les contrôles techniques ne sont pas supprimés. Les liens symboliques, substitutions concurrentes et suppressions hors périmètre restent refusés.
+- **VALIDÉ** — un export manuel n'est pas intégré automatiquement à la rotation ; s'il est ensuite placé manuellement dans le dossier géré et rendu conforme à toutes les conditions, il peut devenir une version gérée comme tout autre fichier admissible.
+- **À DÉFINIR** — critères techniques précis d'admission à la suppression : fichier ordinaire, parcours sans lien, identité stable, nom géré, métadonnées minimales, `vault_id` concordant et conduite en cas d'ambiguïté ou de changement concurrent.
+
+La séquence cible est simple et sans état persistant propre à la rotation :
+
+1. créer et vérifier la nouvelle sauvegarde ;
+2. confirmer suffisamment sa publication ;
+3. compter les versions admissibles du dossier familial ;
+4. si leur nombre dépasse la rétention, identifier les plus anciennes ;
+5. supprimer seulement les versions admissibles les plus anciennes jusqu'au nombre configuré.
+
+- **VALIDÉ** — aucun catalogue, reçu de rotation, historique de suppression ou système persistant de reprise n'est créé.
+- **VALIDÉ** — une erreur de suppression est un échec de rotation distinct : elle n'efface ni n'invalide la nouvelle sauvegarde déjà publiée.
+
+La présence d'un fichier, un code de sortie nul ou le début d'une copie ne prouvent pas une publication réussie. Une erreur postérieure ne doit pas provoquer la suppression d'une publication déjà valide.
+
+### 5.5 Résultats et diagnostics
+
+- **VALIDÉ** — chaque tentative produit un résultat borné et une notification indiquant l'opération concernée.
+- **VALIDÉ** — lorsque la cause est identifiable, le diagnostic présente la raison et les informations système réellement disponibles, notamment l'`errno` ou le code SQLite pertinent. Aucun code d'erreur n'est inventé.
+- **VALIDÉ** — les diagnostics techniques nécessaires restent attachés au résultat d'exécution, sans historique persistant des erreurs.
+- **VALIDÉ** — un échec de création, un résultat de publication ou de synchronisation non confirmé et un échec de rotation sont distingués. Une sauvegarde publiée avec une suppression ancienne impossible reste une sauvegarde réussie accompagnée d'une erreur de rotation.
+- **VALIDÉ** — lorsqu'une publication est visible mais que sa durabilité n'est pas confirmée, PassWall avertit qu'il ne peut pas garantir la réussite ; il ne transforme pas l'incertitude en succès.
+- **À DÉFINIR** — conduite ultérieure exacte pour une publication visible mais de durabilité non confirmée, sans journal de reprise ni nouvelle suppression risquée.
+
+Les diagnostics ne contiennent aucun secret. Des formulations compréhensibles peuvent accompagner, sans les remplacer ni les fabriquer, des causes telles que `ENOSPC` (28), `EACCES` (13) ou un code SQLite effectivement retourné.
+
+### 5.6 Consultation et copie de travail
+
+- **VALIDÉ** — les versions situées sous la racine gérée sont consultables en lecture seule.
+- **VALIDÉ** — leur modification exige la création d'une copie de travail hors du dossier géré.
+- **VALIDÉ** — cette copie de travail conserve le `vault_id` ; elle appartient donc à la même famille si elle est ensuite modifiée et sauvegardée.
+- **À FAIRE** — définir et implémenter une vraie session de lecture seule empêchant CRUD, Native Messaging d'écriture, suivi de modification et opérations incompatibles ; désactiver seulement les boutons serait insuffisant.
+- **À FAIRE** — implémenter la copie de travail par le moteur d'instantané, sans écrasement ni ouverture automatique.
+- **À DÉFINIR** — manière de retrouver et consulter les sauvegardes laissées dans une ancienne racine.
+
+## 6. Implémentation actuelle des sauvegardes et écarts
+
+### 6.1 Registre monolithique actuel
+
+`VaultPreferencesStore` conserve dans `vaultRegistry/data`, au sein du fichier QSettings global existant, un tableau JSON de `VaultRegistration`.
+
+- **IMPLÉMENTÉ** — chaque principal reconnu possède un `localId` distinct du `vault_id`, une identité physique et son chemin.
+- **IMPLÉMENTÉ** — une copie reconnue comme nouveau fichier reçoit un nouvel enregistrement et n'hérite pas automatiquement des préférences.
+- **IMPLÉMENTÉ** — les préférences sont actuellement par coffre : automatique désactivé par défaut, destination vide et rétention de sept versions.
+- **IMPLÉMENTÉ** — le même enregistrement contient `backupRequired`, suspension, tentative, destination, époque, catalogue des versions et état de rotation.
+- **IMPLÉMENTÉ** — le registre contient aussi les intentions et reçus de restauration/récupération.
+- **À FAIRE — écart actuel** : ces responsabilités sont incompatibles avec les préférences globales et la rotation sans catalogue de la cible.
+- **À FAIRE — écart actuel** : les états persistants de modification, d'échec, de suspension, de tentative et de rotation ne font pas partie de la politique cible 0C.
+- **À FAIRE — risque de transition** : supprimer simplement le registre supprimerait aussi des preuves historiques encore indispensables aux opérations inachevées. Elles doivent rester lisibles et opposables jusqu'à leur résolution contrôlée ; elles ne seront pas transférées dans un nouveau journal permanent.
+
+`GlobalBackupPreferencesStore` constitue désormais une fondation distincte, sans remplacer ce registre :
+
+- **IMPLÉMENTÉ — lot 2I-3A** : `BackupPreferences.ini` conserve seulement la racine globale et la rétention cible ; il ne lit ni n'écrit `PassWall.conf` ou `vaultRegistry/data` ;
+- **IMPLÉMENTÉ — indépendance métier** : son absence, son invalidité ou une erreur d'accès n'interviennent dans aucun chemin d'ouverture ou CRUD. Les preuves historiques de récupération restent consultées par leurs mécanismes actuels ;
+- **IMPLÉMENTÉ — production inchangée** : le coordinateur construit par `MainWindow` reste `Historical`. Les préférences par coffre, la destination, le catalogue et la rotation historiques restent donc temporairement actifs jusqu'aux lots de basculement ;
+- **TESTÉ — lot 2I-3A** : les dix tests ciblés rapportés après correction du conflit entre le verrou applicatif et celui de QSettings couvrent états, valeurs, erreurs, persistance, permissions et indépendance de `PassWall.conf`.
+
+### 6.2 Exclusion et suivi des mutations
+
+- **IMPLÉMENTÉ** — `VaultOperationGuard` distingue les accès métier partagés, les accès d'instantané partagés et les réservations exclusives de remplacement.
+- **IMPLÉMENTÉ — préparation 2I-3B inactive** : la nouvelle préparation acquiert explicitement l'accès d'instantané existant, vérifie son identité physique avec `matchesSnapshotIdentity()`, relit le `vault_id` avec les contrôles de récupération encore actifs et conserve la capacité jusqu'à sa consommation ou sa destruction. Une restauration exclusive ne peut donc pas franchir cette préparation ; les accès métier compatibles restent possibles.
+- **IMPLÉMENTÉ — destination 2I-3B** : `VaultSnapshotService::inspectDestinationDirectory()` reste la politique d'admission des systèmes de fichiers et chemins. La création familiale ajoute une ouverture composante par composante sans liens, une identité racine/famille stable, des permissions `0700`, une synchronisation du dossier créé et une revalidation avant usage. Ces contrôles n'affaiblissent ni la publication sans écrasement ni la vérification finale du worker.
+- **TESTÉ — lot 2I-3B** : les onze tests ciblés rapportés sont réussis ; ils couvrent familles partagées ou distinctes, UTC et collisions, chemins, liens, permissions, identités, substitutions, absence d'écrasement et durée de vie de la réservation.
+- **IMPLÉMENTÉ — inspection 2I-3C** : `VaultSnapshotService::prevalidateVaultSource()` peut restituer, après validation structurelle et contrôle de stabilité, le `vault_id` et l'existence d'entrées sans clé de déchiffrement. Le préparateur de première copie garde simultanément l'accès d'instantané du principal et revalide racine et famille avant de remettre sa demande transitoire.
+- **TESTÉ — lots 2I-3B/2I-3C** : les 21 tests ciblés rapportés sont réussis, ainsi que les deux tests directement concernés de prévalidation de restauration. Ils couvrent destination, réservation unique, coffre vide ou peuplé, version existante, changement de racine, famille partagée, configuration indisponible, génération CRUD en attente, substitutions et fermeture de session.
+- **IMPLÉMENTÉ — lot 2I-4B inactif** : la préparation conserve un identifiant de liaison opaque ; la demande initiale l'interprète exclusivement comme génération de session. L'admission finale est exécutée sur le thread propriétaire du `BackupJob`, consomme définitivement la demande et transfère la même capacité après revalidation complète. Aucun constructeur de production n'active ce chemin.
+- **TESTÉ — lot 2I-4B, validation ciblée** : 29/29 tests de `passwall_backup_destination_tests` (11 destinations et 18 premières copies/admissions), 2/2 tests de sélection du mode du coordinateur et 2/2 tests de réservation `BackupJob` ont été exécutés avec succès dans le terminal utilisateur, soit 33/33 tests ciblés. Ils couvrent notamment consommation unique, transfert sans réacquisition, admissions refusées, substitutions, annulation, échec synchrone et libération RAII. Aucun CTest complet ni essai de production générationnelle n'est déduit de ces résultats.
+- **IMPLÉMENTÉ — lot 2I-4C inactif** : `AutomaticBackupCoordinator` porte une seule file d'arbitrage et émet une offre transitoire typée `CrudGeneration` ou `InitialCopy`. L'admission d'une première copie vérifie le mode, le thread, la session, le coffre physique et la destination préparée. Une mutation concurrente remplace seulement une offre initiale non démarrée et invalide son jeton ; une tentative CRUD active et ses résultats restent régis par les contrats 2D–2H.
+- **TESTÉ — lot 2I-4C** : les tests ciblés rapportés réussissent ; ils couvrent première copie seule, génération déjà en attente, commit injecté pendant l'inspection, commit entre préparation et admission, remplacement d'une offre, regroupement de plusieurs mutations, fermeture ou session obsolète, libération RAII et neutralité du mode historique.
+- **IMPLÉMENTÉ — coordination 2I-4D inactive** : le coordinateur expose en mémoire des phases distinctes pour l'inspection initiale, la préparation détenant une capacité, la demande en attente ou offerte, la contention, la tentative et le worker réellement vivant. Une activité d'inspection porte un identifiant éphémère lié au coffre physique et à la génération de session ; le coordinateur conserve lui-même la demande préparée et sa capacité jusqu'à admission, annulation ou invalidation, de sorte qu'une réponse tardive ne peut ni être admise ni libérer deux fois la réservation.
+- **IMPLÉMENTÉ — préadmission 2I-4D** : l'export manuel et l'émission d'une autorisation de restauration consultent cette activité avant de détruire une session ou de créer une intention persistante. Une incompatibilité produit un diagnostic et n'annule jamais implicitement la sauvegarde automatique. Ce contrôle de présentation reste anticipé et ne constitue jamais une réservation ni une autorisation de remplacement.
+- **IMPLÉMENTÉ — arbitrage 2I-4F-2 inactif** : après les dialogues et confirmations, mais avant le verrouillage volontaire, `AutomaticBackupCoordinator::acquireUserOperation()` délivre sur son thread propriétaire une capacité RAII mobile, liée au type d'opération et au chemin concerné. Une sauvegarde déjà inspectée, préparée, en attente, offerte, en contention, tentée ou encore supervisée a priorité et refuse cette capacité. Une opération manuelle admise en premier empêche inversement l'offre d'une demande automatique ultérieure du même coffre jusqu'à l'acquisition exclusive finale ; les demandes CRUD restent conservées en mémoire et sont réordonnancées à la libération.
+- **IMPLÉMENTÉ — transfert 2I-4F-2 inactif** : l'export acquiert la capacité avant le verrouillage, puis la consomme seulement après nettoyage du coffre ; il acquiert alors la réservation exclusive historique et la transfère directement à `BackupJob::startReserved()`. La restauration acquiert également l'admission avant le verrouillage, la marque à usage unique après le nettoyage, puis acquiert hors du thread GUI la réservation exclusive du principal sélectionné ; `VaultReplacementAuthorization::reserve()` vérifie cette garde contre l'enregistrement avant d'en devenir propriétaire. L'admission logique reste vivante jusqu'à cette acquisition ou son refus, puis RAII la libère : il n'existe donc pas d'intervalle coopératif sans admission logique ni réservation physique. Cette capacité ne crée aucune intention, n'est ni sérialisable ni persistante et ne remplace jamais `VaultOperationGuard` ou l'autorisation opaque 6A. En mode `Historical`, les deux parcours conservent leurs appels historiques à `BackupJob::start()` et à la réservation interne de l'autorisation.
+- **IMPLÉMENTÉ — isolation 2I-4F-2 inactive** : les admissions sont indexées par coffre ; un worker `Unknown` encore vivant reste bloquant, tandis qu'un `Failed` ou `Unknown` dont le worker a réellement terminé ne bloque plus les opérations manuelles une fois ses verrous libérés. Deux chemins indépendants ne se bloquent pas par ce seul arbitrage. Une nouvelle session authentifiée révoque les admissions non consommées de l'ancienne session ; une réponse tardive ne peut donc pas acquérir ensuite une réservation.
+- **IMPLÉMENTÉ — corrections 2I-4F-2** : l'admission finale de remplacement inspecte le registre avec `VaultPreferencesStore::inspectReserved()` sous la réservation exclusive déjà acquise, sans perdre la porte de récupération. `ManualBackupOperationAdmission` reste une amie de l'autorisation de remplacement dans tous les builds, et non uniquement sous `PASSWALL_REPLACEMENT_TESTING`.
+- **TESTÉ — lot 2I-4F-2** : l'utilisateur rapporte 146/146 tests de sauvegarde automatique, 165/165 tests de remplacement et 5/5 tests GUI ciblés réussis après les deux corrections précédentes.
+- **IMPLÉMENTÉ — invalidation 2I-4F-3 inactive** : chaque lecture de `BackupPreferences.ini` transporte désormais sa provenance transitoire. Une destination préparée conserve la racine, la rétention et le fichier de configuration exacts ayant servi à sa préparation. Une publication confirmée des préférences notifie le coordinateur, y compris lorsque la synchronisation finale reste incertaine, car l'ancien contenu ne peut alors plus être présumé courant.
+- **IMPLÉMENTÉ — cohérence 2I-4F-3 inactive** : sur son thread propriétaire, le coordinateur annule sans attente l'inspection initiale, libère par RAII les premières copies préparées et invalide les jetons non lancés. Les générations CRUD correspondantes sont conservées et réoffertes seulement sous une configuration de nouveau valide ; elles ne deviennent ni `Published`, ni `Failed`, ni `Unknown` du seul fait de la reconfiguration. Une nouvelle inspection est demandée pour une première copie devenue obsolète.
+- **IMPLÉMENTÉ — admission finale 2I-4F-3 inactive** : avant de consommer un jeton, le coordinateur compare l'instantané courant aux préférences de préparation. La frontière `BackupDestinationPreparer` relit en plus le fichier physique lorsque sa provenance est disponible ; changement de racine, de rétention, état absent/invalide ou fichier différent refusent ainsi l'ancienne destination. Un worker déjà lancé n'est jamais interrompu par ce changement et conserve son résultat réel ainsi que sa suspension éventuelle.
+- **À FAIRE — consommateur 2I-4F-3** : le futur consommateur de production devra détruire immédiatement toute `PreparedBackupDestination` CRUD qu'il détient lorsqu'il reçoit `generationalBackupRequestInvalidated`. La revalidation finale empêche déjà son utilisation, mais seul le propriétaire de cet objet mobile peut libérer sans délai sa capacité RAII avant qu'elle ne soit remise au coordinateur.
+- **TESTÉ — lot 2I-4F-3** : l'utilisateur rapporte 11/11 tests des préférences globales, 29/29 tests de préparation des destinations, 150/150 tests du coordinateur et 5/5 tests GUI ciblés réussis. Ils couvrent notamment la modification pendant l'inspection, après préparation, l'indisponibilité de configuration avec générations conservées, la rétention modifiée et le worker déjà actif.
+- **IMPLÉMENTÉ — vidange 2I-4F-4A inactive** : `beginGenerationalShutdownDrain()` constitue une frontière propriétaire, asynchrone et idempotente distincte de `shutdown()`. Elle annule sans attente une inspection initiale non achevée, supprime le délai de regroupement d'une génération CRUD effectivement confirmée et laisse la file générationnelle, ses jetons et le consommateur existant terminer le travail. Une mutation confirmée pendant la vidange devient immédiatement une demande distincte ; aucune génération n'est inventée en l'absence de `COMMIT`.
+- **IMPLÉMENTÉ — résultat de vidange 2I-4F-4A inactif** : l'état transitoire distingue demande en cours, worker encore vivant, vidange confirmée et vidange achevée avec échec ou suspension. Un worker actif n'est ni annulé ni préempté ; sa réservation et sa supervision restent effectives jusqu'à sa terminaison réelle, puis une génération postérieure est offerte si nécessaire. `Failed`, `Unknown`, configuration devenue inadmissible ou inspection initiale à reprendre ne sont jamais transformés en succès et ne déclenchent aucun retry.
+- **IMPLÉMENTÉ — priorité et arrêt 2I-4F-4A** : une opération manuelle déjà admise garde sa place et la demande automatique attend sa libération ; une nouvelle opération manuelle est refusée pendant la vidange. L'arrêt immédiat `shutdown()` conserve sa sémantique historique d'annulation/règlement et demeure séparé de cette frontière progressive.
+- **TESTÉ — lot 2I-4F-4A** : les huit tests ciblés de vidange rapportés par l'utilisateur réussissent. Ils couvrent absence de mutation, accélération et regroupement, idempotence, worker réel avec génération postérieure, absence de copie redondante, `Failed`/`Unknown` et enfant encore vivant, admission manuelle antérieure, inspection annulée et configuration obsolète. Ces scénarios font également partie de la suite du coordinateur exécutée après 2I-4F-4B (158/158 réussis).
+- **IMPLÉMENTÉ — raccordement GUI 2I-4F-4B, inactif en production** : `MainWindow::closeEvent()` utilise la vidange générationnelle uniquement lorsque le coordinateur a été explicitement construit en mode `Generational`. Une fabrique dédiée aux tests GUI sous `PASSWALL_GUI_TESTING` permet ce parcours ; les constructeurs de production restent en mode `Historical`. À la première demande de fermeture, la fenêtre refuse provisoirement l'événement, engage la vidange, invalide l'accès au coffre et appelle `lockVault()` pour effacer immédiatement les secrets, sans attendre l'inspection ni le worker et sans dialogue modal.
+- **IMPLÉMENTÉ — fermeture répétée 2I-4F-4B** : les nouvelles demandes de fermeture pendant une vidange non terminale restent refusées mais ne rappellent plus `lockVault()`. Elles conservent ainsi l'identité physique non secrète et les compteurs du coordinateur nécessaires à la reconnaissance d'un `COMMIT` tardif. Une génération confirmée après le démarrage d'un instantané demeure une demande distincte. Lorsque la vidange devient `Completed` ou `CompletedWithFailureOrSuspension`, une fermeture est programmée automatiquement ; aucun résultat `Failed` ou `Unknown` n'est inventé comme `Published`, aucun nouvel essai n'est lancé et un worker encore vivant ne provoque pas une fermeture anticipée.
+- **TESTÉ — lot 2I-4F-4B** : l'utilisateur rapporte 4/4 tests GUI de fermeture et de neutralité du mode production, 5/5 régressions GUI d'export/restauration, puis 158/158 tests du coordinateur réussis. La fixture GUI générationnelle exige une configuration globale valide ; le test de double fermeture vérifie une première génération, un second `COMMIT` pendant la vidange et la terminaison avec échec sans retry. Un test d'inspection asynchrone, intermittent lors d'une campagne précédente, a été stabilisé par une attente bornée de l'offre sans abaisser l'exigence de résultat ; sa cause précise n'est pas démontrée. Ces résultats ne constituent ni une campagne CTest complète ni une activation du moteur générationnel en production.
+- **À DÉFINIR — désactivation explicite** : le schéma global actuel ne possède toujours pas de booléen d'activation. L'état non valide/absent suspend déjà les nouvelles offres observées et la future désactivation explicite devra emprunter la même invalidation, mais son stockage et son interface ne sont pas inventés par 2I-4F-3.
+- **IMPLÉMENTÉ — supervision 2I-4D** : une offre sans consommateur n'est jamais présentée comme un worker ; inversement, un résultat `Unknown` observé alors que l'enfant vit encore reste exposé comme `WorkerActive`, avec réservation conservée, jusqu'au signal de terminaison effective. Les phases terminales sont notifiées après libération RAII des capacités détenues par le coordinateur.
+- **TESTÉ — lot 2I-4D** : les validations ciblées rapportées réussissent pour l'inspection, la préparation réservée, les préadmissions export/restauration, la course avec la réservation exclusive, l'offre sans worker, le résultat `Unknown` avec enfant vivant, l'annulation, le changement de session et la neutralité historique.
+- **IMPLÉMENTÉ — inspection asynchrone 2I-4E-1 inactive** : le coordinateur peut lancer `InitialBackupPreparer` sur un thread court sans secret, avec une identité de coffre, une génération de session et une empreinte de configuration transitoires. Un jeton atomique compose l'annulation de cycle de vie avec les points de contrôle du préparateur. La réponse move-only est synchronisée puis remise au thread propriétaire, où seulement ont lieu la revalidation et l'arbitrage 2I-4C.
+- **IMPLÉMENTÉ — cycle de vie 2I-4E-1 inactif** : verrouillage, fermeture, changement de session/coffre ou invalidation de configuration demandent l'annulation sans attendre le thread. Une activité annulée reste bloquante jusqu'à la fin réelle si sa capacité peut encore être détenue ; le point de contrôle suivant l'acquisition rend cet état consultable. La destruction du propriétaire n'attend pas le thread : la réponse tardive détruit seulement ses objets RAII et ne peut plus être admise.
+- **IMPLÉMENTÉ — raccordement conditionnel 2I-4E-1** : après l'enregistrement d'une session réellement authentifiée, `MainWindow` prépare le contexte sans clé et ne demande l'inspection que si son coordinateur immuable est déjà `Generational`. Le constructeur de production reste `Historical`, donc ce raccordement ne s'exécute pas actuellement. Une même session/configuration ne lance pas deux inspections et une mutation concurrente est arbitrée sur le thread propriétaire.
+- **TESTÉ — lot 2I-4E-1** : les 129 tests ciblés du coordinateur rapportés par l'utilisateur réussissent. Ils couvrent notamment la réussite asynchrone, la réactivité du propriétaire, les invalidations de verrouillage/destruction/coffre/configuration, les réponses tardives, les doublons, la libération RAII, une mutation concurrente et la neutralité historique.
+- **IMPLÉMENTÉ — consommation 2I-4E-2 inactive** : un coordinateur explicitement construit en mode `Generational` peut désormais consommer une offre `InitialCopy` ou une génération CRUD dotée d'une `PreparedBackupDestination`. Les deux voies convergent vers un unique `BackupJob`, réutilisent sans réacquisition la capacité d'instantané préparée et effectuent l'admission finale sur le thread propriétaire. Le jeton, la session, l'identité physique, le `vault_id`, la racine, la famille et la destination sont revalidés avant le transfert à `startSnapshotReserved()`.
+- **IMPLÉMENTÉ — résultats 2I-4E-2 inactifs** : le superviseur commun sérialise les workers, conserve les générations plus récentes et ne publie le résultat complet qu'après terminaison effective. `Published` exige le reçu 2H-1 cohérent avec le type de demande, le jeton, la génération ou session et la destination ; `Failed` et `Unknown` conservent le résultat détaillé et son diagnostic. Un enfant encore vivant après un résultat incertain conserve sa réservation sous le superviseur existant.
+- **TESTÉ — lot 2I-4E-2** : les 137/137 tests ciblés du coordinateur rapportés par l'utilisateur réussissent après raccordement des publications réelles `InitialCopy`/CRUD, de l'usage unique du jeton, du changement de session avant admission, des mutations pendant le worker, des échecs de lancement, des preuves insuffisantes et de la survie supervisée d'un worker inconnu.
+- **IMPLÉMENTÉ** — un accès d'instantané partage les verrous de nom et d'inode avec les accès métier, mais détient en plus un verrou exclusif de sérialisation : deux instantanés du même fichier physique ne peuvent donc pas agir simultanément.
+- **IMPLÉMENTÉ** — sous Linux, les réservations interprocessus utilisent `flock` et des descripteurs explicitement transmis aux workers ; les capacités d'instantané et de remplacement possèdent des méthodes distinctes de vérification, d'export et d'adoption.
+- **IMPLÉMENTÉ** — le contrôle porte sur le nom et l'identité physique pour résister aux changements d'inode et substitutions concurrentes.
+- **IMPLÉMENTÉ — production historique** : les CRUD préparent le suivi persistant avant l'écriture SQL ; un commit réussi conserve l'obligation de sauvegarde. Ce comportement reste celui de tous les appels qui ne sélectionnent pas explicitement un autre moteur.
+- **IMPLÉMENTÉ — fondation 2A** : `CredentialService::events()` émet en mémoire un événement typé `Added`, `Updated` ou `Removed`, avec le seul chemin du coffre, après confirmation de la fin du `COMMIT`. Validation refusée, erreur SQL, rollback et état de commit incertain n'émettent rien.
+- **IMPLÉMENTÉ — lot 2B/2I-1** : lorsqu'il est construit explicitement en mode `Generational`, `AutomaticBackupCoordinator` observe ces événements pour la seule session authentifiée courante, redémarre un `QTimer` mono-coup de 20 000 ms et incrémente une génération de mutation en mémoire. L'expiration prépare une demande unique pour la période regroupée. Le mode de production `Historical` ne s'abonne pas à ces événements.
+- **IMPLÉMENTÉ — isolation 2B** : le chemin normalisé, la génération de session et la génération monotone du `COMMIT` excluent les événements d'un autre coffre, les événements retardés antérieurs à l'ouverture courante et les délais d'une session terminée. Un arrêt explicite du regroupement annule le délai sans persistance.
+- **IMPLÉMENTÉ — lot 2C** : lors d'un verrouillage ordinaire, une génération encore planifiée est capturée avec le chemin normalisé du coffre, le délai et la session de regroupement sont invalidés immédiatement, puis la demande est offerte au tour de boucle Qt suivant. Une génération déjà offerte n'est pas redemandée. Les préparations de remplacement, fermetures externes et exports conservent leurs exclusions historiques.
+- **IMPLÉMENTÉ — lots 2D/2I-4C** : chaque `GenerationalBackupRequestOffer` porte un type explicite et un jeton monotone à usage unique. Le coordinateur distingue l'offre non encore prise en charge, la tentative active et les demandes prêtes mais différées. Une seule tentative peut être active ; une génération apparue après son démarrage reste en attente, même si l'instantané réel pouvait matériellement la contenir.
+- **IMPLÉMENTÉ — résultats 2D/2I-4F-1** : seul le jeton actif exact peut produire `Published`, `Failed` ou `Unknown`. Seul `Published` représente une publication confirmée ; `Failed` et `Unknown` installent désormais une suspension générationnelle volatile. Une mutation ultérieure met à jour le besoin non couvert mais reste inadmissible jusqu'à une reprise explicite, et un résultat obsolète ne peut ni acquitter ce besoin ni lever la suspension.
+- **IMPLÉMENTÉ — fondation 2E** : `startMutationBackupSnapshot()` vérifie une capacité d'instantané déjà acquise, marque le jeton et la génération comme tentés avant tout lancement, puis délègue à `BackupJob::startSnapshotReserved()`. Le même `BackupJob` reste partagé avec le chemin historique : aucun second worker ne peut être lancé simultanément par le coordinateur.
+- **IMPLÉMENTÉ — résultats 2E/2H-1** : le résultat du worker reste attaché au jeton actif et n'acquitte la génération qu'après terminaison effective du processus. Seul `Published` accompagné de la preuve transitoire complète devient `Published` ; un échec ou une annulation confirmés avant publication deviennent `Failed`, tandis que preuve absente ou incohérente, durabilité non confirmée, résultat absent, crash ou protocole non confirmé deviennent `Unknown`. Une génération postérieure reste différée jusqu'à cette terminaison.
+- **IMPLÉMENTÉ — séparation publication/rotation 2E** : ce chemin appelle le worker sans contexte de rotation historique. Une publication confirmée peut donc acquitter sa génération sans qu'un échec futur de rotation soit confondu avec un échec de copie ; le raccordement à la future rotation sans catalogue reste à réaliser.
+- **IMPLÉMENTÉ — preuve de publication 2H-1** : le chemin d'instantané partagé demande désormais explicitement au worker un reçu transitoire. Le résultat lie l'identité stable du fichier publié et de son répertoire, son empreinte SHA-256 et le chemin de destination effectivement contrôlé. `BackupJob` refuse de conserver `Published` si cette preuve manque, vise une autre destination ou ne satisfait pas les critères techniques déjà requis pour une suppression sûre ; comme une publication a pu avoir lieu, ce refus devient `Unknown`, jamais un échec fictivement antérieur à la publication.
+- **IMPLÉMENTÉ — liaison au jeton 2H-1/2H-2** : `AutomaticBackupCoordinator` conserve le reçu uniquement en mémoire jusqu'à la terminaison effective du worker, puis vérifie le worker supervisé, le jeton actif, la génération, le chemin du coffre et la destination attendue. Le résultat transitoire unique `MutationBackupResult` transporte cette preuve avec `BackupFileEvidence` et le règlement exact de la génération. Une preuve absente, incomplète, incohérente ou attachée à un résultat tardif ne peut pas acquitter la génération.
+- **IMPLÉMENTÉ — séparation rotation 2H-1** : le reçu n'est écrit ni dans QSettings ni dans un catalogue et ce lot ne lance aucune rotation. Il fournit seulement au futur consommateur la preuve nécessaire pour commencer cette étape séparée après une publication confirmée.
+- **IMPLÉMENTÉ — diagnostics 2H-2** : `MutationBackupResult` associe atomiquement le chemin du coffre, la génération, le jeton à usage unique, l'état de coordination `Published`/`Failed`/`Unknown`, le `BackupOutcome` détaillé du worker, son diagnostic borné et le reçu de publication éventuel. Une annulation confirmée reste ainsi distincte d'un échec avant publication ; une durabilité non confirmée reste distincte d'un résultat absent ou invalide. Les diagnostics réellement transmis par le worker, notamment les codes POSIX ou SQLite disponibles, ne sont plus perdus lors de la réduction en état de coordination.
+- **IMPLÉMENTÉ — absence d'invention 2H-2** : les échecs locaux antérieurs au worker portent uniquement la cause effectivement connue. L'absence d'un résultat terminal produit un diagnostic explicite d'absence, jamais une cause système fabriquée. Aucun résultat, diagnostic ni reçu générationnel n'est persisté.
+- **IMPLÉMENTÉ — sélecteur 2I-1** : `BackupTriggerMode` est fixé à la construction du coordinateur et ne possède aucun mutateur. Tous les constructeurs utilisés par la production sélectionnent `Historical`; `Generational` exige le constructeur explicite employé par les tests. Le coordinateur ne connecte que la source d'événements du moteur choisi et chaque frontière d'entrée refuse défensivement les appels de l'autre moteur.
+- **IMPLÉMENTÉ — exclusivité 2I-1** : en mode `Historical`, commits, délais et demandes générationnelles sont neutralisés ; en mode `Generational`, changements de préférences, reprise historique par `localId`, demande historique au verrouillage et dispatch historique sont neutralisés. La reprise volatile 2I-4F-1 appartient exclusivement au moteur générationnel. Les rappels Qt différés revérifient leur moteur avant tout dispatch. Il n'existe ni basculement à chaud, ni repli automatique vers l'historique après un échec générationnel.
+- **IMPLÉMENTÉ — admission 2I-2** : la politique immuable `BackupTriggerMode` est partagée entre le coordinateur et `CredentialService`. `MainWindow` transmet à `add()`, `update()` et `remove()` le mode du coordinateur propriétaire de la session ; les appels directs conservent `Historical` par défaut. En mode historique, `prepareMutation()` et toutes ses écritures de `backupRequired` restent inchangés. En mode générationnel, `admitGenerationalMutation()` conserve la réservation métier, les contrôles de fichier et d'identité physique ainsi que la porte de récupération historique, mais n'écrit ni `backupRequired`, ni tentative, ni suspension dans QSettings.
+- **IMPLÉMENTÉ — indépendance des préférences 2I-2** : l'admission générationnelle lit sous verrou uniquement l'identité locale et les intentions ou reçus historiques nécessaires à la sécurité. L'absence du fichier de préférences, l'absence des champs ordinaires de sauvegarde ou leur contenu invalide ne bloquent donc pas à eux seuls un CRUD sur un coffre sain et ne créent pas le fichier de configuration. Une configuration INI globalement illisible, une structure ne permettant plus de décider si une preuve de récupération existe, une preuve malformée ou une restauration active restent refusées par prudence.
+- **IMPLÉMENTÉ — capacité d'admission 2I-2** : la capacité d'accès métier obtenue pendant l'admission reste vivante jusqu'à la fin du CRUD. La lecture des métadonnées qui suit ne peut éviter le second contrôle des préférences ordinaires qu'en présentant cette capacité exacte, encore valide pour le même chemin et la même identité coopérative. L'ouverture SQLite conserve sa propre garde partagée ; aucune API publique ne transforme un booléen en autorisation.
+- **IMPLÉMENTÉ — notifications 2I-2** : les événements `Added`, `Updated` et `Removed` restent émis exclusivement après un `COMMIT` confirmé, indépendamment du mode. Un refus d'admission, une erreur SQLite ou un rollback ne produit aucune notification.
+- **TESTÉ — lot 2I-2** : 40 tests ciblés réussis couvrent le mode historique explicite, l'absence ou l'invalidité des préférences ordinaires, l'absence de fichier de configuration, le refus des preuves de récupération actives ou malformées, l'exigence d'une capacité exacte et la notification après `COMMIT`.
+- **IMPLÉMENTÉ — identité 2G-1** : chaque génération conserve en mémoire le périphérique et l'inode vérifiés lors de l'enregistrement de la session authentifiée. Cette identité suit la demande lorsqu'un verrouillage ordinaire détruit la session et n'est ni sérialisée ni transformée en autorisation persistante.
+- **IMPLÉMENTÉ — admission 2G-1** : juste avant le lancement, `startMutationBackupSnapshot()` exige d'abord une capacité d'instantané valide pour le chemin courant, puis confirme que cette capacité protège le périphérique et l'inode attendus. L'absence d'une tentative d'acquisition est une erreur d'appel qui ne vaut pas résultat métier ; une acquisition effectivement tentée mais définitivement refusée ou une capacité devenue invalide soldent la génération `Failed`. Une capacité valide sur un fichier physiquement différent prouve également que l'ancienne génération est obsolète et ne lance aucun worker.
+- **IMPLÉMENTÉ — concurrence 2G-1** : la réservation partagée et sa revalidation empêchent la préparation exclusive et l'instantané de franchir simultanément leur frontière. Si un remplacement gagne la réservation, l'ancienne demande reste bloquée puis est invalidée par la nouvelle identité ; si l'instantané gagne, la restauration exclusive attend ou échoue sans contourner ses contrôles. Une substitution extérieure qui ignore les verrous coopératifs est encore détectée lors de la revalidation ou de l'adoption des descripteurs par le worker.
+- **IMPLÉMENTÉ — reprise 2G-2** : une acquisition effectivement tentée et refusée pour contention place la demande dans un état d'attente en mémoire distinct d'un échec. La libération effective d'un `VaultOperationGuard` détenu dans le processus produit un indice noyau local ; le coordinateur réémet alors la demande avec un nouveau jeton à usage unique. Cet indice ne constitue ni une preuve de disponibilité ni une capacité : chaque réveil exige une nouvelle acquisition et les contrôles complets de chemin, périphérique et inode.
+- **IMPLÉMENTÉ — borne 2G-2** : la première contention démarre une unique échéance de pré-lancement de 3 000 ms, cohérente avec la fenêtre de contention SQLite V1. Les réveils et jetons successifs ne la réarment pas. À l'échéance, la génération est soldée `Failed` avec un diagnostic explicite, sans worker et sans réussite fictive ; une génération postérieure conservée en mémoire reste ensuite admissible. Cette borne ne limite jamais la durée d'une sauvegarde saine déjà lancée.
+- **IMPLÉMENTÉ — échecs 2G-2** : une annulation confirmée avant lancement solde la seule demande correspondante ; un refus définitif, une identité divergente, un échec réel du worker et un résultat `Unknown` ne déclenchent aucune reprise automatique. Un résultat ou un jeton ancien ne peut pas terminer une offre réémise. Le déclenchement reste limité à un worker actif dans le coordinateur.
+- **IMPLÉMENTÉ — limite de notification 2G-2** : le réveil est local au processus et couvre les gardes détenus par PassWall, y compris ceux conservés par les superviseurs jusqu'à la terminaison effective des workers. Une réservation détenue par un processus indépendant ou un composant ignorant ce mécanisme peut ne produire aucun réveil local ; l'échéance transforme alors l'attente en échec explicite plutôt qu'en attente infinie ou polling.
+- **IMPLÉMENTÉ — fermeture 2G-3** : avant l'arrêt du coordinateur lors d'une fermeture normale, `MainWindow` capture synchroniquement la génération encore planifiée avec son identité physique, sans lancer de worker et sans retarder le nettoyage du coffre. Le verrouillage invalide ensuite la session Firefox et détruit les secrets selon le chemin existant. Le destructeur possède la même capture de dernier recours si aucun `closeEvent()` normal n'a abouti.
+- **IMPLÉMENTÉ — résultats de fermeture 2G-3** : une génération capturée, prête, offerte ou en attente de contention mais jamais lancée est soldée `Failed` avec un diagnostic de fermeture ; une tentative simulée dont aucun processus supervisé ne peut encore répondre est soldée `Unknown`. Une génération déjà soldée `Failed` ou `Unknown` n'est ni recréée ni réessayée. Aucune de ces transitions n'est présentée comme une sauvegarde publiée.
+- **IMPLÉMENTÉ — worker actif 2G-3** : un véritable `BackupJob` déjà lancé reçoit une demande d'annulation. Un résultat confirmé avant publication devient `Failed`; une publication confirmée reste `Published`; un résultat incertain devient `Unknown`. La fermeture de la façade Qt ne libère pas les réservations d'un enfant encore vivant : le superviseur indépendant les conserve jusqu'à sa terminaison effective. Aucune durée maximale globale n'est imposée à une sauvegarde saine ; les délais d'escalade après annulation restent distincts.
+- **IMPLÉMENTÉ — limite volontaire 2G-3** : puisque le consommateur générationnel de production est encore désactivé, une fermeture normale ne lance pas artificiellement un nouveau worker. Elle rend la perte de la demande explicite par `Failed` au lieu de l'effacer silencieusement. Cette fondation ne constitue donc pas une garantie de sauvegarde à la fermeture.
+- **IMPLÉMENTÉ — limite volontaire 2I-4E-2** : le coordinateur générationnel injectable possède maintenant ses voies de consommation réelles pour `InitialCopy` et `CrudGeneration`, mais aucun composant de production ne consomme encore `generationalBackupRequested`. Le déclenchement automatique historique demeure le seul chemin actif dans `MainWindow`, ce qui évite un double déclenchement pendant la transition.
+- **TESTÉ — lot 2A** : les trois mutations réussies émettent exactement une notification typée ; un refus de validation et les échecs de commit avec rollback des trois opérations n'en émettent aucune. Les 27 tests ciblés des services métier et transactions passent.
+- **TESTÉ — lot 2B** : délai démarré et réarmé, trois commits regroupés en une demande, nouvelle période après expiration, isolation entre coffres et sessions, arrêt sans demande résiduelle et absence de sauvegarde réelle. Les tests utilisent un délai injecté court ; la valeur de production reste 20 000 ms.
+- **TESTÉ — lot 2C avant 2I-1** : verrouillage avant échéance, absence de demande sans mutation, regroupement de plusieurs mutations, ordonnancements des deux côtés de l'échéance sans perte ni doublon, conservation du chemin et de la génération après changement de session. L'ancien parcours mixte `MainWindow` avait également vérifié que la session et ses secrets étaient invalidés avant que la demande différée soit observable ; la production est désormais explicitement `Historical` et une future intégration GUI générationnelle devra être revalidée lors du basculement.
+- **TESTÉ — lot 2D** : regroupement avant démarrage, mutation et expiration pendant une tentative active, accélération au verrouillage, sérialisation des offres, conservation des générations non couvertes, résultats publié/échoué/inconnu, absence de reprise en boucle après échec, nouvelle tentative après nouveau commit, et refus des démarrages ou résultats portant un jeton, un chemin, une génération ou une session obsolète.
+- **TESTÉ — lot 2E** : lancement d'un véritable `BackupJob`/`QProcess` avec capacité d'instantané et jeton exact, publication d'un fichier par l'auxiliaire de test, échec confirmé sans reprise, résultat absent et crash classés `Unknown`, mutation pendant un worker actif conservée comme génération suivante, refus d'une capacité absente pendant une réservation de remplacement, absence de rotation et absence d'appel du chemin automatique historique.
+- **TESTÉ — lot 2G-1** : identité inchangée admise, remplacement physique avant lancement refusé sans fichier publié, capacité acquise avant une substitution extérieure devenue inutilisable, ancienne génération soldée sans reprise contre le nouveau principal, et demande issue d'un verrouillage ordinaire encore admise après une nouvelle session du même fichier physique. Les trois régressions d'exclusivité de l'export manuel restent vertes.
+- **TESTÉ — lot 2G-2** : reprise après libération, contention persistante soldée une seule fois, conservation d'une génération plus récente, nouvelle réservation concurrente après réveil, annulation pendant l'attente, substitution physique pendant l'attente, rejet des jetons tardifs et absence de reprise après échec ou résultat inconnu. Les régressions d'export manuel exclusif et les contrôles de réservation de restauration directement concernés restent verts. Une fixture historique de précaution placée sous `/tmp` reste refusée par la politique de permissions des ancêtres et n'a pas été assouplie.
+- **TESTÉ — lot 2G-3** : absence de résultat sans mutation, fermeture avant échéance, après offre, pendant contention et pendant tentative réelle, conservation puis règlement distinct d'une génération plus récente, absence de reprise après `Failed` ou `Unknown`, nettoyage de session `MainWindow` et quatre régressions de fermeture de l'export manuel. Les résultats globaux de la campagne demandée sont consignés en section 12.
+- **TESTÉ — lot 2H-1** : les huit tests ciblés exécutés après correction locale de la portée du reçu dans `backup_worker_main.cpp` couvrent le reçu produit par le worker réel, sa liaison exacte à la destination, sa transmission avec le jeton et la génération, ainsi que le refus fail-closed d'un résultat publié sans reçu, avec reçu incomplet ou avec chemin incohérent.
+- **TESTÉ — lot 2H-2, validation ciblée** : 11/11 tests ciblés rapportés réussis dans le terminal utilisateur après implémentation. Ils vérifient notamment l'association atomique du reçu au résultat publié, la conservation d'un diagnostic `errno=28`, la distinction d'une annulation confirmée, la conservation de `DurabilityUnconfirmed` et les diagnostics de résultat absent ou de crash. Cela ne constitue pas une validation exhaustive des parcours de production.
+- **TESTÉ — lot 2I-1** : 41 tests ciblés réussis couvrent la sélection explicite de la fixture `Generational`, le refus croisé des entrées de l'autre moteur, l'absence de double lancement ou de repli et le maintien strict de `MainWindow` en mode historique.
+- **VALIDÉ** — les réservations et contrôles d'identité doivent être préservés dans la cible.
+- **À FAIRE — écart actuel** : activer le consommateur de production des demandes générationnelles, puis remplacer `backupRequired` et le suivi persistant des mutations sans créer une fenêtre où un CRUD, un worker ou une restauration deviennent concurrents.
+- **VALIDÉ — fermeture cible** : toute génération CRUD confirmée et encore en attente devient immédiatement éligible à la fermeture, sans délai de regroupement ni boîte de dialogue. Les secrets sont nettoyés sans attendre les sauvegardes ; la fenêtre attend de façon asynchrone la terminaison effective des workers et des générations postérieures, puis se ferme automatiquement sur un état terminal, y compris si le résultat doit rester signalé comme échec ou suspension. Les demandes de fermeture répétées n'effacent pas l'identité transitoire nécessaire aux `COMMIT` déjà engagés. Les lots 2I-4F-4A/4B implémentent et testent ce comportement uniquement dans la voie générationnelle injectable.
+- **À FAIRE — après 2I-4F-4B** : raccorder un consommateur unique de production et les préférences globales, puis sélectionner explicitement `Generational` sans maintenir simultanément le déclenchement historique. Conserver les contrôles d'admission, la protection du coffre principal et la distinction entre vidange progressive et `shutdown()` immédiat. `Failed` et `Unknown` exigent toujours une reprise explicite pendant la vie du processus.
+
+### 6.3 Instantané, worker et export manuel
+
+- **IMPLÉMENTÉ** — `VaultSnapshotService` utilise l'API de sauvegarde SQLite pour produire une copie cohérente sans clé de déchiffrement.
+- **IMPLÉMENTÉ** — la source et la destination sont ouvertes de manière conservatrice ; les chemins ambigus, liens et types interdits sont refusés.
+- **IMPLÉMENTÉ** — la copie est validée structurellement avant publication.
+- **IMPLÉMENTÉ** — la publication est sans écrasement, avec fichier temporaire privé, synchronisation du fichier et du répertoire, puis distinction entre publié, durabilité incertaine, annulé et échec.
+- **IMPLÉMENTÉ** — les échecs POSIX et SQLite pertinents conservent dans leur diagnostic les codes réellement observés ; le protocole transmet ce diagnostic sans contenu du coffre.
+- **IMPLÉMENTÉ — transport 2H-2** : le coordinateur générationnel conserve ce `BackupResult` jusqu'à la terminaison effective du worker au lieu de le réduire immédiatement à trois états. Son signal de résultat expose simultanément le diagnostic borné, le résultat détaillé et la preuve 2H-1, toujours sans contenu du coffre, clé ou mot de passe.
+- **IMPLÉMENTÉ** — `passwall_backup_worker` exécute la copie hors du thread GUI et ne contient aucun moteur de déchiffrement.
+- **IMPLÉMENTÉ** — `BackupJob` distingue résultat métier et terminaison effective ; la réservation n'est pas libérée tant que l'enfant peut encore agir.
+- **IMPLÉMENTÉ — protocole 2H-1** : lorsqu'un reçu est demandé, le protocole borné associe obligatoirement `BackupFileEvidence` au chemin canonique publié. Le worker construit cette preuve par inspection protégée de la destination après publication et la recoupe avec l'identité vérifiée avant publication ; un chemin seul, un fichier visible ou un code de sortie nul ne suffisent pas.
+- **IMPLÉMENTÉ — lot 2F** : l'entrée `BackupJob::start()` utilisée par l'export manuel acquiert une réservation exclusive et utilise le protocole worker historique `--protocol-v1`. Accès métier, restauration et autre instantané du même coffre restent refusés jusqu'à la terminaison effective du worker, y compris après un résultat `Unknown` ou la destruction de la façade Qt.
+- **IMPLÉMENTÉ** — seul le chemin explicite `BackupJob::startSnapshotReserved()` et le protocole worker `--snapshot-v1` utilisent l'accès d'instantané partagé : les accès métier restent possibles, tandis qu'une restauration exclusive et un second instantané restent refusés jusqu'à la terminaison effective.
+- **IMPLÉMENTÉ — compatibilité temporaire** : le chemin automatique actif de `AutomaticBackupCoordinator` et sa rotation utilisent encore l'ancien chemin exclusif `startReserved()`. La frontière générationnelle peut appeler le chemin partagé `startSnapshotReserved()`, mais elle n'est volontairement reliée à aucun signal de production ; le basculement attend le routage global, le nommage cible et la rotation sans catalogue.
+- **IMPLÉMENTÉ** — l'export manuel verrouille et nettoie le coffre avant de lancer le worker ; il n'impose aucune durée globale arbitraire.
+- **TESTÉ — lot 2F** : les trois régressions d'exclusivité de l'export manuel, les 25 cas `BackupJob`, les fondations 2B–2E et la campagne CTest complète séquentielle passent. La campagne compte 928 cas sans échec ; `RestoreParentExitProbe` reste l'unique auxiliaire volontairement ignoré.
+- **VALIDÉ** — ces moteurs sont réutilisables par la cible.
+
+Le contrôle actuel des chemins refuse notamment des ancêtres modifiables par un autre utilisateur ou groupe selon sa politique POSIX. PassWall ne doit pas corriger automatiquement les permissions d'un dossier choisi. L'ouverture future à NAS/NFS/CIFS/FUSE/FAT/exFAT ou l'assouplissement de cette politique nécessitent une décision et des contrôles adaptés.
+
+### 6.4 Coordinateur automatique et rotation actuelle
+
+- **IMPLÉMENTÉ** — `AutomaticBackupCoordinator` résout actuellement un chemin principal vers un `localId`, relit les préférences par coffre et lance une sauvegarde au verrouillage si `backupRequired` est actif.
+- **IMPLÉMENTÉ — lot 2I-1** : le coordinateur possède un sélecteur immuable `Historical`/`Generational`. `MainWindow` utilise le constructeur par défaut, exclusivement `Historical`. Le mode `Generational` demeure une frontière injectable par les tests : aucun consommateur de production de `generationalBackupRequested` n'est connecté.
+- **IMPLÉMENTÉ** — les noms automatiques utilisent actuellement l'heure locale et l'extension `.db`, avec un suffixe d'opération en cas de collision.
+- **IMPLÉMENTÉ** — `BackupRotationService` charge le catalogue, trie les versions par ordre persistant, vérifie leurs preuves puis marque et confirme chaque suppression.
+- **IMPLÉMENTÉ** — une suppression incertaine bloque la rotation sans rétracter la nouvelle sauvegarde publiée.
+- **À FAIRE — écart actuel** : le nommage, le routage, les préférences par coffre, les époques de destination et le catalogue doivent être remplacés.
+- **À FAIRE** — remplacer les reçus et états persistants de rotation par le traitement simple décrit en 5.4, tout en réutilisant les contrôles de chemin, les identités et la supervision sans conserver deux moteurs à long terme.
+
+### 6.5 Interface actuelle des préférences
+
+- **IMPLÉMENTÉ** — `VaultBackupSettingsDialog` et `VaultBackupSettingsController` permettent de choisir un principal enregistré, une activation, une destination et une rétention.
+- **IMPLÉMENTÉ** — l'enregistrement compare l'identité et les préférences affichées avant la mise à jour atomique du registre.
+- **IMPLÉMENTÉ** — la reprise après suspension est explicite et ne vaut pas réussite de sauvegarde.
+- **À FAIRE — écart actuel** : l'interface doit devenir une configuration globale initiale puis des paramètres globaux ; elle ne doit plus présenter les trois réglages par coffre.
+- **À FAIRE — écart actuel** : retirer avec le moteur historique la suspension persistante et sa reprise par `localId`, puis exposer dans la future interface la suspension générationnelle uniquement volatile et sa reprise explicite.
+- **À FAIRE** — conserver les diagnostics de destination sans modifier automatiquement les permissions du dossier utilisateur.
+
+## 7. Restauration et récupération
+
+### 7.1 Cible validée sans journal permanent
+
+- **VALIDÉ** — restaurer signifie remplacer intégralement le coffre principal par une sauvegarde authentifiée ; aucune fusion entrée par entrée.
+- **VALIDÉ** — PassWall ne doit conserver, dans l'architecture cible, aucun journal permanent d'intentions, de phases ou de reçus de restauration. Il n'existe aucune reprise automatique ou semi-automatique d'un échange interrompu.
+- **VALIDÉ** — le moteur de remplacement, ses réservations, l'authentification complète de la source et la protection des secrets sont préservés autant que possible.
+- **VALIDÉ** — une autorisation transitoire opaque n'est délivrée qu'après confirmation explicite, verrouillage et nettoyage réels du coffre ; elle reste limitée à l'opération autorisée.
+- **VALIDÉ** — le candidat complet est préparé sur le système de fichiers du principal, sous contrôles des chemins, types, propriétaires, liens symboliques, identités physiques et substitutions concurrentes.
+- **VALIDÉ** — l'intégrité et les identités sont revalidées avant publication ; les synchronisations nécessaires distinguent remplacement confirmé, durabilité incertaine et résultat inconnu.
+- **VALIDÉ** — la sauvegarde source et son emplacement ne sont pas modifiés par la restauration ; l'ancien principal est conservé par l'échange au lieu d'être écrasé directement.
+- **VALIDÉ** — le coffre reste verrouillé après un remplacement et exige une nouvelle authentification manuelle.
+- **VALIDÉ** — une interruption ne provoque jamais automatiquement un nouvel échange. Après redémarrage, PassWall examine et authentifie le fichier effectivement présent au chemin principal ; une nouvelle restauration exige une demande et une autorisation explicites.
+- **VALIDÉ** — un principal sain et authentifié peut être rouvert, sous réserve des protections historiques encore applicables pendant la transition décrite en 7.6.
+- **VALIDÉ** — la restauration manuelle doit rester possible lorsque le principal est corrompu, même si ses métadonnées SQLite ou son `vault_id` sont illisibles.
+- **VALIDÉ** — la disparition des préférences ordinaires ne bloque pas à elle seule l'ouverture d'un coffre sain et n'est pas utilisée comme preuve de l'issue d'une ancienne restauration.
+
+La suppression du journal PassWall ne supprime ni les transactions et journaux internes nécessaires à SQLite, ni les états transitoires gardés en mémoire pendant une opération supervisée. Elle renonce seulement à déduire ou reprendre automatiquement, après redémarrage, le déroulement passé d'un remplacement.
+
+### 7.2 Autorisation et moteur actuels
+
+- **IMPLÉMENTÉ** — `MainWindow` ne délivre une `VaultReplacementAuthorization` opaque qu'après verrouillage et nettoyage réels, revalidation de la génération, de l'identité, de l'autorisation et des protections Linux.
+- **IMPLÉMENTÉ** — l'autorisation est non copiable, limitée au coffre et à l'UUID d'opération, et possède une réservation exclusive.
+- **IMPLÉMENTÉ** — un UUID, chemin, booléen ou message JSON ne suffit pas à fabriquer l'autorisation.
+- **IMPLÉMENTÉ** — `VaultReplacementService` authentifie le maître et toutes les entrées de la source avant l'engagement.
+- **IMPLÉMENTÉ Linux** — le principal et le candidat sont échangés avec `renameat2(RENAME_EXCHANGE)` après préparation privée ; l'ancien principal est conservé dans un emplacement de récupération.
+- **IMPLÉMENTÉ — mécanisme historique à retirer** : les intentions et phases persistantes comprennent `prepared`, `armed`, `identity-confirmed`, `resolved`, `abandon-confirmed` et `abandoned`, avec reçus et preuves associées dans `vaultRegistry/data`.
+- **IMPLÉMENTÉ — mécanisme historique à retirer** : une porte permanente de récupération utilise notamment `localId`, le chemin, l'identité physique, des empreintes et les preuves persistantes pour autoriser ou refuser l'ouverture.
+- **IMPLÉMENTÉ** — `recoverReplacement()` ne répète jamais automatiquement l'échange ; `resumeFinalization()` reprend seulement une finalisation démontrée.
+- **IMPLÉMENTÉ** — aucun rollback destructeur ni nettoyage automatique de l'ancien principal.
+
+Ces mécanismes décrivent le code actuel, pas la cible. Leur retrait ne pourra intervenir qu'après la transition contrôlée de 7.6. L'autorisation opaque délivrée après nettoyage, l'engagement transitoire de l'opération, les contrôles avant publication et les résultats conservateurs restent nécessaires sans persistance permanente de leurs phases.
+
+### 7.3 Worker, secrets et supervision
+
+- **IMPLÉMENTÉ** — `passwall_restore_worker` est séparé du worker de sauvegarde.
+- **IMPLÉMENTÉ** — sa délégation à usage unique provient de l'autorisation 6A et exige les ressources héritées, l'identité du parent, l'opération et les réservations attendues.
+- **IMPLÉMENTÉ** — le maître passe par un canal Unix privé, entre buffers propriétaires, jamais par arguments, environnement, JSON, QSettings ou fichier temporaire.
+- **IMPLÉMENTÉ** — le worker valide la délégation avant de recevoir le secret ; tailles, version, ordre, messages partiels, doublons, EOF et déconnexions sont contrôlés.
+- **IMPLÉMENTÉ** — `RestoreJob` distingue demande d'annulation, acquittement, nettoyage sensible, résultat métier et terminaison effective.
+- **IMPLÉMENTÉ** — `Control1.Lock()` et le nettoyage attendu par logind n'acquittent positivement le nettoyage global qu'après confirmation de la phase sensible ou terminaison effective.
+Limite connue : le délai maximal de l'inhibiteur logind ne permet pas de garantir que tout worker ou appel noyau bloqué sera nettoyé avant une transition système.
+
+### 7.4 Prévalidation et interface
+
+- **IMPLÉMENTÉ** — la GUI prévalide sans mot de passe les sources absentes, inaccessibles, non ordinaires, manifestement non SQLite, structurellement incompatibles ou corrompues avant le verrouillage et la création de `prepared`.
+- **IMPLÉMENTÉ** — cette prévalidation n'est ni une authentification ni une autorisation ; la source est revalidée après préparation pour résister aux changements TOCTOU.
+- **IMPLÉMENTÉ** — le sélecteur propose les sauvegardes par extension mais permet une sélection libre ; l'extension n'est pas un critère de sécurité.
+- **IMPLÉMENTÉ** — annulation avant worker, mauvais maître et autres refus structurés certainement non engagés peuvent utiliser l'abandon contrôlé après terminaison, nettoyage et preuves confirmés.
+- **IMPLÉMENTÉ** — résultat `Unknown`, worker vivant, divergence, engagement possible ou persistance non confirmée imposent la récupération manuelle.
+- **IMPLÉMENTÉ** — aucune issue ne réouvre automatiquement le coffre.
+
+### 7.5 Récupération utilisateur
+
+| État prouvé | Comportement actuel |
+|---|---|
+| `prepared`, principal intact, aucune opération active | abandon contrôlé possible après confirmation |
+| `abandon-confirmed` | reprise idempotente de la résolution d'abandon |
+| `armed` avant échange | blocage conservé ; ni abandon ni second échange |
+| `armed` après échange démontré | reprise de finalisation uniquement |
+| `identity-confirmed` | finalisation idempotente sous réservations |
+| reçu `resolved` ou `abandoned` | revalidation de la persistance et de l'identité avant admission |
+| preuves insuffisantes ou divergentes | aucun déblocage automatique |
+
+- **IMPLÉMENTÉ** — la GUI de récupération ne contient aucun secret et ne duplique pas les contrôles des services.
+- **IMPLÉMENTÉ** — les opérations longues et synchronisations s'exécutent hors du thread GUI ; les retours sont liés à la génération, au coffre et à l'UUID.
+- **IMPLÉMENTÉ** — un reçu visible après échec de `fsync` ne suffit pas à autoriser l'ouverture ; l'admission reconfirme actuellement le fichier de registre et son répertoire.
+- **À FAIRE — transition historique** : conserver ces garanties pour les opérations déjà enregistrées, sans extraire les preuves vers un nouveau journal permanent.
+- **À FAIRE** — définir le nettoyage contrôlé des anciens principaux, candidats et artefacts ; leur suppression automatique reste interdite.
+- **À FAIRE** — traiter ou documenter durablement les états `armed` avant échange et les preuves irrémédiablement divergentes.
+
+### 7.6 Interruption, artefacts et transition historique
+
+L'architecture cible distingue trois catégories d'interruption :
+
+- une interruption du processus peut laisser le principal ancien ou nouveau au chemin principal et un ancien principal ou candidat à l'emplacement de travail ;
+- un arrêt système ordonné peut permettre certaines synchronisations, sans constituer une preuve universelle de durabilité ;
+- une panne électrique ou matérielle peut rendre le résultat indémontrable malgré l'atomicité de l'échange et les appels à `fsync`.
+
+- **TESTÉ — lot 0A** : sept interruptions réelles du processus enfant, injectées de l'authentification de la source jusqu'à la synchronisation suivant l'échange, caractérisent l'implémentation historique. Avant l'échange, le principal reste identique ; après l'échange, le nouveau principal et l'ancien principal restent observables ; la source sélectionnée reste octet pour octet inchangée à chaque point. Ces tests ne simulent pas une panne électrique.
+
+- **VALIDÉ** — après redémarrage, PassWall vérifie l'état actuel des fichiers et authentifie le coffre au chemin principal ; il ne prétend pas nécessairement déterminer si l'échange précédent a eu lieu.
+- **VALIDÉ** — les fichiers de récupération inconnus, anciens principaux et candidats ne sont jamais supprimés automatiquement.
+- **VALIDÉ** — l'emplacement des artefacts connus doit pouvoir être communiqué à l'utilisateur ; un futur nettoyage reste volontaire et contrôlé.
+- **VALIDÉ** — l'échange atomique conserve l'ancien principal à l'emplacement du candidat. Aucune seconde copie de précaution systématique n'est prévue dans la cible.
+- **VALIDÉ** — l'atomicité de `RENAME_EXCHANGE` ne constitue pas une garantie absolue de durabilité après coupure électrique.
+- **À DÉFINIR** — convention d'emplacement et de nommage des artefacts, diagnostic utilisateur et critères précis d'un nettoyage volontaire.
+
+La transition depuis l'implémentation actuelle suit les règles suivantes :
+
+1. **À FAIRE** — arrêter la création de nouvelles intentions persistantes une fois le remplacement transitoire prêt et caractérisé ;
+2. **À FAIRE** — conserver temporairement la lecture des preuves historiques présentes dans `vaultRegistry/data` ;
+3. **À FAIRE** — maintenir leur porte d'admission et résoudre les opérations historiques inachevées avec les mécanismes actuels ;
+4. **À FAIRE** — ne supprimer automatiquement ni preuve incertaine ni artefact associé ;
+5. **À FAIRE** — retirer les structures, la GUI et les services historiques seulement après validation des conditions de transition et des tests correspondants ;
+6. **À DÉFINIR** — comportement face à une ancienne version de PassWall encore capable de recréer des intentions dans le registre historique.
+
+Aucun nouveau journal permanent ne doit être introduit pour réaliser cette transition. La délégation au worker reste liée à une autorisation transitoire opaque et à des ressources vivantes ; un UUID, un chemin ou un message sérialisé ne constitue jamais à lui seul une autorisation de remplacement.
+
+### 7.7 Principal corrompu
+
+- **VALIDÉ** — l'utilisateur sélectionne et confirme explicitement la destination lorsque le principal ne peut plus fournir de métadonnées fiables.
+- **VALIDÉ** — la sauvegarde source est intégralement authentifiée, y compris ses entrées chiffrées, avant tout remplacement.
+- **VALIDÉ** — chemin, propriétaire, type de fichier, identité physique et opérations concurrentes font l'objet de contrôles stricts ; les liens symboliques et substitutions restent refusés.
+- **VALIDÉ** — le candidat complet est préparé sur le système de fichiers du principal, puis l'ancien fichier est conservé par l'échange.
+- **À DÉFINIR** — politique exacte de confirmation renforcée et preuve suffisante que la destination choisie est bien celle voulue lorsque son contenu est inexploitable.
+
+## 8. Interface, verrouillage et préférences locales
+
+### 8.1 Cycle de vie de la session
+
+- **IMPLÉMENTÉ** — `MainWindow::lockVault()` invalide les sessions Native Messaging avant de détruire la clé.
+- **IMPLÉMENTÉ** — les éditeurs ouverts sont nettoyés immédiatement et leurs générations sont révoquées ; un ancien éditeur ne peut pas republier dans une nouvelle session.
+- **IMPLÉMENTÉ** — les nettoyeurs RAII restent une protection supplémentaire sans être l'unique mécanisme.
+- **IMPLÉMENTÉ** — le chemin critique n'affiche pas de notification modale bloquante.
+- **IMPLÉMENTÉ** — le timer est armé dès qu'une session avec clé devient utilisable, avant les rafraîchissements susceptibles d'ouvrir une boucle Qt imbriquée.
+- **IMPLÉMENTÉ — lot 2I-4F-4B, uniquement en test générationnel** : `closeEvent()` amorce une vidange asynchrone et un verrouillage sensible immédiat lors de la première fermeture. Les fermetures répétées ne relancent pas le nettoyage et la fenêtre se ferme automatiquement à l'état terminal ; le parcours de production `Historical` reste inchangé.
+
+### 8.2 Verrouillage automatique obligatoire
+
+- **IMPLÉMENTÉ** — seules les valeurs 1, 5, 15, 30 et 60 minutes sont autorisées ; la valeur par défaut est une minute.
+- **IMPLÉMENTÉ** — aucune désactivation n'est disponible.
+- **IMPLÉMENTÉ** — anciennes valeurs 0, 10 ou invalides migrées vers une minute avec notification non modale.
+- **IMPLÉMENTÉ** — si la persistance échoue, une minute reste appliquée en mémoire et la désactivation ne réapparaît pas.
+- **TESTÉ** — 64 cas ciblés couvrent valeurs, défaut, migration, échec de persistance, expiration réelle, éditeurs, Native Messaging, logind et opérations asynchrones.
+- **À FAIRE** — essais manuels Wayland des cinq choix et maintien des régressions lors des évolutions GUI.
+
+Le timer mesure l'activité dans PassWall, pas l'inactivité globale du bureau. Aucun délai temps réel n'est garanti si le thread GUI ou le système est bloqué.
+
+### 8.3 Dernier coffre ouvert
+
+- **IMPLÉMENTÉ dans l'état local actuel** — `vault/lastPath` n'est publié qu'après création ou ouverture authentifiée et enregistrement confirmé, jamais à la simple sélection du fichier.
+- **IMPLÉMENTÉ dans l'état local actuel** — au démarrage, seuls les chemins absolus vers un fichier ordinaire lisible et non ambigu préremplissent le champ, sans ouvrir SQLite ni authentifier le coffre.
+- **IMPLÉMENTÉ dans l'état local actuel** — une valeur absente, vide, relative, supprimée, inaccessible ou symbolique laisse le champ vide sans effacer la préférence ; un support temporairement absent peut revenir.
+- **TESTÉ dans l'état local actuel** — 15 cas ciblés couvrent préférence, sélection, authentification, conservation du registre, session et timer.
+
+`lastPath` est une commodité locale, jamais une preuve d'identité, une autorisation ou un substitut aux protections historiques de récupération encore actives.
+
+## 9. Firefox et Native Messaging
+
+### 9.1 Architecture
+
+Le chemin de production est :
+
+```text
+Firefox
+  → Extension PassWall
+  → passwall_native_host
+  → NativeBridgeServer
+  → MainWindow::handleNativeRequest()
+  → NativeRequestProcessor
+  → NativeVaultAccess (implémenté par MainWindow)
+  → Coffre PassWall
+```
+
+- **IMPLÉMENTÉ** — `NativeRequestProcessor` est l'unique implémentation métier Native Messaging.
+- **IMPLÉMENTÉ** — les identifiants d'entrée sont des chaînes hexadécimales canoniques de 32 caractères.
+- **IMPLÉMENTÉ** — la taille commune maximale des messages est de 1 Mio hors préfixe.
+- **IMPLÉMENTÉ** — l'origine est vérifiée avant le chargement ciblé du secret puis de nouveau côté extension avant remplissage.
+- **IMPLÉMENTÉ** — les générations de session invalident les réponses en attente après verrouillage ou changement de session.
+- **IMPLÉMENTÉ** — `NativeRequestResponse` possède son buffer et n'est pas copiable.
+- **IMPLÉMENTÉ** — aucun cache durable de tous les credentials complets n'est nécessaire au traitement natif.
+
+### 9.2 Validation et travaux restants
+
+- **TESTÉ automatiquement** — `EntryIdParserTest` 9/9, `NativeRequestProcessorTest` 27/27, `NativeRequestResponseTest` 1/1, `SiteMatcherTest` 12/12, `NativeBridgeServerTest` 21/21 avec sockets Unix réels, `passwall_native_host_tests` 6/6.
+- **TESTÉ manuellement le 6 novembre 2026** — chargement temporaire Firefox, démarrage automatique, communication, détection du coffre verrouillé, recherche, remplissage, isolation des domaines, refus après verrouillage et redémarrage verrouillé, avec données fictives.
+- **À FAIRE** — tests Firefox automatisés de bout en bout, invalidation déterministe pendant la transmission réelle, packaging et installation reproductible du Host et de l'extension.
+- **À DÉFINIR** — identifiant et canal de diffusion définitifs de l'extension.
+
+Les tests JavaScript et du bridge ne prouvent pas à eux seuls le parcours complet dans Firefox. Les buffers Qt, système et JavaScript peuvent conserver des copies hors du contrôle direct de PassWall.
+
+## 10. Protection Linux
+
+### 10.1 Instance unique et service de contrôle
+
+- **IMPLÉMENTÉ** — une seule instance applicative Linux est admise.
+- **IMPLÉMENTÉ** — `org.passwall.PassWall.Control1.Lock()` acquitte le verrouillage après nettoyage local attendu.
+- **IMPLÉMENTÉ** — l'ancienne interface `SessionGuard1` est supprimée ; aucune garde globale persistante ou authentification maître globale n'existe.
+
+### 10.2 logind
+
+- **IMPLÉMENTÉ** — `LinuxSessionMonitor`, indépendant des widgets, surveille `PrepareForSleep` et `PrepareForShutdown` avec Qt DBus.
+- **IMPLÉMENTÉ** — un inhibiteur `delay` pour sleep/shutdown est conservé tant que la protection est requise.
+- **IMPLÉMENTÉ** — le descripteur est contrôlé par `poll()` ; une simple valeur numérique ou `fcntl(F_GETFD)` n'est pas considérée comme une preuve de pair vivant.
+- **IMPLÉMENTÉ** — résolution asynchrone du propriétaire unique de logind, réabonnement par génération et politique fail-closed lors des incohérences.
+Limite connue : thread principal bloqué, logind indisponible, crash, arrêt forcé ou délai d'inhibiteur expiré peuvent empêcher un nettoyage avant la transition physique.
+
+### 10.3 Verrouillage de session Wayland
+
+- **IMPLÉMENTÉ** — `passwall-session-lock` tente `Control1.Lock()` pendant un budget D-Bus de 1 500 ms, puis lance `/usr/bin/swaylock -p` même si PassWall est absent ou ne répond pas.
+- **IMPLÉMENTÉ** — une réservation `flock` empêche plusieurs verrouilleurs concurrents pour la même invocation.
+- **IMPLÉMENTÉ** — aucun shell ni argument non fiable n'est utilisé.
+- **TESTÉ automatiquement** — 21 cas du coordinateur et 10 cas du service de verrouillage sur bus privés et faux verrouilleur.
+- **TESTÉ manuellement le 7 novembre 2026** — `Ctrl+Alt+L`, verrouillage préalable du coffre, verrouillage/déverrouillage Linux, coffre restant fermé, refus Firefox puis nouvelle authentification, avec maintien de `Ctrl+Super+L`.
+Limite connue : lancer directement swaylock contourne le coordinateur ; l'absence d'acquittement de PassWall ne prouve pas le nettoyage du coffre.
+
+Limite connue : `LockedHint`, le code de sortie de swaylock et son simple affichage ne prouvent ni un déverrouillage normal, ni l'effacement de toutes les allocations historiques.
+- **À FAIRE** — installation reproductible et essais contrôlés des véritables transitions suspension, hibernation et arrêt ; vérifier les autres déclencheurs de session et l'ergonomie `pishutdown`.
+
+## 11. Garanties et limites de sécurité
+
+### 11.1 Garanties à préserver
+
+- authentification cryptographique avant accès aux secrets ;
+- aucune clé ou mot de passe dans les journaux, arguments, environnement ou fichiers temporaires ;
+- validation métier commune et transactions atomiques ;
+- invalidation Native Messaging avant destruction de la clé ;
+- nettoyage immédiat des champs contrôlés et RAII en protection supplémentaire ;
+- aucune session ancienne restaurée après verrouillage, récupération ou remplacement ;
+- réservations maintenues jusqu'à la terminaison effective des workers ;
+- distinction entre réussite, échec avant publication, publication à durabilité incertaine, annulation confirmée et résultat inconnu ;
+- aucune suppression ou nouvelle substitution en cas de preuve insuffisante ;
+- aucun nouvel échange automatique après une restauration interrompue ;
+- authentification complète de la source, préparation d'un candidat complet, revalidation des identités et remplacement atomique sous réservation ;
+- conservation de la sauvegarde source et de l'ancien principal après échange ;
+- après redémarrage, ouverture seulement du fichier actuellement présent au chemin principal s'il est sain et authentifié, sans restauration automatique d'une ancienne session ;
+- aucune modification automatique des permissions d'un dossier utilisateur choisi ;
+- aucune ouverture rendue impossible par la seule perte des futures préférences ordinaires.
+
+### 11.2 Limites inhérentes
+
+- un processus malveillant déjà exécuté sous le même compte utilisateur dépasse le modèle de protection locale des permissions et descripteurs ;
+- Qt, la bibliothèque C++, SQLite et le noyau peuvent conserver des copies historiques de secrets ;
+- une E/S ou un appel noyau peut rester bloqué malgré une annulation ;
+- une demande d'annulation envoyée ne prouve ni sa réception ni la terminaison du worker ;
+- `fsync` et les résultats système ne garantissent pas la conservation physique après retrait ou panne du support ;
+- `renameat2(RENAME_EXCHANGE)` garantit l'atomicité attendue de l'échange sur les systèmes pris en charge, pas sa durabilité physique absolue après une coupure ;
+- sans journal permanent, PassWall ne peut pas toujours déterminer après redémarrage si un échange antérieur a eu lieu ; il authentifie l'état présent et exige une nouvelle demande explicite pour restaurer ;
+- les réservations sont coopératives et ne contraignent pas un processus tiers qui les ignore ;
+- les systèmes réseau, amovibles ou synchronisés n'ont pas les mêmes propriétés que les systèmes de fichiers locaux testés ;
+- une copie cohérente n'empêche pas deux copies de la même famille de diverger ensuite ;
+- les tests injectés ne simulent pas intégralement une panne électrique ou matérielle.
+
+## 12. Validation connue
+
+Les nombres ci-dessous correspondent à des campagnes distinctes et ne doivent pas être additionnés.
+
+| Jalon | Résultat rapporté | Portée principale |
+|---|---:|---|
+| Campagne complète historique | 225/225 | État antérieur du projet |
+| Restauration 6B | 449 cas ciblés | échange réel sur coffres fictifs, finalisation, reprise |
+| Worker et supervision 7 | 737 cas ciblés | délégation, canal secret, processus, réservations |
+| GUI de restauration 8A | 713 cas ciblés | parcours widgets/6A/worker/6B |
+| Préférences GUI 8B | 772 cas ciblés | registre, coordinateur, worker, reprise |
+| Verrouillage obligatoire 8C-2 | 64/64 | valeurs, migration, expirations et régressions |
+| Prévalidation/restauration 1.29 | 157 cas ciblés | sources invalides, TOCTOU, abandon contrôlé |
+| `vault/lastPath` local | 15/15 | préremplissage et publication après authentification |
+| Caractérisation lot 0A | 320/320 ciblés | transactions/interruption SQLite, publication, réservations, worker, remplacement et preuves historiques |
+| Réservations partagées d'instantané | 135/135 ciblés | garde typée, copie SQLite concurrente, worker, supervision, coordinateur historique exclusif et remplacement |
+| Correction export manuel 2F | 928 sans échec, 1 auxiliaire ignoré | export exclusif, chemin d'instantané partagé explicite, annulation, résultat inconnu et terminaison effective |
+| Identité générationnelle 2G-1 | 12 cas ciblés verts ; campagne CTest 930 réussis, 1 échec GUI non reproductible isolément, 1 auxiliaire ignoré | liaison périphérique/inode, substitution, verrouillage ordinaire, réservation de remplacement et export exclusif |
+| Reprise de contention 2G-2 | 28 cas ciblés distincts réussis ; 1 fixture historique sous `/tmp` refusée par la politique de permissions | réveil local, borne de pré-lancement, générations, concurrence, identité, résultats tardifs, export exclusif et réservations de restauration |
+| Fermeture normale 2G-3 | 8 nouveaux cas ciblés réussis ; 4 régressions d'export réussies ; CTest : 944 réussis, 1 échec GUI intermittent réussi en relance isolée, 1 auxiliaire ignoré | capture avant arrêt, règlement explicite, worker réel, contention, générations récentes, nettoyage de session, export et restauration |
+| Preuve de publication 2H-1 | 8 tests ciblés réussis | reçu worker, destination exacte, jeton/génération et refus fail-closed des preuves absentes ou incohérentes |
+| Diagnostics générationnels 2H-2 | 11/11 tests ciblés rapportés réussis après implémentation | résultat détaillé, `errno`, annulation, durabilité incertaine, résultat absent/crash et reçu atomique |
+| Sélecteur exclusif 2I-1 | 41 tests ciblés réussis | mode immuable, production historique, injection générationnelle et neutralisation croisée sans double déclenchement |
+| Admission CRUD 2I-2 | 40 tests ciblés réussis | production historique inchangée, admission générationnelle sans suivi persistant et barrières de récupération conservées |
+| Préférences globales 2I-3A | 10 tests ciblés réussis après correction du verrou QSettings | états explicites, schéma global, persistance, erreurs et indépendance de `PassWall.conf` |
+| Familles et destinations 2I-3B | 11 tests ciblés réussis | familles `vault_id`, nommage UTC, permissions privées, identités, collisions et substitutions |
+| Première sauvegarde 2I-3B/2I-3C | 21 tests ciblés rapportés réussis | destination, réservation unique, peuplement, version admissible, nouvelle racine, familles partagées, configuration, sessions et substitutions |
+| Admission préparée 2I-4B | 33/33 tests ciblés réussis (29 préparation/destination, 2 coordinateur, 2 BackupJob) | usage unique, admission propriétaire, revalidation complète, transfert au worker, annulation et libération RAII |
+| Arbitrage initial/CRUD 2I-4C | tests ciblés rapportés réussis | type `InitialCopy`, admission propriétaire, courses de commit, fusion, invalidation de jeton et libération RAII |
+| Coordination utilisateur 2I-4D | validations ciblées rapportées réussies | états transitoires, préadmission export/restauration, course avec l'exclusivité, worker inconnu encore vivant, annulation et session obsolète |
+| Inspection asynchrone 2I-4E-1 | 129 tests ciblés du coordinateur rapportés réussis | thread de travail, cycle de session, annulation non bloquante, réponse tardive, configuration, doublons et arbitrage CRUD |
+| Consommation générationnelle 2I-4E-2 | 137/137 tests ciblés du coordinateur rapportés réussis | publication réelle initiale/CRUD, jeton et session, sérialisation, échecs, preuve de publication et worker inconnu |
+| Suspension générationnelle 2I-4F-1 | 138/138 tests ciblés du coordinateur rapportés réussis | suspension volatile `Failed`/`Unknown`, commits non couverts, reprise unique, worker vivant, résultat obsolète, isolation et absence de persistance |
+| Arbitrage manuel 2I-4F-2 | 146/146 sauvegarde automatique, 165/165 remplacement, 5/5 GUI ciblés rapportés réussis | admission RAII, priorité automatique, transfert vers l'exclusivité, inspection réservée, annulation, substitution, sessions et isolation |
+| Invalidation des préférences 2I-4F-3 | 11/11 préférences, 29/29 destinations, 150/150 coordinateur, 5/5 GUI ciblés rapportés réussis | provenance INI, annulation non bloquante, jetons invalidés, CRUD conservés, revalidation finale et worker actif préservé |
+| Vidange du coordinateur 2I-4F-4A | 8/8 tests ciblés réussis ; inclus dans les 158/158 du coordinateur après 4B | générations immédiates, worker actif et génération postérieure, absence de doublon, suspension, admission manuelle et inspection annulée |
+| Fermeture GUI générationnelle 2I-4F-4B | 4/4 tests GUI de fermeture, 5/5 GUI export/restauration, 158/158 coordinateur rapportés réussis | premier verrouillage et secrets nettoyés, fermetures répétées, `COMMIT` tardif, clôture automatique et compatibilité production `Historical` |
+| GitHub ARM64 1.26 | 887 réussis, 1 ignoré | ensemble CTest enregistré |
+| JavaScript extension | 5/5 localement | tests unitaires Node.js, pas Firefox réel |
+
+Principes d'interprétation :
+
+- **TESTÉ** ne signifie pas certifié ni validé sous panne électrique.
+- Les sélections ciblées se recouvrent ; leurs totaux ne mesurent pas le nombre global de tests uniques du dépôt.
+- Les bus D-Bus privés, faux logind, faux verrouilleurs et Qt offscreen ne remplacent pas une transition système réelle.
+- Les essais Firefox et Wayland sont des observations manuelles avec données fictives, séparées des tests automatisés.
+- Les anciens échecs `EPERM` de sockets ou identités artificielles dans un sandbox ne sont pas des défauts applicatifs lorsqu'ils disparaissent dans l'environnement POSIX autorisé sans relâcher les protections.
+
+### 12.1 Principales suites existantes
+
+- cryptographie, environnement, stockage et ressources SQLite ;
+- `CredentialService`, nettoyage maître et mémoire CRUD ;
+- parsing d'identifiants, traitement natif, bridge et démarrage du Host ;
+- SiteMatcher et générateur de mots de passe ;
+- instance unique, logind, service et coordinateur de session ;
+- préférences, suivi des mutations et réservations ;
+- instantané, worker, sauvegarde automatique et rotation ;
+- autorisation, moteur de remplacement, worker de restauration et supervision ;
+- GUI d'export, préférences, restauration, récupération, éditeurs et timer ;
+- JavaScript de remplissage et sécurité de navigation.
+
+## 13. Plan de refonte des sauvegardes
+
+L'ordre ci-dessous peut être ajusté si l'analyse des dépendances l'impose, sans retirer une garantie au seul motif qu'elle appartient au code historique.
+
+### Lot 0 — spécification, décisions et caractérisation
+
+- **VALIDÉ — lot 0B** — le suivi des modifications métier est limité à la mémoire de la session et commence seulement après `COMMIT` ; l'interruption avant publication confirmée peut donc laisser une sauvegarde non rattrapée automatiquement ;
+- **VALIDÉ — lot 0B** — le dossier familial, le nom UTC, les collisions, la première copie et les bornes de rétention sont spécifiés par les sections 5.2 à 5.4 ;
+- **VALIDÉ — lots 0C/2I-4F-1** — seuls les coffres ouverts sont pris en charge, chaque tentative produit un résultat et une notification sans suspension persistante ; `Failed` et `Unknown` suspendent seulement en mémoire jusqu'à reprise explicite, et la rotation suit une publication suffisamment confirmée sans catalogue ni reçu persistant ;
+- **TESTÉ — lot 0A** — 320 cas ciblés caractérisent les transactions, interruptions injectées, publications, réservations, workers, remplacement et preuves historiques de l'implémentation actuelle ;
+- **À FAIRE** — trancher les points restant ouverts de la section 14 ;
+- **Critère de sortie** — règles explicites pour les artefacts, la destination corrompue, l'admission à la rotation, les préférences, les échecs de sauvegarde et la compatibilité historique.
+
+### Lot 1 — découplage des préférences et transition historique
+
+- **À FAIRE** — séparer les préférences ordinaires des contrôles de sécurité encore utilisés par les opérations historiques ;
+- **À FAIRE** — préparer l'arrêt des nouvelles intentions persistantes sans supprimer ni déplacer aveuglément les preuves existantes ;
+- **À FAIRE** — caractériser la coexistence temporaire avec les versions anciennes de PassWall ;
+- **Critère de sortie** — perdre les préférences ordinaires ne bloque pas un coffre sain, tandis qu'une opération historique inachevée conserve ses protections actuelles.
+
+### Lot 2 — préférences globales et familles `vault_id`
+
+- **IMPLÉMENTÉ et TESTÉ — fondation 2I-3A** : un fichier INI utilisateur distinct stocke la racine, la rétention minimale de sept et un état explicite d'absence, validité, invalidité ou erreur, sans modifier le registre historique. Les dix tests ciblés rapportés sont réussis ;
+- **IMPLÉMENTÉ et TESTÉ — fondation 2I-3B** : le préparateur inactif route une identité de coffre vérifiée vers sa famille `vault_id`, crée le sous-dossier privé, choisit un nom UTC sans réserver ni publier de fichier et conserve la capacité d'instantané ainsi que les identités nécessaires à une revalidation. Les onze tests ciblés rapportés sont réussis ;
+- **À FAIRE** — raccorder la configuration initiale et le futur consommateur générationnel à cette fondation, sans présenter l'état `Valid` comme une autorisation suffisante d'écrire dans la destination ;
+- **À FAIRE** — retirer la liste permanente des coffres comme condition de la gestion automatique ; un coffre est pris en charge lorsqu'il est effectivement ouvert ;
+- **À FAIRE** — remplacer la GUI par une configuration initiale puis des paramètres globaux ;
+- **Critère de sortie** — deux copies de même famille alimentent le même dossier sans que `vault_id` devienne une autorisation.
+
+### Lot 3 — sauvegarde automatique et rotation sans catalogue
+
+- **IMPLÉMENTÉ — fondation** : le garde, le moteur d'instantané et le worker possèdent un accès partagé typé, transmissible et sérialisé par coffre ; le coordinateur automatique historique reste provisoirement exclusif.
+- **IMPLÉMENTÉ — fondation 2A** : les ajouts, modifications et suppressions confirmés exposent un événement en mémoire après `COMMIT` ;
+- **IMPLÉMENTÉ — fondation 2B** : le coordinateur regroupe ces événements par session avec un délai mono-coup de vingt secondes et des générations en mémoire, puis émet une demande interne sans lancer de copie ;
+- **IMPLÉMENTÉ — fondation 2C** : le verrouillage ordinaire transforme une génération encore planifiée en demande différée unique après l'invalidation synchrone de la session ; le nettoyage des secrets n'attend aucun consommateur ni aucune copie ;
+- **IMPLÉMENTÉ — fondation 2D** : offres, tentative active et générations différées sont sérialisées en mémoire par des jetons à usage unique ; seul un résultat correspondant à la tentative active peut la terminer, sans acquitter les générations postérieures ;
+- **IMPLÉMENTÉ — fondation 2E** : la frontière peut lancer `BackupJob::startSnapshotReserved()` avec une capacité partagée contrôlée, marque la tentative avant le lancement, lie le résultat au jeton et attend la terminaison effective avant de publier `Published`, `Failed` ou `Unknown`. Elle n'exécute aucune rotation et n'est pas encore consommée en production ;
+- **IMPLÉMENTÉ — fondation 2G-1** : une demande transporte l'identité physique en mémoire de sa session d'origine et la frontière refuse définitivement toute génération dont une capacité d'instantané valide révèle que le fichier au chemin attendu a été remplacé ; un verrouillage ordinaire du même fichier conserve la demande ;
+- **IMPLÉMENTÉ — fondation 2G-2** : une contention de pré-lancement attend en mémoire un indice local de libération et réémet un jeton neuf sous une échéance unique de trois secondes ; la disponibilité et l'identité sont toujours réacquises, tandis qu'une contention persistante, une annulation, un refus définitif ou un résultat incertain se terminent explicitement sans boucle automatique ;
+- **IMPLÉMENTÉ — fondation 2G-3** : la fermeture normale capture la génération planifiée avant d'arrêter le coordinateur, nettoie la session sans attendre une copie, solde explicitement les demandes non lancées et conserve la supervision/réservation d'un worker réel jusqu'à sa terminaison ou son transfert au superviseur indépendant ; elle ne lance aucun nouveau worker tant que le consommateur de production reste désactivé ;
+- **IMPLÉMENTÉ — fondations 2H-1/2H-2** : une publication générationnelle exige un reçu transitoire lié à la destination et au jeton actifs ; le même résultat transitoire conserve ce reçu, le `BackupOutcome` détaillé et le diagnostic effectivement disponible sans créer de catalogue ni d'historique persistant ;
+- **IMPLÉMENTÉ — fondation 2I-1** : les deux sources de déclenchement sont mutuellement exclusives dès la construction ; les événements et rappels du moteur inactif ne peuvent pas lancer une sauvegarde, et aucun échec ne provoque de repli vers l'autre moteur ;
+- **IMPLÉMENTÉ et TESTÉ — fondation 2I-2** : l'admission des CRUD est maintenant sélectionnée par la même politique immuable. Le mode historique conserve son intention persistante avant SQL ; le mode générationnel conserve les barrières de récupération et d'identité sans écrire le suivi historique des sauvegardes. Les 40 tests ciblés rapportés sont réussis ;
+- **IMPLÉMENTÉ — préparation 2I-3B** : la destination peut être sélectionnée et liée au coffre, à sa famille et à sa génération sous capacité d'instantané, mais aucun consommateur de production ne l'appelle encore ;
+- **IMPLÉMENTÉ — préparation 2I-3C inactive** : un service sans état persistant détecte, sous identité physique et contrôles structurels, un coffre authentifié et peuplé sans version admissible dans la racine courante. Il produit une demande de première copie distincte ou la fusionne avec une génération CRUD déjà en attente, sans créer de fichier ni lancer de worker ;
+- **TESTÉ — préparation 2I-3B/2I-3C** : les 21 tests ciblés rapportés réussissent, ainsi que les deux régressions de prévalidation de restauration directement concernées ;
+- **IMPLÉMENTÉ et TESTÉ — admission 2I-4B inactive** : une frontière propriétaire à usage unique revalide la préparation et transfère sans réacquisition la capacité au pilote existant ; les 33 tests ciblés rapportés réussissent (29 préparateur/destination, 2 coordinateur, 2 `BackupJob`), sans activation en production ;
+- **IMPLÉMENTÉ et TESTÉ — arbitrage 2I-4C inactif** : `InitialCopy` et `CrudGeneration` partagent la file, la sérialisation et les jetons du coordinateur sans confondre génération de session et génération métier. Une mutation arrivée avant démarrage remplace la première copie préparée et conserve son propre délai ; les tests ciblés sont rapportés réussis ;
+- **IMPLÉMENTÉ et TESTÉ — coordination 2I-4D inactive** : l'activité préparatoire, la capacité détenue, les offres, la contention et les workers vivants sont distingués en mémoire. L'export et la restauration disposent d'un refus anticipé diagnostiqué, sans annulation implicite et sans remplacer leurs réservations exclusives finales. Les validations ciblées sont rapportées réussies ;
+- **IMPLÉMENTÉ et TESTÉ — inspection 2I-4E-1 inactive** : l'inspection 2I-3C est exécutable hors du thread GUI, liée au véritable cycle de session et remise à l'arbitrage propriétaire sans attendre lors du verrouillage. Les 129 tests ciblés du coordinateur rapportés par l'utilisateur réussissent ;
+- **IMPLÉMENTÉ et TESTÉ — consommation 2I-4E-2 inactive** : les demandes préparées initiales et CRUD utilisent un superviseur et un worker communs avec admission finale, transfert unique de capacité et résultat complet après terminaison. Les 137/137 tests ciblés du coordinateur rapportés par l'utilisateur réussissent ;
+- **IMPLÉMENTÉ et TESTÉ — suspension 2I-4F-1 inactive** : `Failed` et `Unknown` créent une suspension exclusivement en mémoire, tout commit ultérieur reste non couvert sans nouvelle tentative, et seule une reprise explicite revalidée peut offrir une tentative unique. Un worker encore vivant interdit cette reprise et les sauvegardes incertaines sont conservées ; les 138/138 tests ciblés rapportés réussissent ;
+- **IMPLÉMENTÉ et TESTÉ — arbitrage 2I-4F-2 inactif** : une capacité RAII propriétaire ferme la course entre précontrôle et réservation exclusive des exports/restaurations. Une demande automatique antérieure gagne ; une opération manuelle admise en premier termine son transfert sans être préemptée ; la garde physique reste l'autorité finale et aucun état persistant n'est ajouté. Les validations rapportées sont 146/146, 165/165 et 5/5 selon les suites ciblées ;
+- **IMPLÉMENTÉ et TESTÉ — invalidation 2I-4F-3 inactive** : provenance et contenu des préférences lient chaque préparation ; les changements annulent les travaux non lancés, conservent les générations CRUD et sont revalidés au dernier point de consommation. Aucun worker actif n'est interrompu et aucun état persistant n'est ajouté. Les validations ciblées rapportées réussissent (11/11, 29/29, 150/150 et 5/5 selon les suites) ;
+- **IMPLÉMENTÉ et TESTÉ — vidange 2I-4F-4A inactive** : la fermeture rend immédiatement éligibles les générations confirmées, conserve un worker actif et traite séparément les générations postérieures sans retry ; les huit tests ciblés de vidange réussissent ;
+- **IMPLÉMENTÉ et TESTÉ — GUI 2I-4F-4B inactive en production** : la première fermeture verrouille et nettoie immédiatement, les fermetures répétées n'effacent pas la session non secrète nécessaire aux derniers `COMMIT`, et la fermeture finale est automatique après vidange terminale, sans dialogue utilisateur. Une fabrique sous `PASSWALL_GUI_TESTING` rend ce parcours testable sans sélectionner `Generational` en production. Les validations rapportées réussissent : 4/4 GUI de fermeture, 5/5 régressions export/restauration et 158/158 coordinateur ;
+- **À FAIRE** — raccorder le consommateur unique de production et les préférences globales, construire explicitement le coordinateur de production en mode `Generational`, puis retirer le suivi historique persistant après validation de la transition, sans réintroduire de dialogue de fermeture « attendre ou quitter » ;
+- **À FAIRE** — appliquer une rétention globale de sept par défaut, configurable à partir de sept sans plafond arbitraire de produit ;
+- **À FAIRE** — après publication suffisamment confirmée, découvrir, filtrer et trier les versions admissibles puis supprimer les plus anciennes jusqu'à la rétention, sans catalogue, reçu ou reprise persistante ;
+- **À FAIRE** — raccorder le résultat générationnel détaillé au futur consommateur et à sa notification, puis distinguer la publication confirmée de la rotation sans perdre les diagnostics système réellement disponibles ;
+- **À FAIRE** — supprimer la suspension persistante et les boucles historiques lors du retrait du moteur `Historical`, tout en raccordant à la future interface la reprise explicite de la suspension générationnelle volatile ;
+- **Critère de sortie** — aucune rotation n'exige de catalogue individuel, aucun fichier ambigu, hors périmètre ou modifié concurremment n'est supprimé, une erreur de rotation ne rétracte pas la nouvelle sauvegarde et une interruption n'est pas présentée comme automatiquement rattrapée.
+
+### Lot 4 — restauration atomique sans journal et autorisation transitoire
+
+- **À FAIRE** — conserver un moteur unique, l'authentification complète, le canal secret, les réservations, les revalidations et l'échange atomique ;
+- **À FAIRE** — remplacer les intentions et reçus permanents par un engagement supervisé uniquement pendant l'opération ;
+- **À FAIRE** — après interruption, authentifier l'état présent sans nouvel échange automatique ni prétention de reconstituer un historique indémontrable ;
+- **Critère de sortie** — aucune donnée sérialisée ne permet de forger une autorisation et les résultats incertains restent présentés comme tels.
+
+### Lot 5 — principal corrompu, consultation et copies de travail
+
+- **À FAIRE** — admettre une destination corrompue sous sélection explicite, confirmation renforcée et contrôles stricts ;
+- **À FAIRE** — exposer une lecture seule réelle des sauvegardes gérées ;
+- **À FAIRE** — créer une copie de travail hors racine sans changer le `vault_id` ;
+- **Critère de sortie** — l'ancien principal est conservé, aucune ouverture automatique ne suit le remplacement et aucune écriture n'est possible depuis la consultation en lecture seule.
+
+### Lot 6 — retrait des mécanismes historiques et audit final
+
+- **À FAIRE** — résoudre ou maintenir bloqués les états historiques encore actifs avant de retirer leur porte d'admission ;
+- **À FAIRE** — supprimer intentions, phases, reçus, catalogue, préférences par coffre et ancien code uniquement après disparition de leur dernier appelant et transfert des garanties pertinentes ;
+- **À FAIRE** — retirer ou réécrire les tests devenus purement historiques sans perdre les scénarios de sécurité réutilisables ;
+- **Critère de sortie** — une seule architecture de préférences, sauvegarde, rotation et restauration demeure, sans nouveau journal permanent PassWall.
+
+## 14. Décisions techniques encore ouvertes
+
+1. **À DÉFINIR** — possibilité de désactiver les sauvegardes après la configuration initiale.
+2. **À DÉFINIR** — comportement exact d'une nouvelle ouverture sans sauvegarde admissible après un échec précédent : distinguer une nouvelle tentative liée à une nouvelle utilisation d'une boucle automatique répétée.
+3. **À DÉFINIR** — critères techniques détaillés de suppression sans catalogue et traitement des fichiers ambigus ou modifiés concurremment ; une preuve historique individuelle n'est pas requise pour une version autrement admissible.
+4. **À DÉFINIR** — conduite après une publication visible dont la synchronisation ou la durabilité n'est pas confirmée, sans inventer un succès, une suppression ou un journal de reprise.
+5. **À DÉFINIR** — conditions précises permettant d'arrêter la création des intentions historiques, de résoudre les états restants puis de retirer leur porte d'admission sans période contradictoire.
+6. **À DÉFINIR** — compatibilité et politique de retour à une ancienne version de PassWall capable de recréer des intentions dans `vaultRegistry/data`.
+7. **À DÉFINIR** — emplacement, nommage, signalement et nettoyage volontaire des anciens principaux et autres artefacts ; aucune seconde copie de précaution systématique n'est prévue.
+8. **À DÉFINIR** — confirmation renforcée et identification suffisante pour remplacer une destination corrompue dont le `vault_id` et les métadonnées sont illisibles.
+9. **À DÉFINIR** — comportement détaillé après interruption lorsque plusieurs fichiers sont sains ou lorsqu'aucun ne peut être authentifié, sans reprise automatique de l'échange.
+10. **À DÉFINIR** — politique sur les plateformes ou systèmes de fichiers dépourvus d'un échange atomique équivalent à `RENAME_EXCHANGE` ; aucun remplacement non atomique silencieux ne doit être introduit.
+11. **À DÉFINIR** — accès aux anciennes racines après changement de destination.
+12. **À DÉFINIR** — politique d'acceptation des chemins ayant un ancêtre modifiable par le groupe, systèmes de fichiers non pris en charge et supports NAS/amovibles indisponibles ou déconnectés.
+13. **À DÉFINIR** — comportement produit lorsque plusieurs principaux de travail de la même famille divergent, y compris la première copie de B lorsqu'une version de A est admissible et la protection d'historiques distincts sous une rétention commune avant toute rotation destructive.
+
+## 15. Travaux transversaux restants
+
+### 15.1 Sécurité et qualité V1
+
+- **À FAIRE** — audit global des copies sensibles, du presse-papiers, des logs, messages et nouvelles tâches asynchrones ;
+- **À FAIRE** — revue cryptographique V1 documentée ;
+- **À FAIRE** — tests supplémentaires de corruption, fichier inaccessible, espace insuffisant et E/S, sans les présenter comme des pannes matérielles réelles ;
+- **À FAIRE** — conserver les tests des champs obligatoires, transactions, RAII, timer, éditeurs, Native Messaging, récupérations historiques pendant la transition et interruptions de la restauration cible ;
+- **À FAIRE** — campagne complète actuelle après les lots de refonte, sans masquer les tests instables ou ignorés ;
+- **À FAIRE** — essais contrôlés de panne/interruption sur supports fictifs et documentation des résultats incertains.
+
+### 15.2 Firefox
+
+- **À FAIRE** — automatisation de bout en bout avec Firefox réel ;
+- **À FAIRE** — installation versionnée du manifeste, du Native Host et de l'extension ;
+- **À FAIRE** — scénarios d'invalidation pendant une réponse réellement transmise ;
+- **À FAIRE** — revue de la durée de vie des secrets dans l'extension.
+
+### 15.3 Produit
+
+- **À FAIRE** — TOTP ;
+- **À FAIRE** — passkeys ;
+- **À FAIRE** — audit des mots de passe ;
+- **À FAIRE** — export de la configuration globale, sans inventer un import non spécifié ;
+- **À FAIRE** — ergonomie et diagnostics des supports indisponibles, destinations invalides et résultats incertains.
+
+### 15.4 Plateformes et distribution
+
+- **À FAIRE** — installation Linux reproductible de l'application, des deux workers, du Native Host, du coordinateur et de l'extension ;
+- **À FAIRE** — vérifier les incompatibilités de versions et auxiliaires absents ;
+- **À FAIRE** — validation Windows en machine virtuelle, puis conception iOS après stabilisation Linux/Windows ;
+- **À FAIRE** — fournir un `README.md`, un `SECURITY.md` et un `CHANGELOG.md` adaptés à la diffusion ;
+- **À FAIRE** — documenter les plateformes et systèmes de fichiers effectivement supportés.
+
+## 16. Critères de candidature à une V1
+
+Avant une première diffusion :
+
+- architecture de préférences/sauvegardes unique, sans ancien catalogue concurrent ;
+- restauration atomique sans nouveau journal permanent PassWall, avec autorisation transitoire non forgeable et supervision testées ;
+- arrêt des nouvelles intentions persistantes et traitement contrôlé de toutes les preuves historiques avant retrait de leur porte d'admission ;
+- restauration manuelle d'un principal corrompu sous confirmation renforcée et conservation de l'ancien fichier ;
+- chiffrement, format et paramètres documentés et audités ;
+- sauvegardes, rotation et restauration sans anomalie non qualifiée ;
+- traitement explicite des résultats incertains, des interruptions, des artefacts et des limites de durabilité ;
+- absence de secret dans les logs et maintien des nettoyages contrôlés ;
+- tests actuels du cycle de vie, corruption, mémoire, Firefox et verrouillages ;
+- installation Linux et Firefox reproductible ;
+- supports et plateformes annoncés réellement validés ;
+- risques résiduels, limites physiques et absence de récupération du maître clairement documentés.
+
+TOTP, passkeys et audit des mots de passe doivent être positionnés explicitement dans le périmètre de la diffusion retenue ; ils ne sont pas implicitement livrés par les fondations existantes.
+
+## 17. Règles de maintenance de cette référence
+
+Après chaque changement :
+
+1. mettre à jour le statut concerné sans présenter une décision cible comme déjà implémentée ;
+2. indiquer les composants modifiés, les tests réellement exécutés et leurs limites ;
+3. conserver les garanties historiques encore actives, même si leur implémentation change ;
+4. retirer les descriptions et composants obsolètes dès que leur dernière dépendance est migrée et testée ;
+5. ne pas recréer un TODO ou un document architectural parallèle sans décision explicite.
+
+Les comptes rendus de développement doivent distinguer essais automatisés, observations manuelles, injections de fautes et transitions système réelles. Cette référence ne constitue pas une certification de sécurité.

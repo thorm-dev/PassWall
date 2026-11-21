@@ -8,6 +8,7 @@
 #include <sqlite3.h>
 
 #include <QFile>
+#include <QMetaObject>
 #include <QTemporaryDir>
 
 #include <array>
@@ -789,6 +790,12 @@ TEST_F(CredentialTransactionTest, BeginSuccessWithoutWriteTransactionDoesNotReac
 
 TEST_F(CredentialTransactionTest, CommitErrorWithActiveTransactionConfirmsExplicitRollback)
 {
+    int notifications = 0;
+    const auto connection = QObject::connect(
+        &CredentialService::events(), &passwall::services::CredentialEvents::committed,
+        [&notifications](const QString&, passwall::services::CredentialMutation, quint64) {
+            ++notifications;
+        });
     const auto before = persistentBytes();
     for (int operation = 0; operation < 3; ++operation) {
         probe = MemoryProbe{};
@@ -803,6 +810,8 @@ TEST_F(CredentialTransactionTest, CommitErrorWithActiveTransactionConfirmsExplic
         EXPECT_FALSE(probe.activeAtClose);
         expectClosedAndUnchanged(before);
     }
+    QObject::disconnect(connection);
+    EXPECT_EQ(notifications, 0);
     expectRetry(false);
 }
 

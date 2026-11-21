@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
@@ -59,6 +60,58 @@ TEST_F(VaultOperationGuardTest, ExistingBusinessAccessRefusesAReservationWithout
     ASSERT_TRUE(access.tryAccess(path, error));
     EXPECT_TRUE(second.tryAccess(path, error));
     EXPECT_FALSE(reservation.tryReserve(path, error));
+}
+TEST_F(VaultOperationGuardTest, SnapshotAccessCoexistsWithBusinessButSerializesSnapshots)
+{
+    VaultOperationGuard snapshot, business, secondSnapshot, replacement;
+    ASSERT_TRUE(snapshot.trySnapshotAccess(path, error));
+    EXPECT_TRUE(snapshot.matchesSnapshotAccess(path, error));
+    EXPECT_FALSE(snapshot.matchesReservation(path, error));
+    EXPECT_TRUE(business.tryAccess(path, error));
+    EXPECT_FALSE(secondSnapshot.trySnapshotAccess(path, error));
+    EXPECT_TRUE(secondSnapshot.contended());
+    EXPECT_FALSE(replacement.tryReserve(path, error));
+    EXPECT_TRUE(replacement.contended());
+    const auto handles = snapshot.inheritedSnapshotHandles();
+    EXPECT_GE(handles[0], 64); EXPECT_GE(handles[1], 64); EXPECT_GE(handles[2], 64);
+    EXPECT_TRUE((business.inheritedSnapshotHandles() == std::array<int, 3>{-1, -1, -1}));
+    business.reset(); snapshot.reset();
+    EXPECT_TRUE(secondSnapshot.trySnapshotAccess(path, error));
+}
+TEST_F(VaultOperationGuardTest, ExclusiveReservationRefusesSnapshotAccess)
+{
+    VaultOperationGuard replacement, snapshot;
+    ASSERT_TRUE(replacement.tryReserve(path, error));
+    EXPECT_FALSE(snapshot.trySnapshotAccess(path, error));
+    EXPECT_TRUE(snapshot.contended());
+    EXPECT_TRUE(replacement.matchesReservation(path, error));
+    EXPECT_FALSE(replacement.matchesSnapshotAccess(path, error));
+}
+TEST_F(VaultOperationGuardTest, SnapshotCapabilityRejectsWrongHandlesAndChangedIdentity)
+{
+    VaultOperationGuard snapshot;
+    ASSERT_TRUE(snapshot.trySnapshotAccess(path, error));
+    const auto handles = snapshot.inheritedSnapshotHandles();
+    VaultOperationGuard forged;
+    EXPECT_FALSE(forged.adoptSnapshotAccess(path, {handles[0], handles[1], handles[0]}, error));
+    const auto moved = directory.filePath("snapshot-moved.db").toStdString();
+    ASSERT_EQ(::rename(path.c_str(), moved.c_str()), 0);
+    EXPECT_FALSE(snapshot.matchesSnapshotAccess(path, error));
+    EXPECT_FALSE(snapshot.matchesSnapshotAccess(moved, error));
+}
+TEST_F(VaultOperationGuardTest, SnapshotCapabilityConfirmsTheExpectedPhysicalIdentity)
+{
+    struct stat expected {};
+    ASSERT_EQ(::stat(path.c_str(), &expected), 0);
+    VaultOperationGuard snapshot;
+    ASSERT_TRUE(snapshot.trySnapshotAccess(path, error));
+    EXPECT_TRUE(snapshot.matchesSnapshotIdentity(path,
+        static_cast<std::uint64_t>(expected.st_dev),
+        static_cast<std::uint64_t>(expected.st_ino), error));
+    EXPECT_FALSE(snapshot.matchesSnapshotIdentity(path,
+        static_cast<std::uint64_t>(expected.st_dev),
+        static_cast<std::uint64_t>(expected.st_ino) + 1, error));
+    EXPECT_FALSE(error.empty());
 }
 TEST_F(VaultOperationGuardTest, OtherVaultRemainsUsableEvenWithIdenticalContent)
 {
@@ -211,5 +264,28 @@ TEST_F(VaultOperationGuardTest, ChildRetainsKernelReservationAfterParentDropsIts
     ASSERT_EQ(::waitpid(child, &status, 0), child);
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     EXPECT_TRUE(access.tryAccess(path, error));
+}
+TEST_F(VaultOperationGuardTest, ChildRetainsSnapshotSerializationButBusinessAccessRemainsShared)
+{
+    VaultOperationGuard snapshot;
+    ASSERT_TRUE(snapshot.trySnapshotAccess(path, error));
+    int channel[2]; ASSERT_EQ(::pipe(channel), 0);
+    const auto child = ::fork(); ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::close(channel[1]); char byte;
+        const bool released = passwall::test_io::readSome(channel[0], &byte, 1) == 1 && byte == 'x';
+        ::_exit(released ? 0 : 1);
+    }
+    ::close(channel[0]); snapshot.reset();
+    VaultOperationGuard business, anotherSnapshot, replacement;
+    EXPECT_TRUE(business.tryAccess(path, error));
+    EXPECT_FALSE(anotherSnapshot.trySnapshotAccess(path, error));
+    EXPECT_FALSE(replacement.tryReserve(path, error));
+    business.reset();
+    EXPECT_TRUE(passwall::test_io::writeAll(channel[1], "x", 1));
+    ::close(channel[1]); int status;
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    EXPECT_TRUE(replacement.tryReserve(path, error));
 }
 } // namespace

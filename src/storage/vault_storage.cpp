@@ -93,10 +93,12 @@ bool openDatabase(
     const std::string& databasePath,
     Database& database,
     std::string& error,
-    bool newlyCreated = false)
+    bool newlyCreated = false,
+    bool recoveryAdmissionConfirmed = false)
 {
     if (!database.access.tryAccess(databasePath, error)) return false;
-    if (!services::VaultPreferencesStore::checkRecoveryAccess(databasePath, error)) return false;
+    if (!recoveryAdmissionConfirmed
+        && !services::VaultPreferencesStore::checkRecoveryAccess(databasePath, error)) return false;
     const int result = sqlite3_open_v2(
         databasePath.c_str(),
         &database.handle,
@@ -336,10 +338,12 @@ bool VaultStorage::writeMetadata(
     return success;
 }
 
-bool VaultStorage::readMetadata(
+namespace {
+bool readMetadataImpl(
     const std::string& databasePath,
     services::VaultKeyMetadata& metadata,
-    std::string& error)
+    std::string& error,
+    bool recoveryAdmissionConfirmed)
 {
     error.clear();
     metadata = services::VaultKeyMetadata{};
@@ -351,7 +355,7 @@ bool VaultStorage::readMetadata(
 
     Database database;
 
-    if (!openDatabase(databasePath, database, error)) {
+    if (!openDatabase(databasePath, database, error, false, recoveryAdmissionConfirmed)) {
         return false;
     }
 
@@ -465,6 +469,28 @@ bool VaultStorage::readMetadata(
 
     metadata = candidate;
     return true;
+}
+} // namespace
+
+bool VaultStorage::readMetadata(
+    const std::string& databasePath,
+    services::VaultKeyMetadata& metadata,
+    std::string& error)
+{
+    return readMetadataImpl(databasePath, metadata, error, false);
+}
+
+bool VaultStorage::readMetadataAdmitted(
+    const std::string& databasePath,
+    const VaultOperationGuard& admittedAccess,
+    services::VaultKeyMetadata& metadata,
+    std::string& error)
+{
+    if (!admittedAccess.matchesAccess(databasePath, error)) {
+        if (error.empty()) error = "Admission métier du coffre absente ou obsolète.";
+        return false;
+    }
+    return readMetadataImpl(databasePath, metadata, error, true);
 }
 
 } // namespace passwall::storage

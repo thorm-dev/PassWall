@@ -125,6 +125,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 gtest_discover_tests(passwall_preferences_tests)
 
+# Ordinary installation-wide backup preferences. Kept distinct from the
+# historical vault registry and opt-in until the generational consumer lands.
+add_library(passwall_global_backup_preferences STATIC EXCLUDE_FROM_ALL
+    src/services/global_backup_preferences_store.cpp)
+target_include_directories(passwall_global_backup_preferences PUBLIC src)
+target_link_libraries(passwall_global_backup_preferences PUBLIC Qt6::Core)
+find_package(Qt6 REQUIRED COMPONENTS Test)
+add_executable(passwall_global_backup_preferences_tests
+    tests/test_global_backup_preferences_store.cpp)
+target_link_libraries(passwall_global_backup_preferences_tests PRIVATE
+    passwall_global_backup_preferences Qt6::Test GTest::gtest_main)
+gtest_discover_tests(passwall_global_backup_preferences_tests)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Isolated SQLite resource faults: reuse linker injection without changing
     # production APIs or the existing credential-memory test wrappers.
@@ -166,6 +179,24 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Recovery gate before every storage/snapshot SQL open. Static libraries
     # form a small strongly-connected component; CMake repeats it for linking.
     target_link_libraries(passwall_vault_snapshot PUBLIC passwall_vault_preferences)
+
+    # Inactive in production: binds a future generational request to the
+    # physical source, family and destination, then exposes only a guarded
+    # one-shot admission into the existing backup driver.
+    add_library(passwall_backup_destination STATIC EXCLUDE_FROM_ALL
+        src/services/backup_destination_preparer.cpp
+        src/services/initial_backup_preparer.cpp)
+    target_include_directories(passwall_backup_destination PUBLIC src)
+    target_link_libraries(passwall_backup_destination PUBLIC
+        passwall_global_backup_preferences passwall_vault_snapshot
+        passwall_vault_preferences Qt6::Core)
+    add_executable(passwall_backup_destination_tests
+        tests/test_backup_destination_preparer.cpp
+        tests/test_initial_backup_preparer.cpp)
+    target_link_libraries(passwall_backup_destination_tests PRIVATE
+        passwall_backup_destination GTest::gtest)
+    gtest_discover_tests(passwall_backup_destination_tests)
+
     add_executable(passwall_snapshot_tests
         tests/test_vault_snapshot_service.cpp
         src/core/crypto_engine.cpp
@@ -268,10 +299,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         src/services/backup_job.hpp src/services/backup_job.cpp)
     target_include_directories(passwall_backup_driver PUBLIC src)
     target_link_libraries(passwall_backup_driver PUBLIC Qt6::Core passwall_vault_operations)
+    # 2I-4B: the prepared destination owns the single snapshot capability until
+    # its final owner-thread admission transfers it into BackupJob.
+    target_link_libraries(passwall_backup_destination PUBLIC passwall_backup_driver)
     add_library(passwall_automatic_backup STATIC
         src/services/automatic_backup_coordinator.hpp src/services/automatic_backup_coordinator.cpp)
     target_include_directories(passwall_automatic_backup PUBLIC src)
-    target_link_libraries(passwall_automatic_backup PUBLIC passwall_backup_driver passwall_vault_preferences)
+    # 2I-4C reuses the prepared request inside the single generational queue.
+    # Linking this inactive foundation does not select Generational in production.
+    target_link_libraries(passwall_automatic_backup PUBLIC
+        passwall_backup_destination passwall_backup_driver passwall_vault_preferences)
     add_executable(passwall_automatic_backup_tests tests/test_automatic_backup.cpp
         src/services/credential_service.cpp src/services/vault_key_service.cpp src/core/crypto_engine.cpp)
     target_link_libraries(passwall_automatic_backup_tests PRIVATE
@@ -291,6 +328,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(passwall_fake_backup_worker tests/fake_backup_worker.cpp)
     target_include_directories(passwall_fake_backup_worker PRIVATE src)
     target_link_libraries(passwall_fake_backup_worker PRIVATE passwall_backup_rotation)
+    target_compile_definitions(passwall_backup_destination_tests PRIVATE
+        INITIAL_FAKE_BACKUP_WORKER="$<TARGET_FILE:passwall_fake_backup_worker>")
+    add_dependencies(passwall_backup_destination_tests passwall_fake_backup_worker)
     add_executable(passwall_backup_worker_probe
         src/services/backup_worker_main.cpp tests/backup_worker_faults.cpp)
     target_link_libraries(passwall_backup_worker_probe PRIVATE passwall_backup_rotation)
@@ -393,6 +433,7 @@ add_executable(passwall_gui_tests
     src/native/native_bridge_server.cpp
 )
 target_include_directories(passwall_gui_tests PRIVATE src)
+target_compile_definitions(passwall_gui_tests PRIVATE PASSWALL_GUI_TESTING)
 target_link_libraries(passwall_gui_tests PRIVATE
     passwall_vault_preferences
     GTest::gtest
@@ -551,6 +592,7 @@ endif()
 set(PASSWALL_CTEST_TARGETS
     passwall_tests
     passwall_preferences_tests
+    passwall_global_backup_preferences_tests
     passwall_gui_tests
     passwall_native_host_tests)
 set(PASSWALL_TEST_SUPPORT_TARGETS)
@@ -559,6 +601,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND PASSWALL_CTEST_TARGETS
         passwall_storage_tests
         passwall_snapshot_tests
+        passwall_backup_destination_tests
         passwall_restore_job_tests
         passwall_replacement_tests
         passwall_automatic_backup_tests

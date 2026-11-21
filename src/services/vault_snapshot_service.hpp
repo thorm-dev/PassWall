@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <string>
 #include <cstdint>
 namespace passwall::storage { class VaultOperationGuard; }
@@ -18,6 +19,13 @@ struct SnapshotSourceIdentity {
     std::uint64_t device = 0;
     std::uint64_t inode = 0;
     bool operator==(const SnapshotSourceIdentity&) const = default;
+};
+
+// Keyless structural information only. A matching vault_id and the presence
+// of rows do not authenticate their encrypted contents.
+struct SnapshotVaultContents {
+    std::array<std::uint8_t, 16> vaultId{};
+    bool hasEntries = false;
 };
 
 enum class SnapshotPublication {
@@ -54,12 +62,13 @@ struct SnapshotResult {
 
 class VaultSnapshotService final {
 public:
-    // Read-only, keyless screening for the restoration UI. This rejects files
-    // that are manifestly not protected PassWall V1 vaults, but is neither
-    // cryptographic authentication nor replacement authorization. The restore
-    // engine must still repeat all source/identity/content checks.
+    // Read-only, keyless structural screening used by restoration and backup
+    // preparation. This rejects files manifestly incompatible with PassWall V1,
+    // but is neither cryptographic authentication nor an authorization. The
+    // restore engine must still repeat all source/identity/content checks.
     [[nodiscard]] static bool prevalidateVaultSource(const std::string& path,
-        std::string& error, SnapshotSourceIdentity* identity = nullptr);
+        std::string& error, SnapshotSourceIdentity* identity = nullptr,
+        SnapshotVaultContents* contents = nullptr);
     // Same directory traversal/permissions/filesystem policy as createSnapshot.
     // Never creates a missing directory or redirects to another destination.
     [[nodiscard]] static bool inspectDestinationDirectory(const std::string& path,
@@ -81,9 +90,11 @@ public:
     // Cancellation racing with an already entered linkat cannot retract it.
     // The engine itself performs no cryptographic authentication; the optional
     // trusted verification hook belongs to its in-process restore caller.
-    // The default call reserves its source against cooperating PassWall access.
-    // A worker can borrow a validated inherited reservation for that source;
-    // this permits only the existing read-only snapshot path, never business SQL.
+    // The default call obtains a serialized snapshot access which coexists with
+    // business access but excludes replacement. A worker can borrow that typed
+    // inherited capability; ordinary business access cannot be exported.
+    // A legacy exclusive reservation is still accepted while the historical
+    // automatic coordinator depends on exclusive mutation tracking.
     // true means Published, not merely a complete SQLite backup. If allocation
     // throws, RAII cleans owned temporaries; result.publication still records
     // any irreversible publication, set before constructing its diagnostic.

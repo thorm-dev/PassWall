@@ -63,15 +63,21 @@ int main(int argc, char** argv)
     QCoreApplication application(argc, argv);
     const auto arguments = application.arguments();
     const bool rotation = arguments.size() >= 2 && arguments[1] == QStringLiteral("--rotation-v1");
-    if ((arguments.size() != 2 && arguments.size() != 4)
-        || (!rotation && arguments[1] != QStringLiteral("--protocol-v1"))
-        || (rotation && arguments.size() != 4))
+    const bool snapshotAccess = arguments.size() >= 2
+        && arguments[1] == QStringLiteral("--snapshot-v1");
+    const bool legacyCopy = arguments.size() >= 2
+        && arguments[1] == QStringLiteral("--protocol-v1");
+    if ((!rotation && !snapshotAccess && !legacyCopy)
+        || (rotation && arguments.size() != 4)
+        || (legacyCopy && arguments.size() != 2 && arguments.size() != 4)
+        || (snapshotAccess && arguments.size() != 2 && arguments.size() != 5))
         return 2;
     SnapshotResult snapshot;
     std::optional<BackupFileEvidence> receipt;
+    QString receiptDestination;
     try {
-        // Exactly one bounded request line. Any later byte is cancellation.
-        QByteArray request;
+      // Exactly one bounded request line. Any later byte is cancellation.
+      QByteArray request;
         while (!stopping && request.size() <= backup_protocol::requestLimit) {
             char byte;
             const auto count = ::read(STDIN_FILENO, &byte, 1);
@@ -89,12 +95,22 @@ int main(int argc, char** argv)
             : !backup_protocol::parseRequest(request, source, destination, &expectedDirectory, &wantReceipt)))
             return 2;
         std::string reservationError;
-        if (arguments.size() == 4) {
+        if (snapshotAccess && arguments.size() == 5) {
+            bool first = false, second = false, third = false;
+            const int a = arguments[2].toInt(&first), b = arguments[3].toInt(&second);
+            const int c = arguments[4].toInt(&third);
+            if (!first || !second || !third || a < 64 || c < 64
+                || (b != -1 && b < 64)
+                || !reservation.adoptSnapshotAccess(source.toStdString(), {a, b, c}, reservationError))
+                return 2;
+        } else if (arguments.size() == 4) {
             bool first = false, second = false;
             const int a = arguments[2].toInt(&first), b = arguments[3].toInt(&second);
             if (!first || !second || a < 64 || (b != -1 && (b < 64 || b == a))
                 || !reservation.adoptReservation(source.toStdString(), {a, b}, reservationError)) return 2;
-        } else if (!reservation.tryReserve(source.toStdString(), reservationError)) {
+        } else if (!(snapshotAccess
+                ? reservation.trySnapshotAccess(source.toStdString(), reservationError)
+                : reservation.tryReserve(source.toStdString(), reservationError))) {
             snapshot.diagnostic = reservationError;
             return writeResult(backup_protocol::result({BackupOutcome::FailedBeforePublication,
                 QString::fromStdString(reservationError)})) ? 0 : 2;
@@ -134,7 +150,8 @@ int main(int argc, char** argv)
                 || published.mount != evidence.evidence.mount
                 || (expectedDirectory && (published.directoryDevice != expectedDirectory->device
                     || published.directoryInode != expectedDirectory->inode))) return 2;
-            receipt = std::move(published);
+            receiptDestination = destination;
+	    receipt = std::move(published);
         }
     } catch (...) {
         if (rotation) return 2; // Missing rotation result is uncertainty, never copy failure.
@@ -149,6 +166,7 @@ int main(int argc, char** argv)
     case SnapshotPublication::PublishedDurabilityUnconfirmed: outcome = BackupOutcome::DurabilityUnconfirmed; break;
     }
     try {
-        return writeResult(backup_protocol::result({outcome, QString::fromStdString(snapshot.diagnostic), receipt})) ? 0 : 2;
+        return writeResult(backup_protocol::result({outcome, QString::fromStdString(snapshot.diagnostic),
+            receipt, receipt ? receiptDestination : QString{}})) ? 0 : 2;
     } catch (...) { return 2; } // Missing record is UNKNOWN to the parent.
 }

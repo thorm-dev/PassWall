@@ -26,24 +26,19 @@ VaultBackupSettingsDialog::VaultBackupSettingsDialog() : QDialog(nullptr)
         auto* item = new QLabel(text, this); item->setObjectName(QString::fromLatin1(name));
         item->setTextFormat(Qt::PlainText); item->setWordWrap(true); layout->addWidget(item); return item;
     };
-    label(tr("Ces trois préférences sont locales à cette installation, pas inscrites dans le coffre. "
-        "Une copie portable ne les hérite pas. Les anciennes sauvegardes ne sont pas déplacées."), "backupLocalPolicyLabel");
     auto* form = new QFormLayout;
     vault_ = new QComboBox(this); vault_->setObjectName("backupVaultCombo");
-    vault_->setPlaceholderText(tr("Choisir explicitement le coffre principal…"));
-    form->addRow(tr("Coffre principal enregistré"), vault_);
+    vault_->setPlaceholderText(tr("Choisir le coffre à configurer…"));
+    form->addRow(tr("Coffre enregistré"), vault_);
     automatic_ = new QCheckBox(tr("Activer les sauvegardes automatiques"), this);
     automatic_->setObjectName("backupAutomaticCheck"); form->addRow(automatic_);
     auto* row = new QHBoxLayout;
     directory_ = new QLineEdit(this); directory_->setObjectName("backupDirectoryEdit");
     browse_ = new QPushButton(tr("Parcourir…"), this); browse_->setObjectName("backupDirectoryButton");
-    row->addWidget(directory_); row->addWidget(browse_); form->addRow(tr("Répertoire local existant"), row);
+    row->addWidget(directory_); row->addWidget(browse_); form->addRow(tr("Dossier où stocker les sauvegardes"), row);
     retained_ = new QSpinBox(this); retained_->setObjectName("backupRetentionSpin");
     retained_->setRange(1, std::numeric_limits<int>::max()); retained_->setValue(7);
-    form->addRow(tr("Versions automatiques conservées"), retained_); layout->addLayout(form);
-    label(tr("Activation : première copie selon le coordinateur existant. Ensuite, les modifications sont "
-        "regroupées au verrouillage. Une erreur suspend les tentatives jusqu'à une reprise explicite. "
-        "La rétention s'applique après une nouvelle copie confirmée, jamais par suppression immédiate ici."), "backupTriggerPolicyLabel");
+    form->addRow(tr("Nombre de versions à conserver"), retained_); layout->addLayout(form);
     state_ = label(tr("Chargement du registre…"), "backupStateLabel");
     rotation_ = label({}, "backupRotationLabel"); feedback_ = label({}, "backupFeedbackLabel");
     auto* buttons = new QHBoxLayout;

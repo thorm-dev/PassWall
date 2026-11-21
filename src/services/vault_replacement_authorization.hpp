@@ -93,6 +93,9 @@ private:
     explicit VaultReplacementAuthorization(std::shared_ptr<State>) noexcept;
     static std::shared_ptr<State> reserve(const VaultPreferencesStore&, const QString&,
         std::function<bool()> cleanupStillValid, QString&);
+    static std::shared_ptr<State> reserve(const VaultPreferencesStore&, const QString&,
+        std::function<bool()> cleanupStillValid,
+        storage::VaultOperationGuard, QString&);
     static VaultReplacementAuthorization acknowledge(std::shared_ptr<State>, QString&);
     // Three-part issuance: owner-thread cleanup, secretless I/O, owner-thread
     // revalidation. The state is not otherwise used while its I/O is running.

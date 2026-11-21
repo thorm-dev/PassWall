@@ -207,6 +207,44 @@ std::shared_ptr<VaultReplacementAuthorization::State> VaultReplacementAuthorizat
     state->intent.phase = "prepared";
     return state;
 }
+
+std::shared_ptr<VaultReplacementAuthorization::State> VaultReplacementAuthorization::reserve(
+    const VaultPreferencesStore& store, const QString& localId,
+    std::function<bool()> cleanupStillValid,
+    storage::VaultOperationGuard reservation, QString& error)
+{
+    QVector<VaultRegistration> records;
+    if (!store.list(records, error)) return {};
+    auto state = std::make_shared<State>(store);
+    state->cleanupStillValid = std::move(cleanupStillValid);
+    bool found = false;
+    for (const auto& record : records) if (record.localId == localId) {
+        if (record.replacement) {
+            fail(error, "Une récupération est déjà requise pour ce coffre.");
+            return {};
+        }
+        state->registration = record;
+        found = true;
+        break;
+    }
+    if (!found) {
+        fail(error, "Coffre principal non enregistré.");
+        return {};
+    }
+    std::string reservationError;
+    if (!reservation.matchesReservation(
+            state->registration.file.path.toStdString(), reservationError)) {
+        error = reservationError.empty()
+            ? QStringLiteral("Réservation exclusive de restauration incohérente.")
+            : QString::fromStdString(reservationError);
+        return {};
+    }
+    state->reservation = std::move(reservation);
+    state->intent.operationId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    state->intent.previous = state->registration.file;
+    state->intent.phase = "prepared";
+    return state;
+}
 VaultReplacementAuthorization VaultReplacementAuthorization::acknowledge(
     std::shared_ptr<State> state, QString& error)
 {

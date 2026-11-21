@@ -86,9 +86,13 @@ void VaultRestoreController::prepare() {
         services::RestoreJob::siblingApplicationPath(), executableError)) {
         fail(tr("Restauration indisponible avant préparation : %1").arg(executableError)); return;
     }
+    const bool historicalAutomaticWorker = owner_.automaticBackup_
+        && owner_.automaticBackup_->triggerMode()
+            == services::BackupTriggerMode::Historical
+        && owner_.automaticBackup_->isActive();
     if (owner_.externalLockBlocksAccess() || owner_.vaultLockInProgress_ || owner_.exportInProgress_
         || owner_.exportCloseRequested_ || owner_.hasOpenCredentialEditor()
-        || (owner_.automaticBackup_ && owner_.automaticBackup_->isActive()) || !owner_.ensureLifecycleProtection()) {
+        || historicalAutomaticWorker || !owner_.ensureLifecycleProtection()) {
         fail(tr("Une édition, une opération incompatible ou une protection indisponible empêche la restauration.")); return;
     }
     selected_ = *found; principalId_ = selected; source_ = dialog_->source();
@@ -146,12 +150,40 @@ void VaultRestoreController::authorizeAfterPrevalidation(quint64 serial, quint64
     if (generation_ != serial || cancelled_ || !dialog_) {
         emit preparationSettled(false); return;
     }
+    const bool historicalAutomaticWorker = owner_.automaticBackup_
+        && owner_.automaticBackup_->triggerMode()
+            == services::BackupTriggerMode::Historical
+        && owner_.automaticBackup_->isActive();
     if (securityGeneration != owner_.replacementGeneration_
         || owner_.externalLockBlocksAccess() || owner_.vaultLockInProgress_ || owner_.exportInProgress_
         || owner_.exportCloseRequested_ || owner_.hasOpenCredentialEditor()
-        || (owner_.automaticBackup_ && owner_.automaticBackup_->isActive()) || !owner_.ensureLifecycleProtection()) {
+        || historicalAutomaticWorker || !owner_.ensureLifecycleProtection()) {
         fail(tr("Une édition, une opération incompatible ou une protection indisponible empêche la restauration."));
         emit preparationSettled(true); return;
+    }
+    QString admissionError;
+    std::shared_ptr<services::ManualBackupOperationAdmission> manualAdmission;
+    if (owner_.automaticBackup_
+        && owner_.automaticBackup_->triggerMode()
+            == services::BackupTriggerMode::Generational) {
+        auto admission = owner_.automaticBackup_->acquireUserOperation(
+            services::BackupUserOperation::Restoration,
+            selected_.file.path, admissionError);
+        if (!admission.valid()) {
+            fail(admissionError.isEmpty()
+                ? tr("Restauration différée : une sauvegarde automatique a pris la priorité.")
+                : admissionError);
+            emit preparationSettled(true);
+            return; // Preserve the still-unlocked session and form contents.
+        }
+        try {
+            manualAdmission = std::make_shared<
+                services::ManualBackupOperationAdmission>(std::move(admission));
+        } catch (...) {
+            fail(tr("Impossible de conserver l'admission de la restauration."));
+            emit preparationSettled(true);
+            return;
+        }
     }
     stage_ = Stage::Preparing; dialog_->preparing();
     // No secret entered yet. Explicit confirmation permits locking even another
@@ -178,7 +210,7 @@ void VaultRestoreController::authorizeAfterPrevalidation(quint64 serial, quint64
         guarded->authority_ = std::move(authority); guarded->stage_ = Stage::Password;
         guarded->dialog_->awaitingPassword();
         emit guarded->preparationSettled(true);
-    });
+    }, std::move(manualAdmission), selected_.file.path);
 }
 void VaultRestoreController::execute() {
     if (stage_ != Stage::Password || !dialog_ || authority_.operationId().isEmpty()) return;

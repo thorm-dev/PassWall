@@ -45,7 +45,9 @@ bool MainWindow::recoveryAllowsCurrentSession() const noexcept
     } catch (...) { return false; }
 }
 void MainWindow::requestReplacementAuthorization(const QString& localId,
-    std::function<void(services::VaultReplacementAuthorization, QString)> completion)
+    std::function<void(services::VaultReplacementAuthorization, QString)> completion,
+    std::shared_ptr<services::ManualBackupOperationAdmission> admission,
+    QString admittedVaultPath)
 {
     using Authorization = services::VaultReplacementAuthorization;
     if (!isSessionThread()) qFatal("Replacement preparation must run on the vault owner's thread");
@@ -54,24 +56,71 @@ void MainWindow::requestReplacementAuthorization(const QString& localId,
     const auto reject = [&](services::VaultReplacementAuthorization authority, QString error) noexcept {
         try { completion(std::move(authority), std::move(error)); } catch (...) {}
     };
+#ifdef Q_OS_LINUX
+    if (admittedVaultPath.isEmpty()) admittedVaultPath = vaultPath_;
+    const bool generational = automaticBackup_
+        && automaticBackup_->triggerMode()
+            == services::BackupTriggerMode::Generational;
+    if (generational && !admission) {
+        QString admissionError;
+        auto acquired = automaticBackup_->acquireUserOperation(
+            services::BackupUserOperation::Restoration, admittedVaultPath,
+            admissionError);
+        if (!acquired.valid()) {
+            reject({}, admissionError);
+            return; // No reservation and therefore no persistent replacement intent.
+        }
+        try {
+            admission = std::make_shared<
+                services::ManualBackupOperationAdmission>(std::move(acquired));
+        } catch (...) {
+            reject({}, QStringLiteral(
+                "Impossible de conserver l'admission de la restauration."));
+            return;
+        }
+    }
+    if (generational && (!admission || !admission->valid())) {
+        reject({}, QStringLiteral(
+            "Admission de restauration absente, révoquée ou obsolète."));
+        return;
+    }
+#endif
     if (replacementGeneration_ == 0 || externalLockBlocksAccess() || vaultLockInProgress_ || !ensureLifecycleProtection() || !guarded
 #ifdef Q_OS_LINUX
         || hasOpenCredentialEditor() || exportInProgress_
-        || (automaticBackup_ && automaticBackup_->isActive())
+        || (automaticBackup_
+            && automaticBackup_->triggerMode()
+                == services::BackupTriggerMode::Historical
+            && automaticBackup_->isActive())
 #endif
     ) {
         reject({}, QStringLiteral("Une opération incompatible ou un éditeur est encore actif."));
         return;
     }
-    // Set before registry/reservation work. No nested UI loop, no blocking flock.
-    replacementTransition_ = true;
     const auto initialGeneration = sessionGeneration_;
     const auto preparationGeneration = replacementGeneration_;
     struct Pending {
         std::shared_ptr<Authorization::State> state;
+        std::shared_ptr<services::ManualBackupOperationAdmission> admission;
+        QString admittedVaultPath;
         QString error;
     };
     auto pending = std::make_shared<Pending>();
+#ifdef Q_OS_LINUX
+    if (admission && admission->generational()) {
+        if (!admission->consumeForExclusive(
+                services::BackupUserOperation::Restoration,
+                admittedVaultPath, pending->error)) {
+            reject({}, pending->error);
+            return;
+        }
+        pending->admission = std::move(admission);
+        pending->admittedVaultPath = std::move(admittedVaultPath);
+    }
+#endif
+    // Set only after the single-use admission was consumed successfully and
+    // before any registry/reservation work can start.
+    replacementTransition_ = true;
     auto deliver = [guarded, completion = std::move(completion)](Authorization authority, QString error) mutable {
         if (guarded) guarded->replacementTransition_ = false;
         try { completion(std::move(authority), std::move(error)); } catch (...) {}
@@ -85,9 +134,26 @@ void MainWindow::requestReplacementAuthorization(const QString& localId,
             && guarded->hasLifecycleProtection() && guarded->isFullyLocked(); };
         prepareOffThread([pending, store, localId, validation] {
             try {
-                pending->state = Authorization::reserve(store, localId, validation, pending->error);
+                storage::VaultOperationGuard reservation;
+                std::string reservationError;
+                if (pending->admission) {
+                    if (!reservation.tryReserve(
+                            pending->admittedVaultPath.toStdString(),
+                            reservationError)) {
+                        pending->error = QString::fromStdString(reservationError);
+                        return;
+                    }
+                    pending->state = Authorization::reserve(store, localId,
+                        validation, std::move(reservation), pending->error);
+                } else {
+                    pending->state = Authorization::reserve(store, localId,
+                        validation, pending->error);
+                }
             } catch (...) { pending->error = QStringLiteral("Impossible de réserver le coffre."); }
         }, [guarded, pending, initialGeneration, preparationGeneration, deliver]() mutable {
+            // The real reservation is now held by state or definitively
+            // refused. Release the logical slot only on the owner thread.
+            pending->admission.reset();
             const auto state = pending->state;
             if (!state || !guarded || guarded->sessionGeneration_ != initialGeneration
                 || guarded->replacementGeneration_ != preparationGeneration

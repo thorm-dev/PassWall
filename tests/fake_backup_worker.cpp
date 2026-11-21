@@ -22,8 +22,9 @@ int main(int argc, char** argv)
     using namespace passwall::services;
     const bool rotation = application.arguments().contains("--rotation-v1");
     AutomaticBackupContext context;
+    bool wantReceipt = false;
     if (rotation ? !backup_protocol::parseRotationRequest(bytes, source, context)
-                 : !backup_protocol::parseRequest(bytes, source, destination)) return 1;
+                 : !backup_protocol::parseRequest(bytes, source, destination, nullptr, &wantReceipt)) return 1;
     if (rotation) {
         const auto args = application.arguments();
         passwall::storage::VaultOperationGuard reservation;
@@ -67,8 +68,15 @@ int main(int argc, char** argv)
         for (;;) ::pause();
     }
     if (mode == "slow") QThread::msleep(250);
-    if (mode == "slow-published-file") QThread::msleep(250);
-    if (mode == "published-file" || mode == "slow-published-file" || mode == "durability-file") {
+    if (mode == "slow-published-file" || mode == "slow-snapshot-published-file") QThread::msleep(250);
+    if (mode == "gated-snapshot-published-file")
+        while (!QFile::exists(destination + ".release")) QThread::msleep(5);
+    if (mode == "published-file" || mode == "slow-published-file" || mode == "durability-file"
+        || mode == "snapshot-published-file" || mode == "slow-snapshot-published-file"
+        || mode == "gated-snapshot-published-file"
+        || mode == "snapshot-published-without-receipt"
+        || mode == "snapshot-insufficient-receipt"
+        || mode == "snapshot-wrong-path-receipt") {
         if (!QFile::copy(source, destination)) return 1;
         QFile::setPermissions(destination, QFile::ReadOwner | QFile::WriteOwner);
     }
@@ -81,10 +89,14 @@ int main(int argc, char** argv)
         (mode == "failed" || mode == "enospc") ? BackupOutcome::FailedBeforePublication :
         (mode == "durability" || mode == "durability-file") ? BackupOutcome::DurabilityUnconfirmed : BackupOutcome::Published;
     BackupResult value{outcome, mode == "enospc" ? QStringLiteral("Écriture [errno=28].") : QString()};
-    if (mode == "published-file" || mode == "slow-published-file" || mode == "durability-file") {
+    if (wantReceipt && outcome != BackupOutcome::FailedBeforePublication
+        && outcome != BackupOutcome::CancelledBeforePublication
+        && mode != "snapshot-published-without-receipt") {
         BackupFileEvidence evidence; QString error;
         if (!BackupRotationService::inspectEncryptedFile(destination, evidence, error)) return 1;
+        if (mode == "snapshot-insufficient-receipt") evidence.mount = 0;
         value.receipt = evidence;
+        value.publishedPath = mode == "snapshot-wrong-path-receipt" ? source : destination;
     }
     const auto result = backup_protocol::result(value);
     // Fragmented output is legal; terminal parsing occurs only after exit.

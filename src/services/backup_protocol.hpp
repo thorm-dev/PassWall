@@ -18,6 +18,7 @@ struct BackupResult {
     BackupOutcome outcome = BackupOutcome::Unknown;
     QString diagnostic;
     std::optional<BackupFileEvidence> receipt;
+    QString publishedPath;
 };
 
 struct AutomaticBackupContext { QString settingsFile, localId, attempt; };
@@ -97,7 +98,10 @@ inline QByteArray result(const BackupResult& value)
 {
     QJsonObject object{{"v", 1}, {"outcome", name(value.outcome)},
         {"diagnostic", value.diagnostic.left(1024)}};
-    if (value.receipt) object.insert("receipt", encodeBackupEvidence(*value.receipt));
+    if (value.receipt) {
+        object.insert("receipt", encodeBackupEvidence(*value.receipt));
+        object.insert("publishedPath", value.publishedPath);
+    }
     return QJsonDocument(object).toJson(QJsonDocument::Compact) + '\n';
 }
 inline bool parseResult(const QByteArray& bytes, BackupResult& value)
@@ -107,7 +111,7 @@ inline bool parseResult(const QByteArray& bytes, BackupResult& value)
     const auto document = QJsonDocument::fromJson(bytes, &error);
     const auto object = document.object();
     if (error.error != QJsonParseError::NoError || !document.isObject()
-        || (object.size() != 3 && object.size() != 4)
+        || (object.size() != 3 && object.size() != 5)
         || object.value("v") != QJsonValue(1) || !object.value("outcome").isString()
         || !object.value("diagnostic").isString()
         || object.value("diagnostic").toString().size() > 1024) return false;
@@ -115,11 +119,16 @@ inline bool parseResult(const QByteArray& bytes, BackupResult& value)
              BackupOutcome::DurabilityUnconfirmed, BackupOutcome::CancelledBeforePublication}) {
         if (object.value("outcome").toString() == name(outcome)) {
             value = {outcome, object.value("diagnostic").toString()};
-            if (object.size() == 4) {
+            if (object.size() == 5) {
                 BackupFileEvidence evidence;
                 if ((outcome != BackupOutcome::Published && outcome != BackupOutcome::DurabilityUnconfirmed)
-                    || !decodeBackupEvidence(object.value("receipt"), evidence)) return false;
+                    || !decodeBackupEvidence(object.value("receipt"), evidence)
+                    || !object.value("publishedPath").isString()
+                    || !validPath(object.value("publishedPath").toString())
+                    || QDir::cleanPath(object.value("publishedPath").toString())
+                        != object.value("publishedPath").toString()) return false;
                 value.receipt = std::move(evidence);
+                value.publishedPath = object.value("publishedPath").toString();
             }
             return true;
         }

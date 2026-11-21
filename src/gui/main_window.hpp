@@ -4,6 +4,7 @@
 #include "core/crypto_engine.hpp"
 #include "models/credential.hpp"
 #include "native/native_request_processor.hpp"
+#include "services/backup_trigger_mode.hpp"
 #include "services/vault_replacement_authorization.hpp"
 
 #include <QMainWindow>
@@ -30,7 +31,11 @@ class MainWindow;
 QT_END_NAMESPACE
 
 #ifdef Q_OS_LINUX
-namespace passwall::services { class BackupJob; class AutomaticBackupCoordinator; }
+namespace passwall::services {
+class BackupJob;
+class AutomaticBackupCoordinator;
+class ManualBackupOperationAdmission;
+}
 class QCloseEvent;
 #endif
 
@@ -48,6 +53,12 @@ class MainWindow : public QMainWindow, public native::NativeVaultAccess {
 
 public:
     explicit MainWindow(QWidget* parent = nullptr);
+#ifdef PASSWALL_GUI_TESTING
+    // The production constructor always selects Historical.  GUI integration
+    // tests alone may exercise the already-implemented generational boundary.
+    [[nodiscard]] static std::unique_ptr<MainWindow>
+        createForGenerationalTests(QWidget* parent = nullptr);
+#endif
     ~MainWindow() override;
 
     void activateFromNativeRequest();
@@ -69,7 +80,9 @@ public:
     // Does not replace a file. Owner-thread only.
     // The only production issuer is this real cleanup/acknowledgement path.
     void requestReplacementAuthorization(const QString& localId,
-        std::function<void(services::VaultReplacementAuthorization, QString)> completion);
+        std::function<void(services::VaultReplacementAuthorization, QString)> completion,
+        std::shared_ptr<services::ManualBackupOperationAdmission> admission = {},
+        QString admittedVaultPath = {});
 #ifdef Q_OS_LINUX
     // Internal execution API used by the restoration GUI/tests. Only an authority issued by THIS
     // MainWindow can be consumed. Returned facade remains owned by the window.
@@ -110,6 +123,10 @@ protected:
 #endif
 
 private:
+#ifdef Q_OS_LINUX
+    explicit MainWindow(services::BackupTriggerMode backupTriggerMode,
+                        QWidget* parent);
+#endif
 #ifdef Q_OS_LINUX
     friend class VaultRestoreController; // Coordinates the real issuer; never a friend of Authorization.
     friend class VaultBackupSettingsController; // Presentation uses the existing backup coordinator.
@@ -168,13 +185,17 @@ private:
     void updateExportAction();
     [[nodiscard]] bool exportAuthorizationCurrent(native::VaultLease lease, const QString& source);
     [[nodiscard]] bool hasOpenCredentialEditor() const;
-    void startVaultExport(const QString& source, const QString& destination);
+    void startVaultExport(const QString& source, const QString& destination,
+        std::shared_ptr<services::ManualBackupOperationAdmission> admission);
     void cancelVaultExport();
     void queueExportClose();
+    void queueGenerationalDrainClose();
     bool exportInProgress_ = false;
     bool exportLockPending_ = false;
     bool exportCloseRequested_ = false;
     bool exportUncertain_ = false;
+    bool generationalCloseDrainRequested_ = false;
+    bool generationalDrainCloseQueued_ = false;
     QPointer<services::BackupJob> backupJob_;
     services::AutomaticBackupCoordinator* automaticBackup_ = nullptr;
     // Independent modeless window: lockVault must not reject/cancel a keyless
