@@ -30,7 +30,7 @@ protected:
     {
         window.reset();
         QApplication::processEvents();
-        window = std::make_unique<MainWindow>();
+        window = MainWindow::createForHistoricalTests();
         window->setLifecycleProtectionValidator([] { return true; }, [] {});
         window->setLifecycleProtectionAvailable(true);
     }

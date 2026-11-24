@@ -34,21 +34,29 @@ GlobalBackupPreferencesResult result(
     return {status, std::move(preferences), std::move(diagnostic)};
 }
 
-bool validRootDirectory(const QString& path)
+QString validationDiagnostic(const GlobalBackupPreferences& preferences)
 {
-    if (path.isEmpty() || path.contains(QChar{}) || !QDir::isAbsolutePath(path)
-        || QDir::cleanPath(path) != path || QFileInfo(path).isRoot())
-        return false;
+    const QString& path = preferences.rootDirectory;
+    if (path.isEmpty())
+        return QStringLiteral("Choisissez un dossier racine pour les sauvegardes.");
+    if (path.contains(QChar{}))
+        return QStringLiteral("Le chemin du dossier contient un caractère interdit.");
+    if (!QDir::isAbsolutePath(path))
+        return QStringLiteral("Le dossier de sauvegarde doit utiliser un chemin absolu.");
+    if (QDir::cleanPath(path) != path)
+        return QStringLiteral("Le chemin du dossier doit être normalisé, sans composant redondant.");
+    if (QFileInfo(path).isRoot())
+        return QStringLiteral("La racine du système de fichiers ne peut pas servir de dossier de sauvegarde.");
 
     const QFileInfo existing(path);
-    return !existing.exists() || (!existing.isSymLink() && existing.isDir());
-}
-
-bool validPreferences(const GlobalBackupPreferences& preferences)
-{
-    return validRootDirectory(preferences.rootDirectory)
-        && preferences.retainedVersions
-            >= GlobalBackupPreferencesStore::MinimumRetainedVersions;
+    if (existing.isSymLink())
+        return QStringLiteral("Le dossier de sauvegarde ne doit pas être un lien symbolique.");
+    if (existing.exists() && !existing.isDir())
+        return QStringLiteral("Le chemin choisi ne désigne pas un dossier.");
+    if (preferences.retainedVersions
+        < GlobalBackupPreferencesStore::MinimumRetainedVersions)
+        return QStringLiteral("Le nombre de versions conservées doit être au moins égal à sept.");
+    return {};
 }
 
 bool canonicalUnsigned(const QVariant& value, quint64& output)
@@ -94,7 +102,7 @@ GlobalBackupPreferencesResult parseSettings(const QByteArray& bytes)
     if (!versionOk || version != FormatVersion
         || !canonicalUnsigned(settings.value(RetainedVersionsKey),
             preferences.retainedVersions)
-        || !validPreferences(preferences))
+        || !validationDiagnostic(preferences).isEmpty())
         return result(GlobalBackupPreferencesStatus::Invalid,
             QStringLiteral("Configuration globale invalide."));
 
@@ -139,10 +147,21 @@ GlobalBackupPreferencesResult readPhysicalFile(const QString& path)
         || before.st_dev != after.st_dev || before.st_ino != after.st_ino
         || before.st_size != after.st_size
         || before.st_mtim.tv_sec != after.st_mtim.tv_sec
-        || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec)
+        || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec
+        || before.st_ctim.tv_sec != after.st_ctim.tv_sec
+        || before.st_ctim.tv_nsec != after.st_ctim.tv_nsec)
         return result(GlobalBackupPreferencesStatus::ReadError,
             QStringLiteral("Lecture stable des préférences globales impossible."));
-    return parseSettings(bytes);
+    auto parsed = parseSettings(bytes);
+    parsed.sourceIdentity = GlobalBackupPreferencesFileIdentity{
+        static_cast<quint64>(after.st_dev),
+        static_cast<quint64>(after.st_ino),
+        static_cast<quint64>(after.st_size),
+        static_cast<qint64>(after.st_mtim.tv_sec),
+        static_cast<quint32>(after.st_mtim.tv_nsec),
+        static_cast<qint64>(after.st_ctim.tv_sec),
+        static_cast<quint32>(after.st_ctim.tv_nsec)};
+    return parsed;
 #else
     if (information.isSymLink() || !information.isFile()
         || information.size() < 0 || information.size() > MaximumSettingsBytes)
@@ -266,6 +285,15 @@ GlobalBackupPreferencesResult GlobalBackupPreferencesStore::load() const
     return loaded;
 }
 
+GlobalBackupPreferencesResult GlobalBackupPreferencesStore::validate(
+    const GlobalBackupPreferences& preferences)
+{
+    const QString diagnostic = validationDiagnostic(preferences);
+    return diagnostic.isEmpty()
+        ? result(GlobalBackupPreferencesStatus::Valid, {}, preferences)
+        : result(GlobalBackupPreferencesStatus::Invalid, diagnostic, preferences);
+}
+
 GlobalBackupPreferencesResult GlobalBackupPreferencesStore::save(
     const GlobalBackupPreferences& preferences) const
 {
@@ -273,9 +301,8 @@ GlobalBackupPreferencesResult GlobalBackupPreferencesStore::save(
         value.sourceFile = settingsFile_;
         return value;
     };
-    if (!validPreferences(preferences))
-        return sourced(result(GlobalBackupPreferencesStatus::Invalid,
-            QStringLiteral("Préférences globales invalides."), preferences));
+    auto validation = validate(preferences);
+    if (!validation.valid()) return sourced(std::move(validation));
 
     QString diagnostic;
     if (!prepareParentDirectory(settingsFile_, diagnostic)

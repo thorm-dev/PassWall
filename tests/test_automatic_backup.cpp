@@ -16,7 +16,6 @@
 #include <QJsonArray>
 #include <QCryptographicHash>
 #include <QProcess>
-#include <QSemaphore>
 #include <QSettings>
 #include <QTemporaryDir>
 #include <QThread>
@@ -34,7 +33,6 @@
 #include <functional>
 #include <cstdio>
 #include <algorithm>
-#include <atomic>
 #include <memory>
 #include <stdexcept>
 
@@ -63,60 +61,6 @@ bool workerMarkerWithoutQtEvents(const QString& marker)
     while (!QFileInfo::exists(marker) && elapsed.elapsed() < 5000)
         QThread::msleep(1);
     return QFileInfo::exists(marker);
-}
-bool initialInspectionRemainsCurrent(
-    void*, quint64, InitialBackupCheckpoint) noexcept
-{
-    return false;
-}
-struct CommitDuringInitialInspection {
-    QString path;
-    passwall::core::SecureBuffer* key = nullptr;
-    bool attempted = false;
-    bool committed = false;
-};
-
-struct AsyncInitialInspectionBarrier {
-    InitialBackupCheckpoint checkpoint = InitialBackupCheckpoint::BeforeInspection;
-    QSemaphore entered;
-    QSemaphore resume;
-    std::atomic_bool blocked{false};
-    ~AsyncInitialInspectionBarrier() { resume.release(); }
-};
-bool waitAtInitialInspectionCheckpoint(
-    void* raw, quint64, InitialBackupCheckpoint checkpoint) noexcept
-{
-    auto& barrier = *static_cast<AsyncInitialInspectionBarrier*>(raw);
-    bool expected = false;
-    if (checkpoint == barrier.checkpoint
-        && barrier.blocked.compare_exchange_strong(expected, true)) {
-        barrier.entered.release();
-        barrier.resume.acquire();
-    }
-    return false;
-}
-bool commitDuringInitialInspection(
-    void* raw, quint64, InitialBackupCheckpoint checkpoint) noexcept
-{
-    auto& context = *static_cast<CommitDuringInitialInspection*>(raw);
-    if (checkpoint != InitialBackupCheckpoint::BeforeDestinationPreparation
-        || context.attempted)
-        return false;
-    context.attempted = true;
-    try {
-        passwall::models::Credential credential;
-        credential.title = "Fictitious concurrent mutation";
-        credential.username = "fictitious-concurrent-user";
-        credential.password = "fictitious-concurrent-password";
-        std::string error;
-        context.committed = context.key != nullptr
-            && CredentialService::add(
-                context.path.toStdString(), *context.key, credential, error);
-        sodium_memzero(credential.password.data(), credential.password.size());
-    } catch (...) {
-        context.committed = false;
-    }
-    return false;
 }
 void touch(const QString& path, const QByteArray& value = {})
 {
@@ -207,16 +151,15 @@ protected:
     QVector<MutationBackupResult> mutationBatchResults;
     QVector<MutationBackupPublicationReceipt> mutationPublicationReceipts;
     QVector<QString> mutationBatchDiagnostics;
-    QVector<InitialBackupInspectionResult> initialInspectionResults;
     QVector<GenerationalBackupSuspensionState> generationalSuspensions;
     QVector<GenerationalShutdownDrainState> generationalShutdownDrainStates;
-    QVector<QString> initialCopyResumeRequests;
-    QVector<QString> globalBackupReinspectionRequests;
-    bool initialInspectionSettledOnOwnerThread = true;
     BackupResult last;
     QString message;
     QVector<RotationResult> rotations;
     BackupTriggerMode triggerMode = BackupTriggerMode::Historical;
+    BackupInstallationIdentity installationIdentity{
+        BackupInstallationIdentityDomain::LinuxSystemdMachineAppSpecificV1,
+        QByteArray(BackupSeriesIdentityService::InstallationIdentitySize, '\x6d')};
     bool completionWhileReserved = false, terminationReleasedReservation = false;
     void SetUp() override
     {
@@ -287,14 +230,6 @@ protected:
                     mutationPublicationReceipts.push_back(*result.publication);
                 mutationBatchResults.push_back(std::move(result));
             });
-        QObject::connect(coordinator.get(),
-            &AutomaticBackupCoordinator::initialBackupInspectionSettled,
-            coordinator.get(), [this](InitialBackupInspectionResult result) {
-                initialInspectionSettledOnOwnerThread =
-                    initialInspectionSettledOnOwnerThread
-                    && QThread::currentThread() == coordinator->thread();
-                initialInspectionResults.push_back(std::move(result));
-            });
         QObject::connect(coordinator.get(), &AutomaticBackupCoordinator::mutationBatchDiagnostic,
             coordinator.get(), [this](const QString&, quint64, const QString& diagnostic) {
                 mutationBatchDiagnostics.push_back(diagnostic);
@@ -308,16 +243,6 @@ protected:
             &AutomaticBackupCoordinator::generationalShutdownDrainChanged,
             coordinator.get(), [this](GenerationalShutdownDrainState state) {
                 generationalShutdownDrainStates.push_back(std::move(state));
-            });
-        QObject::connect(coordinator.get(),
-            &AutomaticBackupCoordinator::generationalInitialCopyResumeRequested,
-            coordinator.get(), [this](const QString& path) {
-                initialCopyResumeRequests.push_back(path);
-            });
-        QObject::connect(coordinator.get(),
-            &AutomaticBackupCoordinator::globalBackupReinspectionRequested,
-            coordinator.get(), [this](const QString& path) {
-                globalBackupReinspectionRequests.push_back(path);
             });
     }
     void fake(const QByteArray& mode, int mutationGroupingDelayMs = 20000,
@@ -357,26 +282,15 @@ protected:
         ADD_FAILURE() << "Fictitious record missing";
         throw std::runtime_error("Fictitious test registry unavailable");
     }
-    void mutate()
+    void mutate(BackupTriggerMode mode = BackupTriggerMode::Historical)
     {
         passwall::models::Credential credential;
         credential.title = "Fictitious title"; credential.username = "fictitious-user";
         credential.password = "fictitious-only-password";
         std::string failure;
-        ASSERT_TRUE(CredentialService::add(source.toStdString(), key, credential, failure)) << failure;
+        ASSERT_TRUE(CredentialService::add(
+            source.toStdString(), key, credential, failure, mode)) << failure;
         sodium_memzero(credential.password.data(), credential.password.size());
-    }
-    InitialBackupPreparation prepareInitialCopy(
-        quint64 sessionGeneration, bool forceInitialCopy = false)
-    {
-        GlobalBackupPreferencesResult preferences;
-        preferences.status = GlobalBackupPreferencesStatus::Valid;
-        preferences.preferences = {destination, 7};
-        AuthenticatedBackupSession session{
-            original.file, sessionGeneration, 0, true, forceInitialCopy};
-        return InitialBackupPreparer::prepare(preferences, session,
-            QDateTime(QDate(2026, 11, 21), QTime(10, 11, 12), QTimeZone::utc()),
-            InitialBackupCancellation{initialInspectionRemainsCurrent, nullptr});
     }
     GlobalBackupPreferencesResult initialPreferences(
         const QString& root = {}) const
@@ -387,21 +301,17 @@ protected:
             root.isEmpty() ? destination : root, 7};
         return preferences;
     }
-    AuthenticatedBackupSession authenticatedSession(
-        quint64 sessionGeneration) const
+    bool prepareDestination(const GlobalBackupPreferencesResult& preferences,
+        quint64 generation, PreparedBackupDestination& output)
     {
-        return {original.file, sessionGeneration, 0, true};
+        return BackupDestinationPreparer::prepare(preferences, original.file,
+            generation, preparationTime(), output, error,
+            nullptr, nullptr, nullptr, nullptr, &installationIdentity);
     }
-    static QDateTime initialInspectionTime()
+    static QDateTime preparationTime()
     {
         return QDateTime(QDate(2026, 11, 21), QTime(10, 11, 14),
             QTimeZone::utc());
-    }
-    InitialBackupAdmission initialAdmission(
-        quint64 sessionGeneration, quint64 inspectionActivityId = 0) const
-    {
-        return {original.file, sessionGeneration, BackupTriggerMode::Generational,
-            true, false, true, inspectionActivityId};
     }
     QString replaceSourceWithAnotherVault()
     {
@@ -494,9 +404,170 @@ TEST_F(AutomaticBackupTest, HistoricalModeIsDefaultAndRejectsGenerationalEntries
     EXPECT_FALSE(coordinator->markMutationBackupStarted(1, source, 1));
     EXPECT_FALSE(coordinator->generationalBackupSuspension(source).suspended);
     EXPECT_FALSE(coordinator->resumeGenerationalBackup(source, error));
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(source, error));
     EXPECT_FALSE(coordinator->beginGenerationalShutdownDrain(error));
     EXPECT_EQ(coordinator->generationalShutdownDrainState().status,
         GenerationalShutdownDrainStatus::NotRequested);
+    EXPECT_TRUE(QDir(destination).entryList(
+        QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty());
+}
+
+TEST_F(GenerationalAutomaticBackupTest,
+    VoluntaryBackupWithoutNewCommitUsesRealSnapshotAndKeepsMutationTrackingClean)
+{
+    mutate(); // The populated vault predates the authenticated coordinator.
+    control(QString::fromLatin1(AUTO_REAL_WORKER), 20000);
+    const QByteArray originalRows = encryptedRows(source);
+    ASSERT_FALSE(originalRows.isEmpty());
+    EXPECT_EQ(coordinator->mutationGeneration(), 0U);
+    ASSERT_TRUE(coordinator->requestGenerationalBackup(source, error))
+        << error.toStdString();
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(source, error));
+    EXPECT_FALSE(coordinator->modificationGroupingPending());
+    EXPECT_EQ(coordinator->mutationGeneration(), 0U);
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(source, error));
+    const quint64 generation = mutationBatchGenerations[0];
+    EXPECT_NE(generation, 0U);
+    PreparedBackupDestination prepared;
+    ASSERT_TRUE(prepareDestination(initialPreferences(), generation, prepared))
+        << error.toStdString();
+    ASSERT_TRUE(coordinator->startPreparedMutationBackupSnapshot(
+        mutationBatchRequestIds[0], source, generation, std::move(prepared), error))
+        << error.toStdString();
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(source, error));
+    ASSERT_TRUE(until([&] { return mutationBatchResults.size() == 1; }, 5000));
+    ASSERT_EQ(mutationBatchResults[0].outcome, MutationBackupOutcome::Published)
+        << mutationBatchResults[0].diagnostic.toStdString();
+    ASSERT_TRUE(mutationBatchResults[0].publication.has_value());
+    EXPECT_TRUE(mutationBatchResults[0].workerTerminated);
+    EXPECT_EQ(encryptedRows(mutationBatchResults[0].publication->destination), originalRows);
+    EXPECT_EQ(encryptedRows(source), originalRows);
+    EXPECT_EQ(coordinator->mutationGeneration(), 0U);
+    EXPECT_FALSE(coordinator->modificationGroupingPending());
+
+    // The user may request another copy even without a subsequent commit.
+    ASSERT_TRUE(coordinator->requestGenerationalBackup(source, error))
+        << error.toStdString();
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 2; }, 1000));
+    const quint64 secondGeneration = mutationBatchGenerations[1];
+    EXPECT_GT(secondGeneration, generation);
+    const QString secondTarget = destination + QStringLiteral("second-manual.pwdb");
+    ASSERT_TRUE(coordinator->markMutationBackupStarted(
+        mutationBatchRequestIds[1], source, secondGeneration, secondTarget));
+    ASSERT_TRUE(coordinator->markMutationBackupFinished(
+        mutationBatchRequestIds[1], MutationBackupOutcome::Published,
+        simulatedReceipt(1, secondTarget)));
+    EXPECT_EQ(coordinator->mutationGeneration(), 0U);
+    EXPECT_FALSE(coordinator->modificationGroupingPending());
+
+    // A genuine subsequent commit must have a strictly newer binding.
+    mutate();
+    EXPECT_GT(coordinator->mutationGeneration(), secondGeneration);
+    EXPECT_TRUE(coordinator->modificationGroupingPending());
+    coordinator->requestPendingMutationsForLock(source);
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 3; }, 1000));
+    EXPECT_GT(mutationBatchGenerations[2], secondGeneration);
+}
+
+TEST_F(GenerationalAutomaticBackupTest,
+    VoluntaryBackupAcceleratesPendingCommitsAndPreservesLaterGeneration)
+{
+    control(QString::fromLatin1(AUTO_REAL_WORKER), 20000);
+    mutate();
+    mutate();
+    ASSERT_TRUE(coordinator->modificationGroupingPending());
+    const quint64 covered = coordinator->mutationGeneration();
+    ASSERT_TRUE(coordinator->requestGenerationalBackup(source, error))
+        << error.toStdString();
+    EXPECT_FALSE(coordinator->modificationGroupingPending());
+    EXPECT_EQ(coordinator->mutationGeneration(), covered);
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
+    EXPECT_EQ(mutationBatchGenerations[0], covered);
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(source, error));
+    const QString target = destination + QStringLiteral("manual-first.pwdb");
+    ASSERT_TRUE(coordinator->markMutationBackupStarted(
+        mutationBatchRequestIds[0], source, covered, target));
+    mutate();
+    const quint64 later = coordinator->mutationGeneration();
+    EXPECT_GT(later, covered);
+    coordinator->requestPendingMutationsForLock(source);
+    ASSERT_TRUE(coordinator->markMutationBackupFinished(
+        mutationBatchRequestIds[0], MutationBackupOutcome::Published,
+        simulatedReceipt(0, target)));
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 2; }, 1000));
+    EXPECT_EQ(mutationBatchGenerations[1], later);
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(source, error));
+}
+
+TEST_F(GenerationalAutomaticBackupTest,
+    VoluntaryBackupRefusesWrongSessionInvalidConfigurationAndManualReservation)
+{
+    control(QString::fromLatin1(AUTO_REAL_WORKER), 20000);
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(
+        temporary.filePath(QStringLiteral("another.pwdb")), error));
+    coordinator->requireGlobalBackupPreferencesInitialization();
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(source, error));
+    coordinator->applyGlobalBackupPreferences(initialPreferences());
+    auto exportAdmission = coordinator->acquireUserOperation(
+        BackupUserOperation::ManualExport, source, error);
+    ASSERT_TRUE(exportAdmission.valid()) << error.toStdString();
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(source, error));
+    exportAdmission = {};
+    coordinator->requestPendingMutationsForLock(source);
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(source, error));
+    QCoreApplication::processEvents();
+    EXPECT_EQ(mutationBatchRequests, 0);
+    coordinator->trackVault(original);
+    // Explicit requests are allowed even for an empty authenticated vault.
+    ASSERT_TRUE(coordinator->requestGenerationalBackup(source, error))
+        << error.toStdString();
+    coordinator->requestPendingMutationsForLock(source);
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(source, error));
+    EXPECT_EQ(coordinator->mutationGeneration(), 0U);
+}
+
+TEST_F(GenerationalAutomaticBackupTest,
+    VoluntaryBackupFailureSuspendsAndRequiresTheExistingExplicitRetry)
+{
+    control(QString::fromLatin1(AUTO_REAL_WORKER), 20000);
+    ASSERT_TRUE(coordinator->requestGenerationalBackup(source, error))
+        << error.toStdString();
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
+    ASSERT_TRUE(coordinator->failMutationBackupPreparation(
+        mutationBatchRequestIds[0], source, mutationBatchGenerations[0],
+        QStringLiteral("Destination fictivement indisponible.")));
+    ASSERT_EQ(mutationBatchOutcomes.size(), 1);
+    EXPECT_EQ(mutationBatchOutcomes[0], MutationBackupOutcome::Failed);
+    EXPECT_TRUE(coordinator->generationalBackupSuspension(source).suspended);
+    EXPECT_FALSE(coordinator->requestGenerationalBackup(source, error));
+    QCoreApplication::processEvents();
+    EXPECT_EQ(mutationBatchRequests, 1);
+    ASSERT_TRUE(coordinator->resumeGenerationalBackup(source, error))
+        << error.toStdString();
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 2; }, 1000));
+    EXPECT_NE(mutationBatchRequestIds[0], mutationBatchRequestIds[1]);
+    EXPECT_EQ(mutationBatchGenerations[0], mutationBatchGenerations[1]);
+}
+
+TEST_F(GenerationalAutomaticBackupTest,
+    VoluntaryBackupPreparationRejectsSubstitutedAuthenticatedSource)
+{
+    control(QString::fromLatin1(AUTO_REAL_WORKER), 20000);
+    ASSERT_TRUE(coordinator->requestGenerationalBackup(source, error))
+        << error.toStdString();
+    ASSERT_TRUE(QFileInfo::exists(replaceSourceWithAnotherVault()));
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
+    PreparedBackupDestination prepared;
+    EXPECT_FALSE(prepareDestination(initialPreferences(),
+        mutationBatchGenerations[0], prepared));
+    ASSERT_FALSE(error.isEmpty());
+    EXPECT_TRUE(coordinator->failMutationBackupPreparation(
+        mutationBatchRequestIds[0], source, mutationBatchGenerations[0], error));
+    EXPECT_FALSE(coordinator->isActive());
+    EXPECT_TRUE(QDir(destination).entryList(
+        QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty());
 }
 
 TEST_F(GenerationalAutomaticBackupTest, GenerationalModeRejectsEveryHistoricalEntryWithoutFallback)
@@ -522,281 +593,78 @@ TEST_F(GenerationalAutomaticBackupTest, GenerationalModeRejectsEveryHistoricalEn
     EXPECT_FALSE(coordinator->isActive());
 }
 
-TEST_F(GenerationalAutomaticBackupTest, InitialCopyAloneIsOfferedWithSessionBinding)
-{
-    mutate(); // Populate before the coordinator starts observing commits.
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    auto preparation = prepareInitialCopy(71);
-    ASSERT_EQ(preparation.decision, InitialBackupDecision::Prepared)
-        << preparation.diagnostic.toStdString();
-    ASSERT_TRUE(preparation.request.has_value());
-
-    EXPECT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(71), error),
-        InitialBackupArbitration::Offered) << error.toStdString();
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-    ASSERT_EQ(generationalRequestKinds.size(), 1);
-    EXPECT_EQ(generationalRequestKinds[0], GenerationalBackupRequestKind::InitialCopy);
-    EXPECT_EQ(mutationBatchGenerations[0], 0U);
-    EXPECT_EQ(generationalSessionGenerations[0], 71U);
-    EXPECT_FALSE(coordinator->isActive());
-
-    const quint64 requestId = mutationBatchRequestIds[0];
-    QString startError;
-    EXPECT_FALSE(coordinator->startMutationBackupSnapshot(requestId, source, 0,
-        destination + QStringLiteral("/must-not-start.pwdb"), {}, {}, startError));
-    EXPECT_FALSE(startError.isEmpty());
-    EXPECT_FALSE(coordinator->isActive());
-    EXPECT_TRUE(mutationBatchResults.empty());
-    coordinator->shutdown();
-    EXPECT_TRUE(invalidatedGenerationalRequests.contains(requestId));
-    ASSERT_EQ(mutationBatchResults.size(), 1);
-    EXPECT_EQ(mutationBatchResults[0].kind,
-	      GenerationalBackupRequestKind::InitialCopy);
-    EXPECT_EQ(mutationBatchResults[0].outcome, MutationBackupOutcome::Failed);
-    EXPECT_EQ(mutationBatchResults[0].workerOutcome,
-	      BackupOutcome::CancelledBeforePublication);
-    VaultOperationGuard exclusive;
-    std::string reservationError;
-    EXPECT_TRUE(exclusive.tryReserve(source.toStdString(), reservationError))
-        << reservationError;
-}
-
-TEST_F(GenerationalAutomaticBackupTest, PendingCrudGenerationCoversInitialCopyAtAdmission)
+TEST_F(GenerationalAutomaticBackupTest,
+    RequiredGlobalPreferencesInitializationRetainsCrudWithoutOfferingWork)
 {
     control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    mutate();
-    auto preparation = prepareInitialCopy(72);
-    ASSERT_TRUE(preparation.request.has_value());
+    coordinator->requireGlobalBackupPreferencesInitialization();
 
-    EXPECT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(72), error),
-        InitialBackupArbitration::MergedWithExistingRequest) << error.toStdString();
-    EXPECT_EQ(mutationBatchRequests, 0);
-    VaultOperationGuard releasedInitialCopy;
-    std::string reservationError;
-    EXPECT_TRUE(releasedInitialCopy.tryReserve(source.toStdString(), reservationError))
-        << reservationError;
-    releasedInitialCopy.reset();
+    mutate(BackupTriggerMode::Generational);
+    EXPECT_EQ(coordinator->mutationGeneration(), 1U);
     coordinator->requestPendingMutationsForLock(source);
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-    EXPECT_EQ(generationalRequestKinds[0],
-        GenerationalBackupRequestKind::CrudGeneration);
-    EXPECT_EQ(mutationBatchGenerations[0], 1U);
-    EXPECT_EQ(generationalSessionGenerations[0], 0U);
-}
-
-TEST_F(GenerationalAutomaticBackupTest, CommitDuringInitialInspectionIsMergedAtOwnerAdmission)
-{
-    mutate(); // The inspected vault must already be populated.
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    GlobalBackupPreferencesResult preferences;
-    preferences.status = GlobalBackupPreferencesStatus::Valid;
-    preferences.preferences = {destination, 7};
-    AuthenticatedBackupSession session{original.file, 73, 0, true};
-    CommitDuringInitialInspection concurrent{source, &key};
-
-    auto preparation = InitialBackupPreparer::prepare(preferences, session,
-        QDateTime(QDate(2026, 11, 21), QTime(10, 11, 13), QTimeZone::utc()),
-        InitialBackupCancellation{commitDuringInitialInspection, &concurrent});
-    ASSERT_TRUE(concurrent.attempted);
-    ASSERT_TRUE(concurrent.committed);
-    ASSERT_EQ(preparation.decision, InitialBackupDecision::Prepared)
-        << preparation.diagnostic.toStdString();
-    ASSERT_TRUE(preparation.request.has_value());
-
-    EXPECT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(73), error),
-        InitialBackupArbitration::MergedWithExistingRequest) << error.toStdString();
-    coordinator->requestPendingMutationsForLock(source);
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-    EXPECT_EQ(generationalRequestKinds[0],
-        GenerationalBackupRequestKind::CrudGeneration);
-    EXPECT_EQ(mutationBatchGenerations[0], 1U);
-}
-
-TEST_F(GenerationalAutomaticBackupTest, CommitBetweenPreparationAndAdmissionWinsArbitration)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    auto preparation = prepareInitialCopy(74);
-    ASSERT_TRUE(preparation.request.has_value());
-    mutate();
-
-    EXPECT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(74), error),
-        InitialBackupArbitration::MergedWithExistingRequest) << error.toStdString();
-    coordinator->requestPendingMutationsForLock(source);
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-    EXPECT_EQ(generationalRequestKinds[0],
-        GenerationalBackupRequestKind::CrudGeneration);
-    EXPECT_EQ(mutationBatchGenerations[0], 1U);
-}
-
-TEST_F(GenerationalAutomaticBackupTest, CommitReplacesOfferedInitialCopyWithoutDoubleRequest)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    auto preparation = prepareInitialCopy(75);
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(75), error),
-        InitialBackupArbitration::Offered) << error.toStdString();
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-    ASSERT_EQ(generationalRequestKinds[0], GenerationalBackupRequestKind::InitialCopy);
-    const quint64 obsoleteInitialToken = mutationBatchRequestIds[0];
-
-    mutate();
-    ASSERT_EQ(invalidatedGenerationalRequests.size(), 1);
-    EXPECT_EQ(invalidatedGenerationalRequests[0], obsoleteInitialToken);
-    EXPECT_TRUE(coordinator->modificationGroupingPending());
-    EXPECT_EQ(mutationBatchRequests, 1);
-    coordinator->requestPendingMutationsForLock(source);
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 2; }, 1000));
-    EXPECT_EQ(generationalRequestKinds[1],
-        GenerationalBackupRequestKind::CrudGeneration);
-    EXPECT_EQ(mutationBatchGenerations[1], 1U);
-    EXPECT_NE(mutationBatchRequestIds[1], obsoleteInitialToken);
-    EXPECT_FALSE(coordinator->isActive());
-
-    VaultOperationGuard exclusive;
-    std::string reservationError;
-    EXPECT_TRUE(exclusive.tryReserve(source.toStdString(), reservationError))
-        << reservationError;
-}
-
-TEST_F(GenerationalAutomaticBackupTest, SeveralCommitsAfterInitialOfferRemainOneMonotoneCrudRequest)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    auto preparation = prepareInitialCopy(76);
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(76), error),
-        InitialBackupArbitration::Offered);
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-
-    mutate();
-    mutate();
-    mutate();
-    coordinator->requestPendingMutationsForLock(source);
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 2; }, 1000));
-    EXPECT_EQ(generationalRequestKinds[1],
-        GenerationalBackupRequestKind::CrudGeneration);
-    EXPECT_EQ(mutationBatchGenerations[1], 3U);
-    EXPECT_EQ(invalidatedGenerationalRequests.size(), 1);
+    QCoreApplication::sendPostedEvents();
     QCoreApplication::processEvents();
-    EXPECT_EQ(mutationBatchRequests, 2);
-}
-
-TEST_F(GenerationalAutomaticBackupTest, ChangedOrClosingSessionRefusesInitialAdmissionAndReleasesGuard)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    for (const bool closing : {false, true}) {
-        auto preparation = prepareInitialCopy(closing ? 78 : 77);
-        ASSERT_TRUE(preparation.request.has_value());
-        auto admission = initialAdmission(closing ? 78 : 77);
-        admission.closing = closing;
-        if (!closing) {
-            admission.sessionCurrent = false;
-            ++admission.currentSessionGeneration;
-        }
-        EXPECT_EQ(coordinator->admitInitialBackup(
-            std::move(*preparation.request), admission, error),
-            InitialBackupArbitration::Refused);
-        VaultOperationGuard exclusive;
-        std::string reservationError;
-        EXPECT_TRUE(exclusive.tryReserve(source.toStdString(), reservationError))
-            << reservationError;
-    }
     EXPECT_EQ(mutationBatchRequests, 0);
-}
+    EXPECT_TRUE(mutationBatchResults.isEmpty());
+    EXPECT_FALSE(coordinator->generationalBackupSuspension(source).suspended);
 
-TEST_F(AutomaticBackupTest, HistoricalModeRefusesInitialCopyWithoutAnOffer)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    auto preparation = prepareInitialCopy(79);
-    ASSERT_TRUE(preparation.request.has_value());
-    auto admission = initialAdmission(79);
-    admission.triggerMode = BackupTriggerMode::Historical;
-
-    EXPECT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), admission, error),
-        InitialBackupArbitration::Refused);
+    GlobalBackupPreferencesResult absent;
+    absent.status = GlobalBackupPreferencesStatus::Absent;
+    absent.sourceFile = GlobalBackupPreferencesStore().fileName();
+    coordinator->applyGlobalBackupPreferences(absent);
+    QCoreApplication::processEvents();
     EXPECT_EQ(mutationBatchRequests, 0);
-    EXPECT_FALSE(coordinator->isActive());
+    EXPECT_TRUE(mutationBatchResults.isEmpty());
+
+    GlobalBackupPreferencesResult invalid = absent;
+    invalid.status = GlobalBackupPreferencesStatus::Invalid;
+    invalid.diagnostic = QStringLiteral("Configuration fictive invalide.");
+    coordinator->applyGlobalBackupPreferences(invalid);
+    QCoreApplication::processEvents();
+    EXPECT_EQ(mutationBatchRequests, 0);
+    EXPECT_TRUE(mutationBatchResults.isEmpty());
+    EXPECT_FALSE(coordinator->generationalBackupSuspension(source).suspended);
+
+    coordinator->applyGlobalBackupPreferences(initialPreferences());
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
+    ASSERT_EQ(mutationBatchGenerations.size(), 1);
+    EXPECT_EQ(mutationBatchGenerations.front(), 1U);
+    EXPECT_EQ(generationalRequestKinds.front(),
+        GenerationalBackupRequestKind::CrudGeneration);
+    EXPECT_TRUE(mutationBatchResults.isEmpty());
 }
 
-TEST_F(GenerationalAutomaticBackupTest, UserOperationsAreRefusedDuringInitialInspection)
+TEST_F(GenerationalAutomaticBackupTest, PreparedCrudDestinationHoldsReservationUntilRaiiRelease)
 {
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    const quint64 activity = coordinator->beginInitialBackupInspection(
-        original.file, 81, error);
-    ASSERT_NE(activity, 0U) << error.toStdString();
-
-    const auto exportAdmission = coordinator->admitUserOperation(
-        BackupUserOperation::ManualExport, source);
-    EXPECT_FALSE(exportAdmission.compatible);
-    EXPECT_EQ(exportAdmission.blockingState.phase,
-        GenerationalOperationPhase::Inspecting);
-    const auto restoreAdmission = coordinator->admitUserOperation(
-        BackupUserOperation::Restoration, source);
-    EXPECT_FALSE(restoreAdmission.compatible);
-    EXPECT_FALSE(restoreAdmission.diagnostic.isEmpty());
-
-    EXPECT_TRUE(coordinator->cancelInitialBackupInspection(activity));
-    EXPECT_TRUE(coordinator->admitUserOperation(
-        BackupUserOperation::ManualExport, source).compatible);
-    EXPECT_EQ(coordinator->generationalOperationState(source).phase,
-        GenerationalOperationPhase::Cancelled);
-}
-
-TEST_F(GenerationalAutomaticBackupTest, PreparedDestinationBlocksExportUntilRaiiRelease)
-{
+    control(QString::fromLatin1(AUTO_REAL_WORKER), 20);
     mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    const quint64 activity = coordinator->beginInitialBackupInspection(
-        original.file, 82, error);
-    ASSERT_NE(activity, 0U) << error.toStdString();
-    auto preparation = prepareInitialCopy(82);
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_TRUE(coordinator->markInitialBackupPrepared(
-        activity, std::move(*preparation.request), error)) << error.toStdString();
-
-    const auto state = coordinator->generationalOperationState(source);
-    EXPECT_EQ(state.phase, GenerationalOperationPhase::PreparedReservation);
-    EXPECT_TRUE(state.reservationHeld);
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
+    PreparedBackupDestination prepared;
+    ASSERT_TRUE(prepareDestination(initialPreferences(), mutationBatchGenerations[0], prepared))
+        << error.toStdString();
     EXPECT_FALSE(coordinator->admitUserOperation(
         BackupUserOperation::ManualExport, source).compatible);
     VaultOperationGuard exclusive;
     std::string reservationError;
     EXPECT_FALSE(exclusive.tryReserve(source.toStdString(), reservationError));
-
-    EXPECT_TRUE(coordinator->cancelInitialBackupInspection(activity));
+    prepared = {};
     EXPECT_TRUE(exclusive.tryReserve(source.toStdString(), reservationError))
         << reservationError;
 }
 
 TEST_F(GenerationalAutomaticBackupTest, RestorationPrecheckDoesNotCreateHistoricalIntent)
 {
+    control(QString::fromLatin1(AUTO_REAL_WORKER), 20);
     mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    const quint64 activity = coordinator->beginInitialBackupInspection(
-        original.file, 83, error);
-    ASSERT_NE(activity, 0U);
-    auto preparation = prepareInitialCopy(83);
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_TRUE(coordinator->markInitialBackupPrepared(
-        activity, std::move(*preparation.request), error)) << error.toStdString();
-
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
+    PreparedBackupDestination prepared;
+    ASSERT_TRUE(prepareDestination(initialPreferences(), mutationBatchGenerations[0], prepared))
+        << error.toStdString();
     ASSERT_FALSE(record().replacement.has_value());
     const auto admission = coordinator->admitUserOperation(
         BackupUserOperation::Restoration, source);
     EXPECT_FALSE(admission.compatible);
-    EXPECT_EQ(admission.blockingState.phase,
-        GenerationalOperationPhase::PreparedReservation);
+    EXPECT_EQ(admission.blockingState.phase, GenerationalOperationPhase::OfferedRequest);
     EXPECT_FALSE(record().replacement.has_value());
     auto ownedAdmission = coordinator->acquireUserOperation(
         BackupUserOperation::Restoration, source, error);
@@ -806,30 +674,20 @@ TEST_F(GenerationalAutomaticBackupTest, RestorationPrecheckDoesNotCreateHistoric
     std::string reservationError;
     EXPECT_FALSE(finalReservation.tryReserve(source.toStdString(), reservationError));
     EXPECT_FALSE(record().replacement.has_value());
-
-    EXPECT_TRUE(coordinator->cancelInitialBackupInspection(activity));
+    prepared = {};
+    EXPECT_TRUE(finalReservation.tryReserve(source.toStdString(), reservationError));
 }
 
-TEST_F(GenerationalAutomaticBackupTest, OfferedInitialCopyIsNotReportedAsAWorker)
+TEST_F(GenerationalAutomaticBackupTest, OfferedCrudRequestIsNotReportedAsAWorker)
 {
+    control(QString::fromLatin1(AUTO_REAL_WORKER), 20);
     mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    const quint64 activity = coordinator->beginInitialBackupInspection(
-        original.file, 84, error);
-    ASSERT_NE(activity, 0U);
-    auto preparation = prepareInitialCopy(84);
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_TRUE(coordinator->markInitialBackupPrepared(
-        activity, std::move(*preparation.request), error));
-    ASSERT_EQ(coordinator->admitPreparedInitialBackup(
-        activity, initialAdmission(84), error), InitialBackupArbitration::Offered)
-        << error.toStdString();
     ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-
     const auto state = coordinator->generationalOperationState(source);
     EXPECT_EQ(state.phase, GenerationalOperationPhase::OfferedRequest);
-    EXPECT_EQ(state.kind, GenerationalBackupRequestKind::InitialCopy);
-    EXPECT_TRUE(state.reservationHeld);
+    EXPECT_EQ(state.kind, GenerationalBackupRequestKind::CrudGeneration);
+    EXPECT_EQ(state.mutationGeneration, mutationBatchGenerations[0]);
+    EXPECT_FALSE(state.reservationHeld);
     EXPECT_FALSE(state.workerAlive);
     EXPECT_FALSE(coordinator->isActive());
     EXPECT_FALSE(coordinator->admitUserOperation(
@@ -838,27 +696,21 @@ TEST_F(GenerationalAutomaticBackupTest, OfferedInitialCopyIsNotReportedAsAWorker
 
 TEST_F(GenerationalAutomaticBackupTest, PrecheckCannotReplaceFinalExclusiveReservation)
 {
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
+    control(QString::fromLatin1(AUTO_REAL_WORKER), 20);
     EXPECT_TRUE(coordinator->admitUserOperation(
         BackupUserOperation::Restoration, source).compatible);
-
-    const quint64 activity = coordinator->beginInitialBackupInspection(
-        original.file, 85, error);
-    ASSERT_NE(activity, 0U);
-    auto preparation = prepareInitialCopy(85);
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_TRUE(coordinator->markInitialBackupPrepared(
-        activity, std::move(*preparation.request), error));
-
+    mutate();
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
+    PreparedBackupDestination prepared;
+    ASSERT_TRUE(prepareDestination(initialPreferences(), mutationBatchGenerations[0], prepared))
+        << error.toStdString();
     auto exactAdmission = coordinator->acquireUserOperation(
         BackupUserOperation::Restoration, source, error);
     EXPECT_FALSE(exactAdmission.valid());
-
     VaultOperationGuard finalReservation;
     std::string reservationError;
     EXPECT_FALSE(finalReservation.tryReserve(source.toStdString(), reservationError));
-    EXPECT_TRUE(coordinator->cancelInitialBackupInspection(activity));
+    prepared = {};
     EXPECT_TRUE(finalReservation.tryReserve(source.toStdString(), reservationError))
         << reservationError;
 }
@@ -909,8 +761,6 @@ TEST_F(GenerationalAutomaticBackupTest,
         ASSERT_TRUE(admission.valid()) << error.toStdString();
         EXPECT_FALSE(coordinator->admitUserOperation(
             BackupUserOperation::ManualExport, source).compatible);
-        EXPECT_EQ(coordinator->beginInitialBackupInspection(
-            original.file, 8501, error), 0U);
     }
 
     auto next = coordinator->acquireUserOperation(
@@ -1029,29 +879,6 @@ TEST_F(GenerationalAutomaticBackupTest,
     EXPECT_TRUE(current.valid()) << error.toStdString();
 }
 
-TEST_F(GenerationalAutomaticBackupTest, SessionChangeInvalidatesLateInitialPreparation)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    const quint64 activity = coordinator->beginInitialBackupInspection(
-        original.file, 86, error);
-    ASSERT_NE(activity, 0U);
-    auto preparation = prepareInitialCopy(86);
-    ASSERT_TRUE(preparation.request.has_value());
-
-    coordinator->trackVault(original); // New owner session invalidates the old activity.
-    EXPECT_FALSE(coordinator->markInitialBackupPrepared(
-        activity, std::move(*preparation.request), error));
-    EXPECT_EQ(coordinator->generationalOperationState(source).phase,
-        GenerationalOperationPhase::Cancelled);
-    EXPECT_TRUE(coordinator->admitUserOperation(
-        BackupUserOperation::Restoration, source).compatible);
-    VaultOperationGuard exclusive;
-    std::string reservationError;
-    EXPECT_TRUE(exclusive.tryReserve(source.toStdString(), reservationError))
-        << reservationError;
-}
-
 TEST_F(GenerationalAutomaticBackupTest, UnknownResultKeepsWorkerAndReservationObservableUntilExit)
 {
     fake("ignore", 20);
@@ -1115,8 +942,6 @@ TEST_F(GenerationalAutomaticBackupTest, UnknownResultKeepsWorkerAndReservationOb
 TEST_F(AutomaticBackupTest, HistoricalModeKeepsUserOperationAdmissionUnchanged)
 {
     control(QString::fromLatin1(AUTO_REAL_WORKER), 20);
-    EXPECT_EQ(coordinator->beginInitialBackupInspection(
-        original.file, 87, error), 0U);
     EXPECT_TRUE(coordinator->admitUserOperation(
         BackupUserOperation::ManualExport, source).compatible);
     EXPECT_TRUE(coordinator->admitUserOperation(
@@ -1126,125 +951,6 @@ TEST_F(AutomaticBackupTest, HistoricalModeKeepsUserOperationAdmissionUnchanged)
     EXPECT_TRUE(owned.valid()) << error.toStdString();
     EXPECT_EQ(coordinator->generationalOperationState(source).phase,
         GenerationalOperationPhase::Idle);
-}
-
-TEST_F(GenerationalAutomaticBackupTest,
-    AsyncInitialInspectionReturnsOnOwnerThreadWithoutBlockingTheOwner)
-{
-    mutate(); // Populate before the coordinator observes commits.
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    AsyncInitialInspectionBarrier barrier;
-    const auto launch = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(91), initialInspectionTime(),
-        {waitAtInitialInspectionCheckpoint, &barrier});
-    ASSERT_EQ(launch.outcome, InitialBackupInspectionLaunch::Started)
-        << launch.diagnostic.toStdString();
-    EXPECT_NE(launch.activityId, 0U);
-
-    // Reaching this assertion proves that the owner call did not wait for the
-    // deliberately blocked worker checkpoint.
-    EXPECT_TRUE(coordinator->initialBackupInspectionActive());
-    ASSERT_TRUE(barrier.entered.tryAcquire(1, 1000));
-    EXPECT_TRUE(initialInspectionResults.isEmpty());
-    barrier.resume.release();
-
-    ASSERT_TRUE(until([&] { return initialInspectionResults.size() == 1; }));
-    EXPECT_TRUE(initialInspectionSettledOnOwnerThread);
-    EXPECT_EQ(initialInspectionResults[0].decision,
-        InitialBackupDecision::Prepared);
-    EXPECT_EQ(initialInspectionResults[0].arbitration,
-        InitialBackupArbitration::Offered);
-    ASSERT_EQ(mutationBatchRequests, 1);
-    EXPECT_EQ(generationalRequestKinds[0],
-        GenerationalBackupRequestKind::InitialCopy);
-    EXPECT_FALSE(coordinator->isActive()); // No worker is connected in 2I-4E-1.
-}
-
-TEST_F(GenerationalAutomaticBackupTest,
-    LockDuringInspectionCancelsWithoutWaitingAndReleasesAfterWorkerExit)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    AsyncInitialInspectionBarrier barrier;
-    barrier.checkpoint = InitialBackupCheckpoint::BeforeDestinationPreparation;
-    const auto launch = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(92), initialInspectionTime(),
-        {waitAtInitialInspectionCheckpoint, &barrier});
-    ASSERT_EQ(launch.outcome, InitialBackupInspectionLaunch::Started);
-    ASSERT_TRUE(barrier.entered.tryAcquire(1, 1000));
-
-    coordinator->stopModificationGrouping(); // Models the synchronous lock cleanup.
-    EXPECT_EQ(coordinator->generationalOperationState(source).phase,
-        GenerationalOperationPhase::Cancelling);
-    VaultOperationGuard exclusive;
-    std::string reservationError;
-    EXPECT_FALSE(exclusive.tryReserve(source.toStdString(), reservationError));
-    barrier.resume.release();
-
-    ASSERT_TRUE(until([&] { return initialInspectionResults.size() == 1; }));
-    EXPECT_EQ(initialInspectionResults[0].decision,
-        InitialBackupDecision::Cancelled);
-    EXPECT_EQ(mutationBatchRequests, 0);
-    EXPECT_TRUE(exclusive.tryReserve(source.toStdString(), reservationError))
-        << reservationError;
-}
-
-TEST_F(GenerationalAutomaticBackupTest,
-    DestroyedOwnerDoesNotWaitAndLatePreparationOnlyReleasesItsCapability)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    AsyncInitialInspectionBarrier barrier;
-    barrier.checkpoint = InitialBackupCheckpoint::BeforeDestinationPreparation;
-    const auto launch = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(93), initialInspectionTime(),
-        {waitAtInitialInspectionCheckpoint, &barrier});
-    ASSERT_EQ(launch.outcome, InitialBackupInspectionLaunch::Started);
-    ASSERT_TRUE(barrier.entered.tryAcquire(1, 1000));
-
-    coordinator.reset(); // shutdown() requests cancellation but never joins.
-    VaultOperationGuard exclusive;
-    std::string reservationError;
-    EXPECT_FALSE(exclusive.tryReserve(source.toStdString(), reservationError));
-    barrier.resume.release();
-    ASSERT_TRUE(until([&] {
-        return exclusive.tryReserve(source.toStdString(), reservationError);
-    }));
-    EXPECT_EQ(mutationBatchRequests, 0);
-}
-
-TEST_F(GenerationalAutomaticBackupTest,
-    ConfigurationChangeInvalidatesTheOldInspectionBeforeAReplacementCanStart)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    AsyncInitialInspectionBarrier barrier;
-    const auto first = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(94), initialInspectionTime(),
-        {waitAtInitialInspectionCheckpoint, &barrier});
-    ASSERT_EQ(first.outcome, InitialBackupInspectionLaunch::Started);
-    ASSERT_TRUE(barrier.entered.tryAcquire(1, 1000));
-
-    const QString newRoot = temporary.filePath(QStringLiteral("new-backup-root"));
-    ASSERT_TRUE(QDir().mkpath(newRoot));
-    ASSERT_TRUE(QFile::setPermissions(newRoot,
-        QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner));
-    coordinator->applyGlobalBackupPreferences(initialPreferences(newRoot));
-    EXPECT_EQ(coordinator->generationalOperationState(source).phase,
-        GenerationalOperationPhase::Cancelling);
-    barrier.resume.release();
-    ASSERT_TRUE(until([&] { return initialInspectionResults.size() == 1; }));
-    EXPECT_EQ(initialInspectionResults[0].decision,
-        InitialBackupDecision::Cancelled);
-
-    const auto replacement = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(newRoot), authenticatedSession(94),
-        initialInspectionTime());
-    ASSERT_EQ(replacement.outcome, InitialBackupInspectionLaunch::Started)
-        << replacement.diagnostic.toStdString();
-    ASSERT_TRUE(until([&] { return initialInspectionResults.size() == 2; }));
-    EXPECT_EQ(initialInspectionResults[1].decision,
-        InitialBackupDecision::Prepared);
 }
 
 TEST_F(GenerationalAutomaticBackupTest,
@@ -1293,8 +999,7 @@ TEST_F(GenerationalAutomaticBackupTest,
     const quint64 staleRequest = mutationBatchRequestIds[0];
     const quint64 generation = mutationBatchGenerations[0];
     PreparedBackupDestination prepared;
-    ASSERT_TRUE(BackupDestinationPreparer::prepare(first, original.file,
-        generation, initialInspectionTime(), prepared, error))
+    ASSERT_TRUE(prepareDestination(first, generation, prepared))
         << error.toStdString();
 
     const auto second = store.save({secondRoot, 8});
@@ -1347,8 +1052,7 @@ TEST_F(GenerationalAutomaticBackupTest,
     ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }));
     const quint64 generation = mutationBatchGenerations[0];
     PreparedBackupDestination prepared;
-    ASSERT_TRUE(BackupDestinationPreparer::prepare(current, original.file,
-        generation, initialInspectionTime(), prepared, error))
+    ASSERT_TRUE(prepareDestination(current, generation, prepared))
         << error.toStdString();
     ASSERT_TRUE(coordinator->startPreparedMutationBackupSnapshot(
         mutationBatchRequestIds[0], source, generation,
@@ -1365,149 +1069,6 @@ TEST_F(GenerationalAutomaticBackupTest,
 }
 
 TEST_F(GenerationalAutomaticBackupTest,
-    DuplicateInspectionForOneSessionAndConfigurationIsNeverStartedTwice)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    AsyncInitialInspectionBarrier barrier;
-    const auto first = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(95), initialInspectionTime(),
-        {waitAtInitialInspectionCheckpoint, &barrier});
-    ASSERT_EQ(first.outcome, InitialBackupInspectionLaunch::Started);
-    ASSERT_TRUE(barrier.entered.tryAcquire(1, 1000));
-    const auto duplicate = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(95), initialInspectionTime());
-    EXPECT_EQ(duplicate.outcome, InitialBackupInspectionLaunch::AlreadyRunning);
-    EXPECT_EQ(duplicate.activityId, first.activityId);
-    barrier.resume.release();
-    ASSERT_TRUE(until([&] { return initialInspectionResults.size() == 1; }));
-
-    const auto settledDuplicate = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(95), initialInspectionTime());
-    EXPECT_EQ(settledDuplicate.outcome,
-        InitialBackupInspectionLaunch::AlreadySettled);
-    EXPECT_EQ(settledDuplicate.activityId, first.activityId);
-    EXPECT_EQ(initialInspectionResults.size(), 1);
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }));
-}
-
-TEST_F(GenerationalAutomaticBackupTest,
-    VaultChangeInvalidatesALateInspectionResult)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    AsyncInitialInspectionBarrier barrier;
-    barrier.checkpoint = InitialBackupCheckpoint::BeforeReturn;
-    const auto launch = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(96), initialInspectionTime(),
-        {waitAtInitialInspectionCheckpoint, &barrier});
-    ASSERT_EQ(launch.outcome, InitialBackupInspectionLaunch::Started);
-    ASSERT_TRUE(barrier.entered.tryAcquire(1, 1000));
-
-    const QString secondPath = temporary.filePath(QStringLiteral("second.pwdb"));
-    std::string failure;
-    ASSERT_TRUE(passwall::storage::VaultStorage::createSchema(
-        secondPath.toStdString(), failure)) << failure;
-    VaultKeyMetadata metadata;
-    metadata.vaultId.fill(0x57);
-    ASSERT_TRUE(passwall::storage::VaultStorage::writeMetadata(
-        secondPath.toStdString(), metadata, failure)) << failure;
-    VaultRegistration second;
-    ASSERT_EQ(VaultPreferencesStore().recognizeOrRegister(
-        secondPath, second, error), VaultRecognition::Registered)
-        << error.toStdString();
-    coordinator->trackVault(second);
-    barrier.resume.release();
-
-    ASSERT_TRUE(until([&] { return initialInspectionResults.size() == 1; }));
-    EXPECT_EQ(initialInspectionResults[0].decision,
-        InitialBackupDecision::Cancelled);
-    EXPECT_EQ(mutationBatchRequests, 0);
-}
-
-TEST_F(GenerationalAutomaticBackupTest,
-    CrudCommitDuringAsyncInspectionWinsOwnerThreadArbitration)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    AsyncInitialInspectionBarrier barrier;
-    barrier.checkpoint = InitialBackupCheckpoint::BeforeDestinationPreparation;
-    const auto launch = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(97), initialInspectionTime(),
-        {waitAtInitialInspectionCheckpoint, &barrier});
-    ASSERT_EQ(launch.outcome, InitialBackupInspectionLaunch::Started);
-    ASSERT_TRUE(barrier.entered.tryAcquire(1, 1000));
-
-    mutate(); // Business access coexists with the held snapshot capability.
-    barrier.resume.release();
-    ASSERT_TRUE(until([&] { return initialInspectionResults.size() == 1; }));
-    EXPECT_EQ(initialInspectionResults[0].decision,
-        InitialBackupDecision::Prepared);
-    EXPECT_EQ(initialInspectionResults[0].arbitration,
-        InitialBackupArbitration::MergedWithExistingRequest);
-    coordinator->requestPendingMutationsForLock(source);
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }));
-    EXPECT_EQ(generationalRequestKinds[0],
-        GenerationalBackupRequestKind::CrudGeneration);
-}
-
-TEST_F(AutomaticBackupTest,
-    HistoricalModeNeverStartsAnAsyncInitialInspection)
-{
-    mutate();
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 1000);
-    const auto launch = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(98), initialInspectionTime());
-    EXPECT_EQ(launch.outcome, InitialBackupInspectionLaunch::Refused);
-    EXPECT_EQ(launch.activityId, 0U);
-    EXPECT_FALSE(coordinator->initialBackupInspectionActive());
-    QCoreApplication::processEvents();
-    EXPECT_TRUE(initialInspectionResults.isEmpty());
-    EXPECT_EQ(mutationBatchRequests, 0);
-}
-
-TEST_F(GenerationalAutomaticBackupTest,
-    PreparedInitialCopyUsesTheCommonWorkerAndPublishesACompleteResult)
-{
-    mutate(); // Populate before the coordinator observes commits.
-    fake("snapshot-published-file", 1000);
-    auto preparation = prepareInitialCopy(101);
-    ASSERT_EQ(preparation.decision, InitialBackupDecision::Prepared)
-        << preparation.diagnostic.toStdString();
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(101), error),
-        InitialBackupArbitration::Offered) << error.toStdString();
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-    ASSERT_EQ(generationalRequestKinds[0],
-        GenerationalBackupRequestKind::InitialCopy);
-
-    const quint64 requestId = mutationBatchRequestIds[0];
-    ASSERT_TRUE(coordinator->startInitialBackupSnapshot(requestId, error))
-        << error.toStdString();
-    EXPECT_TRUE(coordinator->isActive());
-    ASSERT_TRUE(until([&] { return mutationBatchResults.size() == 1; }, 5000));
-
-    const auto& result = mutationBatchResults[0];
-    EXPECT_EQ(result.kind, GenerationalBackupRequestKind::InitialCopy);
-    EXPECT_EQ(result.sessionGeneration, 101U);
-    EXPECT_EQ(result.generation, 0U);
-    EXPECT_EQ(result.requestId, requestId);
-    EXPECT_EQ(result.outcome, MutationBackupOutcome::Published);
-    EXPECT_EQ(result.workerOutcome, BackupOutcome::Published);
-    ASSERT_TRUE(result.publication.has_value());
-    EXPECT_EQ(result.publication->kind,
-        GenerationalBackupRequestKind::InitialCopy);
-    EXPECT_EQ(result.publication->sessionGeneration, 101U);
-    EXPECT_EQ(result.publication->generation, 0U);
-    EXPECT_EQ(result.publication->requestId, requestId);
-    EXPECT_TRUE(result.publication->evidence.permitsDeletion());
-    EXPECT_TRUE(QFileInfo::exists(result.publication->destination));
-    EXPECT_FALSE(coordinator->isActive());
-    EXPECT_TRUE(rotations.isEmpty());
-}
-
-TEST_F(GenerationalAutomaticBackupTest,
     PreparedCrudGenerationUsesTheSameWorkerSupervisionAndFullBindings)
 {
     fake("snapshot-published-file", 20);
@@ -1515,9 +1076,8 @@ TEST_F(GenerationalAutomaticBackupTest,
     ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
     const quint64 generation = mutationBatchGenerations[0];
     PreparedBackupDestination prepared;
-    ASSERT_TRUE(BackupDestinationPreparer::prepare(
-        initialPreferences(), original.file, generation,
-        initialInspectionTime(), prepared, error)) << error.toStdString();
+    ASSERT_TRUE(prepareDestination(
+        initialPreferences(), generation, prepared)) << error.toStdString();
 
     ASSERT_TRUE(coordinator->startPreparedMutationBackupSnapshot(
         mutationBatchRequestIds[0], mutationBatchPath, generation,
@@ -1536,108 +1096,77 @@ TEST_F(GenerationalAutomaticBackupTest,
 }
 
 TEST_F(GenerationalAutomaticBackupTest,
-    InitialCopyTokenIsSingleUseAndAnObsoleteTokenCannotStartAWorker)
+    CrudPreparationFailureSettlesOnlyTheExactOfferedGenerationWithoutRetry)
 {
+    control(QString::fromLatin1(AUTO_REAL_WORKER), 20);
     mutate();
-    fake("failed", 1000);
-    auto preparation = prepareInitialCopy(102);
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(102), error),
-        InitialBackupArbitration::Offered);
     ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
     const quint64 requestId = mutationBatchRequestIds[0];
+    const quint64 generation = mutationBatchGenerations[0];
 
-    EXPECT_FALSE(coordinator->startInitialBackupSnapshot(requestId + 1, error));
+    ASSERT_TRUE(coordinator->failMutationBackupPreparation(
+        requestId, mutationBatchPath, generation,
+        QStringLiteral("Destination fictivement indisponible.")));
+    ASSERT_EQ(mutationBatchResults.size(), 1);
+    EXPECT_EQ(mutationBatchResults[0].requestId, requestId);
+    EXPECT_EQ(mutationBatchResults[0].generation, generation);
+    EXPECT_EQ(mutationBatchResults[0].outcome, MutationBackupOutcome::Failed);
+    EXPECT_EQ(mutationBatchResults[0].workerOutcome,
+        BackupOutcome::FailedBeforePublication);
+    EXPECT_TRUE(coordinator->generationalBackupSuspension(source).suspended);
+
+    QCoreApplication::sendPostedEvents();
+    QCoreApplication::processEvents();
+    EXPECT_EQ(mutationBatchRequests, 1);
+    EXPECT_FALSE(coordinator->failMutationBackupPreparation(
+        requestId, mutationBatchPath, generation,
+        QStringLiteral("Jeton déjà consommé.")));
+}
+
+TEST_F(GenerationalAutomaticBackupTest, PreparedCrudTokenIsSingleUseAndObsoleteTokenCannotStartWorker)
+{
+    fake("failed", 20);
+    mutate();
+    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
+    const quint64 requestId = mutationBatchRequestIds[0];
+    const quint64 generation = mutationBatchGenerations[0];
+    PreparedBackupDestination stale;
+    ASSERT_TRUE(prepareDestination(initialPreferences(), generation, stale))
+        << error.toStdString();
+    EXPECT_FALSE(coordinator->startPreparedMutationBackupSnapshot(
+        requestId + 1, source, generation, std::move(stale), error));
     EXPECT_FALSE(error.isEmpty());
     EXPECT_FALSE(coordinator->isActive());
-    ASSERT_TRUE(coordinator->startInitialBackupSnapshot(requestId, error))
+    PreparedBackupDestination prepared;
+    ASSERT_TRUE(prepareDestination(initialPreferences(), generation, prepared))
         << error.toStdString();
-    EXPECT_FALSE(coordinator->startInitialBackupSnapshot(requestId, error));
+    ASSERT_TRUE(coordinator->startPreparedMutationBackupSnapshot(
+        requestId, source, generation, std::move(prepared), error)) << error.toStdString();
+    EXPECT_FALSE(coordinator->startPreparedMutationBackupSnapshot(
+        requestId, source, generation, PreparedBackupDestination{}, error));
     ASSERT_TRUE(until([&] { return mutationBatchResults.size() == 1; }, 5000));
-    EXPECT_EQ(mutationBatchResults[0].kind,
-        GenerationalBackupRequestKind::InitialCopy);
+    EXPECT_EQ(mutationBatchResults[0].kind, GenerationalBackupRequestKind::CrudGeneration);
     EXPECT_EQ(mutationBatchResults[0].outcome, MutationBackupOutcome::Failed);
     EXPECT_EQ(mutationBatchRequests, 1);
 }
 
-TEST_F(GenerationalAutomaticBackupTest,
-    InitialCopyFinalAdmissionRejectsAChangedSession)
+TEST_F(GenerationalAutomaticBackupTest, PreparedCrudFailedLaunchSettlesOnceAndReleasesReservation)
 {
+    const QString missingWorker = temporary.filePath(QStringLiteral("missing-backup-worker"));
+    control(missingWorker, 20);
     mutate();
-    fake("snapshot-published-file", 1000);
-    auto preparation = prepareInitialCopy(106);
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(106), error),
-        InitialBackupArbitration::Offered);
     ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-
-    coordinator->trackVault(original); // Same file, but a distinct authenticated session.
-    EXPECT_FALSE(coordinator->startInitialBackupSnapshot(
-        mutationBatchRequestIds[0], error));
-    EXPECT_TRUE(error.contains(QStringLiteral("session courante")));
-    ASSERT_EQ(mutationBatchResults.size(), 1);
-    EXPECT_EQ(mutationBatchResults[0].kind,
-        GenerationalBackupRequestKind::InitialCopy);
-    EXPECT_EQ(mutationBatchResults[0].outcome, MutationBackupOutcome::Failed);
-    EXPECT_FALSE(coordinator->isActive());
-
-    VaultOperationGuard exclusive;
-    std::string reservationError;
-    EXPECT_TRUE(exclusive.tryReserve(source.toStdString(), reservationError))
-        << reservationError;
-}
-
-TEST_F(GenerationalAutomaticBackupTest,
-    CrudMutationDuringInitialCopyWorkerRemainsASeparateLaterRequest)
-{
-    mutate();
-    fake("slow-snapshot-published-file", 20);
-    auto preparation = prepareInitialCopy(103);
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(103), error),
-        InitialBackupArbitration::Offered);
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-    ASSERT_TRUE(coordinator->startInitialBackupSnapshot(
-        mutationBatchRequestIds[0], error)) << error.toStdString();
-    ASSERT_TRUE(until([&] { return coordinator->isActive(); }, 1000));
-
-    mutate();
-    EXPECT_TRUE(coordinator->modificationGroupingPending());
+    const quint64 generation = mutationBatchGenerations[0];
+    PreparedBackupDestination prepared;
+    ASSERT_TRUE(prepareDestination(initialPreferences(), generation, prepared))
+        << error.toStdString();
+    ASSERT_TRUE(coordinator->startPreparedMutationBackupSnapshot(
+        mutationBatchRequestIds[0], source, generation, std::move(prepared), error))
+        << error.toStdString();
     ASSERT_TRUE(until([&] { return mutationBatchResults.size() == 1; }, 5000));
-    EXPECT_EQ(mutationBatchResults[0].kind,
-        GenerationalBackupRequestKind::InitialCopy);
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 2; }, 1000));
-    EXPECT_EQ(generationalRequestKinds[1],
-        GenerationalBackupRequestKind::CrudGeneration);
-    EXPECT_EQ(mutationBatchGenerations[1], 1U);
-    EXPECT_FALSE(coordinator->isActive());
-}
-
-TEST_F(GenerationalAutomaticBackupTest,
-    InitialCopyFailedLaunchSettlesOnceAndReleasesTheSnapshotReservation)
-{
-    mutate();
-    const QString missingWorker = temporary.filePath(
-        QStringLiteral("missing-backup-worker"));
-    control(missingWorker, 1000);
-    auto preparation = prepareInitialCopy(104);
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(104), error),
-        InitialBackupArbitration::Offered);
-    ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-    ASSERT_TRUE(coordinator->startInitialBackupSnapshot(
-        mutationBatchRequestIds[0], error)) << error.toStdString();
-
-    ASSERT_TRUE(until([&] { return mutationBatchResults.size() == 1; }, 5000));
-    EXPECT_EQ(mutationBatchResults[0].kind,
-        GenerationalBackupRequestKind::InitialCopy);
+    EXPECT_EQ(mutationBatchResults[0].kind, GenerationalBackupRequestKind::CrudGeneration);
     EXPECT_EQ(mutationBatchResults[0].outcome, MutationBackupOutcome::Failed);
-    EXPECT_EQ(mutationBatchResults[0].workerOutcome,
-        BackupOutcome::FailedBeforePublication);
+    EXPECT_EQ(mutationBatchResults[0].workerOutcome, BackupOutcome::FailedBeforePublication);
     EXPECT_FALSE(mutationBatchResults[0].diagnostic.isEmpty());
     EXPECT_EQ(mutationBatchRequests, 1);
     EXPECT_FALSE(coordinator->isActive());
@@ -1647,47 +1176,35 @@ TEST_F(GenerationalAutomaticBackupTest,
         << reservationError;
 }
 
-TEST_F(GenerationalAutomaticBackupTest,
-    InitialCopyUnconfirmedPublicationRemainsUnknownWithoutAutomaticRetry)
+TEST_F(GenerationalAutomaticBackupTest, PreparedCrudUnconfirmedPublicationRequiresExplicitRetry)
 {
+    fake("snapshot-published-without-receipt", 20);
     mutate();
-    fake("snapshot-published-without-receipt", 1000);
-    auto preparation = prepareInitialCopy(105);
-    ASSERT_TRUE(preparation.request.has_value());
-    ASSERT_EQ(coordinator->admitInitialBackup(
-        std::move(*preparation.request), initialAdmission(105), error),
-        InitialBackupArbitration::Offered);
     ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
-    ASSERT_TRUE(coordinator->startInitialBackupSnapshot(
-        mutationBatchRequestIds[0], error)) << error.toStdString();
-
+    const quint64 generation = mutationBatchGenerations[0];
+    PreparedBackupDestination prepared;
+    ASSERT_TRUE(prepareDestination(initialPreferences(), generation, prepared))
+        << error.toStdString();
+    ASSERT_TRUE(coordinator->startPreparedMutationBackupSnapshot(
+        mutationBatchRequestIds[0], source, generation, std::move(prepared), error))
+        << error.toStdString();
     ASSERT_TRUE(until([&] { return mutationBatchResults.size() == 1; }, 5000));
-    EXPECT_EQ(mutationBatchResults[0].kind,
-        GenerationalBackupRequestKind::InitialCopy);
+    EXPECT_EQ(mutationBatchResults[0].kind, GenerationalBackupRequestKind::CrudGeneration);
     EXPECT_EQ(mutationBatchResults[0].outcome, MutationBackupOutcome::Unknown);
     EXPECT_EQ(mutationBatchResults[0].workerOutcome, BackupOutcome::Unknown);
     EXPECT_FALSE(mutationBatchResults[0].publication.has_value());
-    EXPECT_TRUE(mutationBatchResults[0].diagnostic.contains(
-        QStringLiteral("Preuve de publication")));
+    EXPECT_TRUE(mutationBatchResults[0].diagnostic.contains(QStringLiteral("Preuve de publication")));
     QCoreApplication::processEvents();
     EXPECT_EQ(mutationBatchRequests, 1);
     const auto suspended = coordinator->generationalBackupSuspension(source);
     EXPECT_TRUE(suspended.suspended);
     EXPECT_EQ(suspended.reason, GenerationalBackupSuspensionReason::Unknown);
-    ASSERT_TRUE(coordinator->resumeGenerationalBackup(source, error))
-        << error.toStdString();
-    ASSERT_EQ(initialCopyResumeRequests.size(), 1);
-    EXPECT_EQ(initialCopyResumeRequests[0], QFileInfo(source).absoluteFilePath());
+    ASSERT_TRUE(coordinator->resumeGenerationalBackup(source, error)) << error.toStdString();
     EXPECT_FALSE(coordinator->resumeGenerationalBackup(source, error));
-    EXPECT_EQ(initialCopyResumeRequests.size(), 1);
-    auto retry = prepareInitialCopy(106, true);
-    ASSERT_TRUE(retry.request.has_value());
-    ASSERT_EQ(coordinator->admitInitialBackup(
-        std::move(*retry.request), initialAdmission(106), error),
-        InitialBackupArbitration::Offered) << error.toStdString();
     ASSERT_TRUE(until([&] { return mutationBatchRequests == 2; }, 1000));
-    EXPECT_EQ(generationalRequestKinds[1],
-        GenerationalBackupRequestKind::InitialCopy);
+    EXPECT_EQ(generationalRequestKinds[1], GenerationalBackupRequestKind::CrudGeneration);
+    EXPECT_EQ(mutationBatchGenerations[1], generation);
+    EXPECT_NE(mutationBatchRequestIds[0], mutationBatchRequestIds[1]);
 }
 
 TEST_F(GenerationalAutomaticBackupTest,
@@ -1861,6 +1378,29 @@ TEST_F(GenerationalAutomaticBackupTest, LockCapturesPendingMutationsAndDefersOne
     EXPECT_TRUE(QDir(destination).entryList(QDir::Files).isEmpty());
 }
 
+TEST_F(GenerationalAutomaticBackupTest, PopulatedVaultAndPreferenceChangesWithoutNewCommitDoNotRequestBackup)
+{
+    mutate(); // Existing content, before the new coordinator observes commits.
+    control(QString::fromLatin1(AUTO_REAL_WORKER), 10);
+    coordinator->requireGlobalBackupPreferencesInitialization();
+    coordinator->applyGlobalBackupPreferences(initialPreferences());
+    auto changed = initialPreferences();
+    changed.preferences.retainedVersions = 9;
+    coordinator->applyGlobalBackupPreferences(changed);
+    EXPECT_FALSE(until([&] {
+        return coordinator->isActive() || mutationBatchRequests != 0;
+    }, 100)); // Allow queued work and the short grouping delay to run.
+    coordinator->requestPendingMutationsForLock(source);
+    QCoreApplication::sendPostedEvents();
+    QCoreApplication::processEvents();
+    EXPECT_FALSE(coordinator->isActive());
+    EXPECT_FALSE(coordinator->modificationGroupingPending());
+    EXPECT_EQ(mutationBatchRequests, 0);
+    EXPECT_TRUE(mutationBatchResults.isEmpty());
+    EXPECT_TRUE(QDir(destination).entryList(
+        QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty());
+}
+
 TEST_F(GenerationalAutomaticBackupTest, LockWithoutPendingMutationEmitsNoRequest)
 {
     control(QString::fromLatin1(AUTO_REAL_WORKER), 10);
@@ -1959,8 +1499,8 @@ TEST_F(GenerationalAutomaticBackupTest,
 
     const quint64 firstGeneration = mutationBatchGenerations[0];
     PreparedBackupDestination prepared;
-    ASSERT_TRUE(BackupDestinationPreparer::prepare(initialPreferences(),
-        original.file, firstGeneration, initialInspectionTime(), prepared, error))
+    ASSERT_TRUE(prepareDestination(initialPreferences(),
+        firstGeneration, prepared))
         << error.toStdString();
     const QString firstDestination = prepared.destinationPath();
     ASSERT_TRUE(coordinator->startPreparedMutationBackupSnapshot(
@@ -2052,6 +1592,17 @@ TEST_F(GenerationalAutomaticBackupTest,
         QCoreApplication::processEvents();
         EXPECT_EQ(mutationBatchRequests, 1);
         EXPECT_TRUE(coordinator->generationalBackupSuspension(source).suspended);
+        ASSERT_TRUE(coordinator->continueAfterGenerationalShutdownFailure(
+            error)) << error.toStdString();
+        EXPECT_EQ(coordinator->generationalShutdownDrainState().status,
+            GenerationalShutdownDrainStatus::NotRequested);
+        EXPECT_TRUE(coordinator->generationalBackupSuspension(source).suspended);
+        EXPECT_EQ(mutationBatchRequests, 1);
+        EXPECT_FALSE(coordinator->continueAfterGenerationalShutdownFailure(
+            error));
+        ASSERT_TRUE(coordinator->resumeGenerationalBackup(source, error))
+            << error.toStdString();
+        ASSERT_TRUE(until([&] { return mutationBatchRequests == 2; }, 1000));
     }
 }
 
@@ -2064,9 +1615,8 @@ TEST_F(GenerationalAutomaticBackupTest,
     ASSERT_TRUE(coordinator->beginGenerationalShutdownDrain(error));
     ASSERT_TRUE(until([&] { return mutationBatchRequests == 1; }, 1000));
     PreparedBackupDestination prepared;
-    ASSERT_TRUE(BackupDestinationPreparer::prepare(initialPreferences(),
-        original.file, mutationBatchGenerations[0], initialInspectionTime(),
-        prepared, error)) << error.toStdString();
+    ASSERT_TRUE(prepareDestination(initialPreferences(),
+        mutationBatchGenerations[0], prepared)) << error.toStdString();
     const QString output = prepared.destinationPath();
     ASSERT_TRUE(coordinator->startPreparedMutationBackupSnapshot(
         mutationBatchRequestIds[0], source, mutationBatchGenerations[0],
@@ -2118,33 +1668,8 @@ TEST_F(GenerationalAutomaticBackupTest,
 }
 
 TEST_F(GenerationalAutomaticBackupTest,
-    CloseDrainCancelsLateInitialInspectionAndRejectsStaleConfiguration)
+    CloseDrainRejectsStaleConfiguration)
 {
-    mutate(); // Populate before the coordinator observes commits.
-    control(QString::fromLatin1(AUTO_REAL_WORKER), 20000);
-    AsyncInitialInspectionBarrier barrier;
-    barrier.checkpoint = InitialBackupCheckpoint::BeforeDestinationPreparation;
-    const auto launch = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(120), initialInspectionTime(),
-        {waitAtInitialInspectionCheckpoint, &barrier});
-    ASSERT_EQ(launch.outcome, InitialBackupInspectionLaunch::Started);
-    ASSERT_TRUE(barrier.entered.tryAcquire(1, 1000));
-
-    ASSERT_TRUE(coordinator->beginGenerationalShutdownDrain(error));
-    EXPECT_EQ(coordinator->generationalShutdownDrainState().status,
-        GenerationalShutdownDrainStatus::Draining);
-    const auto refused = coordinator->startInitialBackupInspectionAsync(
-        initialPreferences(), authenticatedSession(120), initialInspectionTime());
-    EXPECT_EQ(refused.outcome, InitialBackupInspectionLaunch::Refused);
-    barrier.resume.release();
-    ASSERT_TRUE(until([&] { return initialInspectionResults.size() == 1; }));
-    EXPECT_EQ(initialInspectionResults[0].decision,
-        InitialBackupDecision::Cancelled);
-    EXPECT_EQ(coordinator->generationalShutdownDrainState().status,
-        GenerationalShutdownDrainStatus::Completed);
-
-    coordinator->shutdown();
-    coordinator.reset();
     control(QString::fromLatin1(AUTO_REAL_WORKER), 20000);
     coordinator->applyGlobalBackupPreferences(initialPreferences());
     mutate();
@@ -2153,9 +1678,8 @@ TEST_F(GenerationalAutomaticBackupTest,
     const quint64 staleRequest = mutationBatchRequestIds.last();
     const quint64 staleGeneration = mutationBatchGenerations.last();
     PreparedBackupDestination staleDestination;
-    ASSERT_TRUE(BackupDestinationPreparer::prepare(initialPreferences(),
-        original.file, staleGeneration, initialInspectionTime(),
-        staleDestination, error)) << error.toStdString();
+    ASSERT_TRUE(prepareDestination(initialPreferences(),
+        staleGeneration, staleDestination)) << error.toStdString();
     GlobalBackupPreferencesResult unavailable;
     unavailable.status = GlobalBackupPreferencesStatus::ReadError;
     unavailable.diagnostic = QStringLiteral("Configuration fictivement illisible.");

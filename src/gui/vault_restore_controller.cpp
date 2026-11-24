@@ -15,6 +15,16 @@ VaultRestoreController::~VaultRestoreController() {
     delete dialog_.data(); // Wipes the GUI field, never waits for a child.
 }
 bool VaultRestoreController::hasSensitiveInput() const { return dialog_ && dialog_->hasPassword(); }
+bool VaultRestoreController::precautionRequired(
+    const services::VaultRegistration& registration) const noexcept
+{
+    // Presentation and early validation only. The authority-bound service
+    // policy remains the enforcement boundary and is rechecked by the worker.
+    return !owner_.automaticBackup_
+        || owner_.automaticBackup_->triggerMode()
+            != services::BackupTriggerMode::Historical
+        || !registration.backup.automatic;
+}
 void VaultRestoreController::recoveryConfirmed(const QString& localId) {
     uncertain_.remove(localId);
     if (dialog_ && stage_ != Stage::Running && stage_ != Stage::Preparing
@@ -59,7 +69,11 @@ void VaultRestoreController::load() {
         if (!guarded || guarded->generation_ != serial || !guarded->dialog_) return;
         if (!listing->ok) { guarded->fail(listing->error); return; }
         guarded->records_ = listing->records; guarded->stage_ = Stage::Choosing;
-        guarded->dialog_->setRegistrations(listing->records, guarded->uncertain_);
+        const bool requirePrecautionForEveryRecord = !guarded->owner_.automaticBackup_
+            || guarded->owner_.automaticBackup_->triggerMode()
+                != services::BackupTriggerMode::Historical;
+        guarded->dialog_->setRegistrations(listing->records, guarded->uncertain_,
+            requirePrecautionForEveryRecord);
     }, Qt::QueuedConnection);
     task->start();
 }
@@ -76,8 +90,9 @@ void VaultRestoreController::prepare() {
     if (found == records_.cend() || found->replacement || uncertain_.contains(selected)) {
         fail(tr("Coffre inconnu ou récupération nécessaire ; aucune restauration autorisée.")); return;
     }
+    const bool requiresPrecaution = precautionRequired(*found);
     if (!dialog_->confirmed() || dialog_->source().isEmpty()
-        || (!found->backup.automatic && dialog_->precaution().isEmpty())) {
+        || (requiresPrecaution && dialog_->precaution().isEmpty())) {
         // Keep the form usable after a missing confirmation/required path.
         dialog_->validationError(tr("Confirmez le remplacement, choisissez la sauvegarde et la copie obligatoire éventuelle.")); return;
     }
@@ -96,7 +111,7 @@ void VaultRestoreController::prepare() {
         fail(tr("Une édition, une opération incompatible ou une protection indisponible empêche la restauration.")); return;
     }
     selected_ = *found; principalId_ = selected; source_ = dialog_->source();
-    precaution_ = found->backup.automatic ? QString{} : dialog_->precaution();
+    precaution_ = requiresPrecaution ? dialog_->precaution() : QString{};
     cancelled_ = false; stage_ = Stage::Prevalidating; dialog_->prevalidating();
     const auto serial = ++generation_;
     const auto securityGeneration = owner_.replacementGeneration_;
@@ -345,9 +360,9 @@ void VaultRestoreController::phase(services::ReplacementCheckpoint point) {
     case Phase::BeforeWork: text = tr("Vérification de la sauvegarde…"); break;
     case Phase::SourceAuthenticated: text = tr("Sauvegarde authentifiée ; secrets temporaires nettoyés. Copie de précaution éventuelle…"); break;
     case Phase::PrecautionCreated:
-        text = selected_.backup.automatic
-            ? tr("Aucune copie de précaution supplémentaire requise ; préparation du remplacement…")
-            : tr("Copie de précaution confirmée ; préparation du remplacement…");
+        text = precautionRequired(selected_)
+            ? tr("Copie de précaution confirmée ; préparation du remplacement…")
+            : tr("Aucune copie de précaution supplémentaire requise ; préparation du remplacement…");
         break;
     case Phase::CandidateStaged: case Phase::BeforeArm: text = tr("Candidat préparé ; préparation de l'engagement…"); break;
     case Phase::Armed: case Phase::BeforeExchange: text = tr("Remplacement engagé : l'annulation ne garantit plus l'absence de substitution."); break;

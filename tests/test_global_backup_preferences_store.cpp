@@ -105,6 +105,9 @@ TEST_F(GlobalBackupPreferencesStoreTest, ValidPreferencesPersistWithoutAnUpperRe
         << loaded.diagnostic.toStdString();
     EXPECT_EQ(loaded.preferences, preferences(retained));
     EXPECT_EQ(loaded.sourceFile, preferencesFile);
+    ASSERT_TRUE(loaded.sourceIdentity.has_value());
+    EXPECT_NE(loaded.sourceIdentity->inode, 0U);
+    EXPECT_GT(loaded.sourceIdentity->size, 0U);
 }
 
 TEST_F(GlobalBackupPreferencesStoreTest, ConfirmedSaveNotifiesOnlyTheAffectedFile)

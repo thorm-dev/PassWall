@@ -1,7 +1,7 @@
 #pragma once
 
 #include "services/backup_trigger_mode.hpp"
-#include "services/initial_backup_preparer.hpp"
+#include "services/backup_destination_preparer.hpp"
 #include "services/vault_preferences_store.hpp"
 #include <QMap>
 #include <QPointer>
@@ -19,12 +19,26 @@ namespace passwall::services {
 class BackupJob;
 class VaultReplacementAuthorization;
 
-// The initial-copy obligation is not a synthetic CRUD generation. Both kinds
-// share the same in-memory arbitration queue and single-use attempt tokens,
-// while their distinct bindings remain explicit at the public boundary.
+// Request kind remains explicit for the common publication/rotation contract.
 enum class GenerationalBackupRequestKind {
-    CrudGeneration,
-    InitialCopy
+    CrudGeneration
+};
+
+// Exact, transient preparation facts retained until the matching worker has
+// really terminated. They authorize no deletion by themselves; the rotation
+// consumer must reload the preferences and the destructive service must still
+// reopen and revalidate the complete series.
+struct GenerationalBackupRotationContext {
+    QString rootDirectory;
+    QByteArray vaultId;
+    QString seriesId;
+    GlobalBackupPreferences preparedPreferences;
+    QString preferencesSourceFile;
+    std::optional<GlobalBackupPreferencesFileIdentity> preferencesSourceIdentity;
+    SnapshotDirectoryIdentity rootIdentity;
+    SnapshotDirectoryIdentity familyIdentity;
+    SnapshotDirectoryIdentity seriesIdentity;
+    bool operator==(const GenerationalBackupRotationContext&) const = default;
 };
 
 // Transient, owner-thread proof for the exact generation attempt that produced
@@ -37,6 +51,7 @@ struct MutationBackupPublicationReceipt {
     BackupFileEvidence evidence;
     GenerationalBackupRequestKind kind = GenerationalBackupRequestKind::CrudGeneration;
     quint64 sessionGeneration = 0;
+    std::optional<GenerationalBackupRotationContext> rotationContext;
     bool operator==(const MutationBackupPublicationReceipt&) const = default;
 };
 
@@ -95,36 +110,14 @@ struct GenerationalShutdownDrainState {
 struct GenerationalBackupRequestOffer {
     GenerationalBackupRequestKind kind = GenerationalBackupRequestKind::CrudGeneration;
     QString vaultPath;
+    // Non-secret physical binding copied from the coordinator's immutable
+    // batch.  A GUI consumer needs it to prepare a CRUD destination without
+    // reinterpreting a path that may already have been substituted.
+    VaultFileIdentity vault;
     quint64 mutationGeneration = 0;
     quint64 sessionGeneration = 0;
     quint64 requestId = 0;
     bool operator==(const GenerationalBackupRequestOffer&) const = default;
-};
-
-enum class InitialBackupArbitration {
-    Offered,
-    MergedWithExistingRequest,
-    Refused
-};
-
-enum class InitialBackupInspectionLaunch {
-    Started,
-    AlreadyRunning,
-    AlreadySettled,
-    Refused
-};
-
-struct InitialBackupInspectionLaunchResult {
-    InitialBackupInspectionLaunch outcome = InitialBackupInspectionLaunch::Refused;
-    quint64 activityId = 0;
-    QString diagnostic;
-};
-
-struct InitialBackupInspectionResult {
-    quint64 activityId = 0;
-    InitialBackupDecision decision = InitialBackupDecision::Refused;
-    InitialBackupArbitration arbitration = InitialBackupArbitration::Refused;
-    QString diagnostic;
 };
 
 // Read-only, transient presentation of the generational engine. These phases
@@ -132,14 +125,11 @@ struct InitialBackupInspectionResult {
 // for every export, replacement and snapshot.
 enum class GenerationalOperationPhase {
     Idle,
-    Inspecting,
-    PreparedReservation,
     PendingRequest,
     OfferedRequest,
     WaitingForReservation,
     AttemptActive,
     WorkerActive,
-    Cancelling,
     Completed,
     Cancelled
 };
@@ -155,7 +145,6 @@ struct GenerationalOperationState {
     bool workerAlive = false;
     bool resultObserved = false;
     BackupOutcome workerOutcome = BackupOutcome::Unknown;
-    quint64 activityId = 0;
     bool operator==(const GenerationalOperationState&) const = default;
 };
 
@@ -220,10 +209,15 @@ struct MutationBackupResult {
     std::optional<MutationBackupPublicationReceipt> publication;
     GenerationalBackupRequestKind kind = GenerationalBackupRequestKind::CrudGeneration;
     quint64 sessionGeneration = 0;
+    // Exact worker result copied only after all publication/token bindings have
+    // been validated. Rotation consumers pass it through unchanged and never
+    // synthesize Published from a path or a visible file.
+    std::optional<BackupResult> confirmedPublicationResult;
+    bool workerTerminated = false;
 };
 
-// Owner-thread Qt coordinator. No key, credential, retry loop or copy engine;
-// only in-memory grouping/coordination timers and generations live here.
+// Owner-thread Qt coordinator. No key, credential, unbounded retry loop or
+// copy engine; only in-memory grouping/coordination timers and generations live here.
 // Registry/preflight work runs only from deferred dispatch, never from
 // lockVault's cleanup/acknowledgement stack. Copy I/O belongs to the worker.
 class AutomaticBackupCoordinator final : public QObject {
@@ -245,44 +239,26 @@ public:
     void trackVault(const VaultRegistration& registration);
     void stopModificationGrouping();
     void requestPendingMutationsForLock(const QString& path);
-    // Owner-thread admission only. It either retains the prepared InitialCopy
-    // in the existing queue or releases it because an exact CRUD request
-    // already covers the same physical vault. It never starts a worker.
-    [[nodiscard]] InitialBackupArbitration admitInitialBackup(
-        InitialBackupRequest request, const InitialBackupAdmission& admission,
-        QString& error);
-    // Future off-GUI inspection boundary. The returned identifier is transient,
-    // session-bound and revocable; it is never a reservation or authorization.
-    [[nodiscard]] quint64 beginInitialBackupInspection(
-        const VaultFileIdentity& identity, quint64 sessionGeneration, QString& error);
-    [[nodiscard]] bool markInitialBackupPrepared(quint64 activityId,
-        InitialBackupRequest request, QString& error);
-    [[nodiscard]] InitialBackupArbitration admitPreparedInitialBackup(
-        quint64 activityId, InitialBackupAdmission admission, QString& error);
-    [[nodiscard]] bool cancelInitialBackupInspection(quint64 activityId);
-    // Runs the filesystem/SQLite inspection on a dedicated short-lived thread.
-    // The optional observer is a deterministic test hook composed with the
-    // coordinator's own atomic cancellation; it must outlive the activity.
-    [[nodiscard]] InitialBackupInspectionLaunchResult
-        startInitialBackupInspectionAsync(
-            GlobalBackupPreferencesResult configuration,
-            AuthenticatedBackupSession session, QDateTime timestamp,
-            InitialBackupCancellation observer = {});
+    // Integration owners call this before exposing a real generational
+    // session. Until an authoritative Valid result is applied, CRUD needs are
+    // retained but no request is offered and no artificial failure is emitted.
+    // Foundation tests that inject prepared capabilities remain independent.
+    void requireGlobalBackupPreferencesInitialization();
     // Owner-thread notification/revalidation boundary for global preferences.
     // Invalid configurations pause new offers but retain CRUD generations.
     // A live worker is deliberately not interrupted.
     void applyGlobalBackupPreferences(
         GlobalBackupPreferencesResult configuration);
-    // Configuration owners use this before replacing an active configuration.
-    // It never waits for filesystem work or releases a still-live capability.
-    void invalidateInitialBackupInspection();
-    [[nodiscard]] bool initialBackupInspectionActive() const noexcept;
     [[nodiscard]] GenerationalBackupSuspensionState
         generationalBackupSuspension(const QString& vaultPath) const;
-    // Explicit, owner-thread resumption. A CRUD need is offered exactly once;
-    // an InitialCopy-only need asks the integration owner for a fresh secured
-    // inspection. No worker is started by this method.
+    // Explicit, owner-thread resumption. A retained CRUD need is offered exactly
+    // once. No worker is started by this method.
     [[nodiscard]] bool resumeGenerationalBackup(
+        const QString& vaultPath, QString& error);
+    // Explicit fresh generation from the current authenticated vault. A
+    // scheduled CRUD batch is accelerated rather than duplicated. The same
+    // preparation, reservation, worker and publication proof are used.
+    [[nodiscard]] bool requestGenerationalBackup(
         const QString& vaultPath, QString& error);
     [[nodiscard]] GenerationalOperationState generationalOperationState(
         const QString& vaultPath) const;
@@ -315,12 +291,14 @@ public:
     [[nodiscard]] bool startPreparedMutationBackupSnapshot(quint64 requestId,
         const QString& path, quint64 generation,
         PreparedBackupDestination prepared, QString& error);
-    // Consumes exactly one already-prepared InitialCopy offer. Final admission,
-    // job creation and signal wiring all run on this object's owner thread.
-    [[nodiscard]] bool startInitialBackupSnapshot(
-        quint64 requestId, QString& error);
     [[nodiscard]] bool cancelMutationBackupBeforeLaunch(
         quint64 requestId, const QString& path, quint64 generation);
+    // The asynchronous GUI preparation could not produce a destination for
+    // this exact unstarted CRUD offer.  This is terminal for the attempt and
+    // deliberately installs the existing suspension; it never retries.
+    [[nodiscard]] bool failMutationBackupPreparation(
+        quint64 requestId, const QString& path, quint64 generation,
+        QString diagnostic);
     void requestForLockedVault(const QString& path);
     void resumeAutomaticBackup(const QString& localId);
     void setPaused(bool paused);
@@ -330,6 +308,11 @@ public:
     // engine. Unlike shutdown(), this does not cancel workers or discard
     // requests. It is idempotent and never blocks waiting for I/O.
     [[nodiscard]] bool beginGenerationalShutdownDrain(QString& error);
+    // A user who declined to leave after a terminal failed drain may reopen
+    // coordination for a fresh authenticated session. This never clears the
+    // suspension, retries a request or revives the invalidated session.
+    [[nodiscard]] bool continueAfterGenerationalShutdownFailure(
+        QString& error);
     [[nodiscard]] GenerationalShutdownDrainState
         generationalShutdownDrainState() const noexcept
         { return generationalShutdownDrainState_; }
@@ -358,8 +341,7 @@ signals:
     void activityChanged(bool active);
     void closeReady();
     void deferred(QString localId);
-    // A request is not a started or successful backup. No production consumer
-    // is connected while the generational engine remains inactive.
+    // A request is not a started or successful backup.
     void generationalBackupRequested(passwall::services::GenerationalBackupRequestOffer offer);
     // Revocation only invalidates an unstarted token. It is not a backup result.
     void generationalBackupRequestInvalidated(quint64 requestId);
@@ -367,12 +349,8 @@ signals:
     void mutationBatchDiagnostic(QString vaultPath, quint64 generation, QString diagnostic);
     void generationalOperationStateChanged(
         passwall::services::GenerationalOperationState state);
-    void initialBackupInspectionSettled(
-        passwall::services::InitialBackupInspectionResult result);
     void generationalBackupSuspensionChanged(
         passwall::services::GenerationalBackupSuspensionState state);
-    void generationalInitialCopyResumeRequested(QString vaultPath);
-    void globalBackupReinspectionRequested(QString vaultPath);
     void generationalShutdownDrainChanged(
         passwall::services::GenerationalShutdownDrainState state);
 private:
@@ -386,9 +364,9 @@ private:
         quint64 inode = 0;
         QString destination;
         GenerationalBackupRequestKind kind = GenerationalBackupRequestKind::CrudGeneration;
-        std::shared_ptr<InitialBackupRequest> initialCopy;
         QByteArray vaultId;
         quint64 resumeEpoch = 0;
+        std::optional<GenerationalBackupRotationContext> rotationContext;
     };
     struct GenerationalSuspension {
         QString path;
@@ -400,39 +378,14 @@ private:
         quint64 epoch = 0;
         quint64 failureRequestId = 0;
         quint64 resumeRequestId = 0;
-        GenerationalBackupRequestKind pendingKind =
-            GenerationalBackupRequestKind::CrudGeneration;
         GenerationalBackupSuspensionReason reason =
             GenerationalBackupSuspensionReason::Failed;
         QString diagnostic;
         bool resumeRequested = false;
     };
-    struct InitialInspectionControl {
-        std::atomic_bool cancellationRequested{false};
-        std::atomic_bool snapshotReservationHeld{false};
-        InitialBackupCancellation observer;
-    };
     struct ManualOperationRecord {
         quint64 id = 0;
         std::shared_ptr<ManualBackupOperationAdmission::State> state;
-    };
-    struct InitialInspectionFingerprint {
-        QString path;
-        QByteArray vaultId;
-        quint64 device = 0;
-        quint64 inode = 0;
-        quint64 sessionGeneration = 0;
-        GlobalBackupPreferencesStatus configurationStatus =
-            GlobalBackupPreferencesStatus::Absent;
-        GlobalBackupPreferences preferences;
-        QString configurationSourceFile;
-        bool forceInitialCopy = false;
-        quint64 activityId = 0;
-    };
-    struct InitialInspectionActivity : InitialInspectionFingerprint {
-        GenerationalOperationPhase phase = GenerationalOperationPhase::Inspecting;
-        std::shared_ptr<InitialBackupRequest> preparedRequest;
-        std::shared_ptr<InitialInspectionControl> control;
     };
     void beginModificationSession(const VaultFileIdentity& identity);
     void observeCommittedMutation(const QString& path, quint64 commitGeneration);
@@ -441,12 +394,6 @@ private:
     void retainLockCapturedMutationBatch(MutationBatch batch);
     void settleMutationBatchesForShutdown();
     void retainReadyMutationBatch(MutationBatch batch);
-    [[nodiscard]] bool hasPendingMutationFor(
-        const QString& path, quint64 device, quint64 inode) const;
-    [[nodiscard]] bool hasPendingInitialCopyFor(
-        const QString& path, quint64 device, quint64 inode) const;
-    void replacePendingInitialCopyWithMutation(
-        const QString& path, quint64 device, quint64 inode);
     [[nodiscard]] GenerationalSuspension* suspensionFor(
         const QString& path, const QByteArray& vaultId,
         quint64 device, quint64 inode);
@@ -466,7 +413,6 @@ private:
     void publishOperationState(GenerationalOperationState state);
     [[nodiscard]] bool manualOperationBlocks(const QString& path) const;
     void releaseManualOperation(quint64 id) noexcept;
-    void cancelInitialInspectionActivity();
     void captureScheduledMutationForShutdownDrain();
     void evaluateGenerationalShutdownDrain();
     void publishGenerationalShutdownDrain(
@@ -476,18 +422,10 @@ private:
     [[nodiscard]] bool globalPreferencesAllowDispatch() const noexcept;
     [[nodiscard]] bool globalPreferencesMatch(
         const GlobalBackupPreferencesResult& configuration) const noexcept;
+    void reloadGlobalBackupPreferencesAsync(
+        const QString& settingsFile, bool persistenceConfirmed);
     void invalidatePreparedRequestsForGlobalPreferences();
     void retainCrudAfterConfigurationInvalidation(MutationBatch batch);
-    void completeInitialBackupInspection(quint64 activityId,
-        const std::shared_ptr<InitialInspectionControl>& control,
-        InitialBackupPreparation preparation);
-    [[nodiscard]] bool initialInspectionMatches(
-        const InitialInspectionFingerprint& fingerprint,
-        const GlobalBackupPreferencesResult& configuration,
-        const AuthenticatedBackupSession& session) const;
-    void finishInitialInspectionActivity(quint64 activityId,
-        GenerationalOperationPhase terminalPhase,
-        std::optional<InitialInspectionFingerprint> completed = std::nullopt);
     void scheduleReadyMutationBatch();
     void dispatchReadyMutationBatch();
     void retryMutationBatchAfterRelease();
@@ -495,7 +433,8 @@ private:
     void settleUnstartedMutationBatch(MutationBatch batch,
         BackupOutcome outcome, const QString& diagnostic);
     [[nodiscard]] bool finishMutationBackup(quint64 requestId, BackupResult result,
-        std::optional<MutationBackupPublicationReceipt> publication = {});
+        std::optional<MutationBackupPublicationReceipt> publication = {},
+        bool workerTerminated = false);
     void superviseGenerationalJob(BackupJob* job, quint64 requestId);
     void dispatch();
     void schedulePending();
@@ -520,18 +459,19 @@ private:
     quint64 modificationSessionDevice_ = 0;
     quint64 modificationSessionInode_ = 0;
     quint64 modificationSessionGeneration_ = 0;
-    quint64 mutationGeneration_ = 0;
+    // Shared volatile ordering of admitted backup needs within this session.
+    // A manual request reserves an ordinal but is not a committed mutation.
+    quint64 backupGeneration_ = 0;
+    quint64 mutationGeneration_ = 0; // Latest actual committed mutation ordinal.
     quint64 scheduledMutationGeneration_ = 0;
     quint64 scheduledSessionGeneration_ = 0;
     quint64 minimumCommitGeneration_ = 0;
     quint64 lastAcceptedCommitGeneration_ = 0;
     quint64 nextMutationRequestId_ = 0;
-    quint64 nextInitialInspectionId_ = 0;
     quint64 nextManualOperationId_ = 0;
-    std::optional<InitialInspectionActivity> initialInspectionActivity_;
-    std::optional<InitialInspectionFingerprint> completedInitialInspection_;
     std::optional<GlobalBackupPreferencesResult> globalBackupPreferences_;
-    QString pendingInitialReinspectionPath_;
+    bool globalPreferencesInitializationRequired_ = false;
+    quint64 globalPreferencesReloadSerial_ = 0;
     std::optional<MutationBatch> offeredMutationBatch_;
     std::optional<MutationBatch> waitingMutationBatch_;
     std::optional<MutationBatch> activeMutationBatch_;
@@ -562,6 +502,5 @@ Q_DECLARE_METATYPE(passwall::services::MutationBackupPublicationReceipt)
 Q_DECLARE_METATYPE(passwall::services::MutationBackupResult)
 Q_DECLARE_METATYPE(passwall::services::GenerationalBackupRequestOffer)
 Q_DECLARE_METATYPE(passwall::services::GenerationalOperationState)
-Q_DECLARE_METATYPE(passwall::services::InitialBackupInspectionResult)
 Q_DECLARE_METATYPE(passwall::services::GenerationalBackupSuspensionState)
 Q_DECLARE_METATYPE(passwall::services::GenerationalShutdownDrainState)

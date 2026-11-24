@@ -1,6 +1,7 @@
 #include "services/backup_protocol.hpp"
 #include "services/vault_snapshot_service.hpp"
 #include "services/backup_rotation_service.hpp"
+#include "services/backup_publication_verifier.hpp"
 #include "storage/vault_operation_guard.hpp"
 
 #include <QCoreApplication>
@@ -128,7 +129,7 @@ int main(int argc, char** argv)
             static bool verify(void* pointer, const std::string& path, std::string& error) {
                 auto& self = *static_cast<EvidenceContext*>(pointer);
                 QString diagnostic;
-                const bool ok = BackupRotationService::inspectEncryptedFile(QString::fromStdString(path),
+                const bool ok = BackupPublicationVerifier::inspectEncryptedFile(QString::fromStdString(path),
                     self.evidence, diagnostic, {&ParentChannel::check, self.channel});
                 error = diagnostic.toStdString(); return ok;
             }
@@ -142,7 +143,7 @@ int main(int argc, char** argv)
             || snapshot.publication == SnapshotPublication::PublishedDurabilityUnconfirmed)) {
             BackupFileEvidence published;
             QString error;
-            if (!BackupRotationService::inspectEncryptedFile(destination, published, error,
+            if (!BackupPublicationVerifier::inspectEncryptedFile(destination, published, error,
                     {&ParentChannel::check, &channel})
                 || published.device != evidence.evidence.device || published.inode != evidence.evidence.inode
                 || published.birth != evidence.evidence.birth || published.size != evidence.evidence.size

@@ -56,11 +56,15 @@ void MainWindow::requestReplacementAuthorization(const QString& localId,
     const auto reject = [&](services::VaultReplacementAuthorization authority, QString error) noexcept {
         try { completion(std::move(authority), std::move(error)); } catch (...) {}
     };
+    auto precautionPolicy =
+        services::ReplacementPrecautionPolicy::HistoricalRegistration;
 #ifdef Q_OS_LINUX
     if (admittedVaultPath.isEmpty()) admittedVaultPath = vaultPath_;
     const bool generational = automaticBackup_
         && automaticBackup_->triggerMode()
             == services::BackupTriggerMode::Generational;
+    if (generational)
+        precautionPolicy = services::ReplacementPrecautionPolicy::Required;
     if (generational && !admission) {
         QString admissionError;
         auto acquired = automaticBackup_->acquireUserOperation(
@@ -132,7 +136,7 @@ void MainWindow::requestReplacementAuthorization(const QString& localId,
         auto validation = [guarded, preparationGeneration] { return guarded && guarded->isSessionThread()
             && guarded->replacementGeneration_ == preparationGeneration
             && guarded->hasLifecycleProtection() && guarded->isFullyLocked(); };
-        prepareOffThread([pending, store, localId, validation] {
+        prepareOffThread([pending, store, localId, validation, precautionPolicy] {
             try {
                 storage::VaultOperationGuard reservation;
                 std::string reservationError;
@@ -144,10 +148,11 @@ void MainWindow::requestReplacementAuthorization(const QString& localId,
                         return;
                     }
                     pending->state = Authorization::reserve(store, localId,
-                        validation, std::move(reservation), pending->error);
+                        precautionPolicy, validation, std::move(reservation),
+                        pending->error);
                 } else {
                     pending->state = Authorization::reserve(store, localId,
-                        validation, pending->error);
+                        precautionPolicy, validation, pending->error);
                 }
             } catch (...) { pending->error = QStringLiteral("Impossible de réserver le coffre."); }
         }, [guarded, pending, initialGeneration, preparationGeneration, deliver]() mutable {

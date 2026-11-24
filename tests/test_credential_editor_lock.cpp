@@ -1,11 +1,17 @@
 #include "gui/credential_editor_context.hpp"
+#include "gui/global_backup_preferences_controller.hpp"
+#include "gui/global_backup_preferences_dialog.hpp"
+#include "gui/generational_backup_status_controller.hpp"
 #include "gui/main_window.hpp"
 #include "services/credential_service.hpp"
 #include "services/automatic_backup_coordinator.hpp"
+#include "services/backup_job.hpp"
+#include "services/backup_series_identity.hpp"
 #include "services/restore_protocol.hpp"
 #include "storage/vault_operation_guard.hpp"
 #include "services/vault_lifecycle_service.hpp"
 #include "services/global_backup_preferences_store.hpp"
+#include "services/generational_backup_rotation_controller.hpp"
 #ifdef Q_OS_LINUX
 #include "fake_login1_backend.hpp"
 #include "platform/linux_instance_lock.hpp"
@@ -26,24 +32,32 @@
 #include <QClipboard>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDir>
+#include <QDirIterator>
+#include <QEvent>
 #include <QEventLoop>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
 #include <QInputDialog>
 #include <QKeyEvent>
 #include <QLineEdit>
+#include <QLabel>
 #include <QJsonDocument>
 #include <QListWidget>
 #include <QMessageBox>
 #include <QLockFile>
 #include <QPushButton>
 #include <QSettings>
+#include <QStringList>
 #include <QStackedWidget>
 #include <QStatusBar>
 #include <QTemporaryDir>
 #include <QTextEdit>
+#include <QToolButton>
 #include <QTimer>
 #include <QScopeGuard>
+#include <QSignalBlocker>
 #include <cstring>
 #include <cstdio>
 #include <sys/stat.h>
@@ -58,6 +72,7 @@
 namespace passwall::tests {
 QString restoreWorkerPathOverride;
 QString restoreApplicationPathOverride;
+void setBackupSettingsTestWorker(QString path);
 void overrideRestoreExecutablePaths(const QString& worker, const QString& application)
 {
     restoreWorkerPathOverride = worker;
@@ -79,6 +94,24 @@ std::atomic<bool> pausePreparationSync{false}, preparationSyncEntered{false}, re
 std::atomic<bool> failPreparationSync{false};
 std::mutex preparationSyncMutex;
 std::condition_variable preparationSyncCondition;
+struct RotationCheckpointPause {
+    passwall::services::BackupSeriesRotationCheckpoint checkpoint =
+        passwall::services::BackupSeriesRotationCheckpoint::BeforeInspection;
+    std::atomic_bool entered{false};
+    std::atomic_bool released{false};
+    std::mutex mutex;
+    std::condition_variable condition;
+};
+void pauseGenerationalRotation(void* raw,
+    passwall::services::BackupSeriesRotationCheckpoint checkpoint) noexcept
+{
+    auto& pause = *static_cast<RotationCheckpointPause*>(raw);
+    if (checkpoint != pause.checkpoint
+        || pause.entered.exchange(true))
+        return;
+    std::unique_lock lock(pause.mutex);
+    pause.condition.wait(lock, [&] { return pause.released.load(); });
+}
 std::mutex phaseSyncMutex;
 QString phaseSyncPath;
 QByteArray phaseSyncMarker;
@@ -134,6 +167,7 @@ extern "C" ssize_t __wrap_send(int fd, const void* data, size_t size, int flags)
         if (restoreGrantFault == "principal") grant["principal"] = grant["principal"].toString() + ".other";
         if (restoreGrantFault == "vault") grant["vault"] = different(grant["vault"].toString());
         if (restoreGrantFault == "inode") grant["inode"] = "0";
+        if (restoreGrantFault == "policy") grant["precaution-policy"] = "invalid";
         if (restoreGrantFault == "session") message["session"] = different(message["session"].toString());
         if (restoreGrantFault == "protocol") message["v"] = 2;
         message["grant"] = grant;
@@ -200,6 +234,63 @@ Credential makeCredential()
     credential.notes = "fictitious-notes-initial";
     return credential;
 }
+
+#ifdef Q_OS_LINUX
+QString generationalStatusDiagnostic(
+    const passwall::services::AutomaticBackupCoordinator* coordinator,
+    const passwall::gui::GenerationalBackupStatusController* status,
+    const QString& vaultPath, qsizetype publicationCount,
+    qsizetype rotationCount)
+{
+    if (!coordinator || !status)
+        return QStringLiteral("contrôleur de diagnostic absent");
+    const auto operation = coordinator->generationalOperationState(vaultPath);
+    const auto suspension = coordinator->generationalBackupSuspension(vaultPath);
+    return QStringLiteral(
+        "backup='%1'; backupDetail='%2'; lastBackup='%3'; "
+        "lastBackupDetail='%4'; rotation='%5'; rotationDetail='%6'; "
+        "suspended=%7; suspensionReason=%8; suspensionWorkerAlive=%9; "
+        "resumeRequested=%10; phase=%11; operationWorkerAlive=%12; "
+        "requestId=%13; mutationGeneration=%14; sessionGeneration=%15; "
+        "publications=%16; rotations=%17; suspensionVaultId=%18; "
+        "device=%19; inode=%20")
+        .arg(status->backupStatus(), status->backupDetail(),
+            status->lastBackupResultStatus(),
+            status->lastBackupResultDetail())
+        .arg(status->rotationStatus(), status->rotationDetail())
+        .arg(suspension.suspended)
+        .arg(static_cast<int>(suspension.reason))
+        .arg(suspension.workerAlive)
+        .arg(suspension.resumeRequested)
+        .arg(static_cast<int>(operation.phase))
+        .arg(operation.workerAlive)
+        .arg(operation.requestId)
+        .arg(operation.mutationGeneration)
+        .arg(operation.sessionGeneration)
+        .arg(publicationCount)
+        .arg(rotationCount)
+        .arg(QString::fromLatin1(suspension.vaultId.toHex()))
+        .arg(suspension.device)
+        .arg(suspension.inode);
+}
+
+QString vaultCorrelationDiagnostic(
+    const passwall::services::VaultFileIdentity& expected,
+    const passwall::services::VaultFileIdentity& received)
+{
+    return QStringLiteral(
+        "expected={path='%1', vaultId=%2, device=%3, inode=%4, birth='%5'}; "
+        "received={path='%6', vaultId=%7, device=%8, inode=%9, birth='%10'}")
+        .arg(expected.path, QString::fromLatin1(expected.vaultId.toHex()))
+        .arg(expected.device)
+        .arg(expected.inode)
+        .arg(expected.birthTime)
+        .arg(received.path, QString::fromLatin1(received.vaultId.toHex()))
+        .arg(received.device)
+        .arg(received.inode)
+        .arg(received.birthTime);
+}
+#endif
 
 struct EditorFields {
     QDialog dialog;
@@ -423,7 +514,7 @@ protected:
         QSettings settings("PassWall", "PassWall");
         settings.setValue("security/autoLockMinutes", 1);
         settings.setValue("vault/lastPath", vaultPath);
-        window = std::make_unique<MainWindow>();
+        window = MainWindow::createForHistoricalTests();
         // Existing editor/timer tests inject available lifecycle protection;
         // dedicated Linux tests below exercise the actual monitor handshake.
         window->setLifecycleProtectionValidator([] { return true; }, [] {});
@@ -486,7 +577,7 @@ protected:
 
     void newLockedWindow()
     {
-        window = std::make_unique<MainWindow>();
+        window = MainWindow::createForHistoricalTests();
         window->setLifecycleProtectionValidator([] { return true; }, [] {});
         window->setLifecycleProtectionAvailable(true);
         window->show();
@@ -499,6 +590,18 @@ protected:
         window.reset();
         QApplication::processEvents();
         window = MainWindow::createForGenerationalTests();
+        window->setLifecycleProtectionValidator([] { return true; }, [] {});
+        window->setLifecycleProtectionAvailable(true);
+        window->show();
+        runBounded([&] { unlock(); });
+        ASSERT_TRUE(window->acquireLease().unlocked);
+    }
+
+    void restartWithGenerationalProductionComposition()
+    {
+        window.reset();
+        QApplication::processEvents();
+        window = MainWindow::createForGenerationalProductionCompositionTests();
         window->setLifecycleProtectionValidator([] { return true; }, [] {});
         window->setLifecycleProtectionAvailable(true);
         window->show();
@@ -629,6 +732,19 @@ protected:
         EXPECT_EQ(summaries.size(), expected);
     }
 #ifdef Q_OS_LINUX
+    void commitGenerationalCredential(const char* title)
+    {
+        Credential added = makeCredential();
+        added.id = {};
+        added.title = title;
+        const auto wipe = qScopeGuard([&] { wipeCredential(added); });
+        std::string error;
+        ASSERT_TRUE(CredentialService::add(
+            vaultPath.toStdString(), verificationKey, added, error,
+            passwall::services::BackupTriggerMode::Generational))
+            << error;
+    }
+
     passwall::services::VaultReplacementAuthorization prepareReplacement()
     {
         using namespace passwall::services;
@@ -834,99 +950,922 @@ protected:
 };
 
 #ifdef Q_OS_LINUX
-TEST_F(MainWindowEditorLockTest, ProductionManualLockKeepsGenerationalTriggerInactive)
+TEST_F(MainWindowEditorLockTest,
+    PublicConstructorSelectsGenerationalAndHidesHistoricalPreferences)
 {
-    using passwall::services::AutomaticBackupCoordinator;
-    auto* coordinator = window->findChild<AutomaticBackupCoordinator*>(
+    window.reset();
+    QApplication::processEvents();
+    window = std::make_unique<MainWindow>();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
         QStringLiteral("automaticBackupCoordinator"));
     ASSERT_NE(coordinator, nullptr);
-
-    Credential added = makeCredential();
-    added.id = {};
-    added.title = "Fictitious mutation before lock";
-    const auto wipe = qScopeGuard([&] { wipeCredential(added); });
-    std::string error;
-    ASSERT_TRUE(CredentialService::add(
-        vaultPath.toStdString(), verificationKey, added, error)) << error;
     ASSERT_EQ(coordinator->triggerMode(),
-        passwall::services::BackupTriggerMode::Historical);
-    ASSERT_FALSE(coordinator->modificationGroupingPending());
-
-    const auto oldLease = window->acquireLease();
-    bool invalidated = false;
-    bool requested = false;
-    QString requestedPath;
-    QObject observer;
-    QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated,
-        &observer, [&] { invalidated = true; });
-    QObject::connect(coordinator, &AutomaticBackupCoordinator::generationalBackupRequested,
-        &observer, [&](passwall::services::GenerationalBackupRequestOffer offer) {
-            requested = true;
-            requestedPath = offer.vaultPath;
-            EXPECT_TRUE(invalidated);
-            EXPECT_FALSE(window->isLeaseCurrent(oldLease));
-            EXPECT_FALSE(window->acquireLease().unlocked);
-        });
-
-    lock();
-    EXPECT_TRUE(invalidated);
-    EXPECT_FALSE(window->acquireLease().unlocked);
-    EXPECT_FALSE(requested); // No consumer runs in the cleanup/lock stack.
-    QCoreApplication::processEvents();
-    EXPECT_FALSE(requested);
-    EXPECT_TRUE(requestedPath.isEmpty());
-    EXPECT_FALSE(coordinator->isActive());
+        passwall::services::BackupTriggerMode::Generational);
+    EXPECT_EQ(window->findChild<QAction*>(
+        QStringLiteral("backupSettingsAction")), nullptr);
+    EXPECT_NE(window->findChild<QAction*>(
+        QStringLiteral("globalBackupPreferencesAction")), nullptr);
+    EXPECT_NE(window->findChild<QAction*>(
+        QStringLiteral("generationalBackupStatusAction")), nullptr);
+    EXPECT_NE(window->findChild<QToolButton*>(
+        QStringLiteral("generationalBackupStatusButton")), nullptr);
+    EXPECT_NE(window->findChild<
+        passwall::gui::GlobalBackupPreferencesController*>(), nullptr);
+    EXPECT_NE(window->findChild<
+        passwall::gui::GenerationalBackupStatusController*>(), nullptr);
 }
 
-TEST_F(MainWindowEditorLockTest, ProductionNormalCloseDoesNotSettleAnInactiveGeneration)
+TEST_F(MainWindowEditorLockTest,
+    PublicGenerationalCommitDrainsAtCloseWithoutHistoricalPublication)
 {
     using passwall::services::AutomaticBackupCoordinator;
     using passwall::services::MutationBackupOutcome;
     using passwall::services::MutationBackupResult;
-    auto* coordinator = window->findChild<AutomaticBackupCoordinator*>(
+    const QString backupRoot = testDirectory->filePath(
+        QStringLiteral("public-generational-backups"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(passwall::services::GlobalBackupPreferencesStore().save(
+        {backupRoot, 7}).valid());
+
+    window.reset();
+    QApplication::processEvents();
+    window = std::make_unique<MainWindow>();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
         QStringLiteral("automaticBackupCoordinator"));
     ASSERT_NE(coordinator, nullptr);
+    auto* preferencesController = window->findChild<
+        passwall::gui::GlobalBackupPreferencesController*>();
+    ASSERT_NE(preferencesController, nullptr);
+    int preferenceReads = 0;
+    QObject observer;
+    QObject::connect(preferencesController,
+        &passwall::gui::GlobalBackupPreferencesController::readSettled,
+        &observer, [&](passwall::services::GlobalBackupPreferencesStatus status) {
+            EXPECT_EQ(status,
+                passwall::services::GlobalBackupPreferencesStatus::Valid);
+            ++preferenceReads;
+        });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return preferenceReads == 1; },
+        10000));
+    runBounded([&] { unlock(); });
+    ASSERT_TRUE(window->acquireLease().unlocked);
 
     Credential added = makeCredential();
     added.id = {};
-    added.title = "Fictitious mutation before normal close";
+    added.title = "Fictitious public generation before close";
     const auto wipe = qScopeGuard([&] { wipeCredential(added); });
     std::string error;
     ASSERT_TRUE(CredentialService::add(
-        vaultPath.toStdString(), verificationKey, added, error)) << error;
+        vaultPath.toStdString(), verificationKey, added, error,
+        passwall::services::BackupTriggerMode::Generational)) << error;
     ASSERT_EQ(coordinator->triggerMode(),
-        passwall::services::BackupTriggerMode::Historical);
-    ASSERT_FALSE(coordinator->modificationGroupingPending());
+        passwall::services::BackupTriggerMode::Generational);
 
-    const auto oldLease = window->acquireLease();
-    bool invalidated = false;
-    int requests = 0;
-    QVector<MutationBackupOutcome> outcomes;
-    QObject observer;
-    QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated,
-        &observer, [&] { invalidated = true; });
-    QObject::connect(coordinator, &AutomaticBackupCoordinator::generationalBackupRequested,
-        &observer, [&](passwall::services::GenerationalBackupRequestOffer) { ++requests; });
+    QVector<MutationBackupResult> outcomes;
     QObject::connect(coordinator, &AutomaticBackupCoordinator::mutationBatchSettled,
         &observer, [&](MutationBackupResult result) {
-            outcomes.push_back(result.outcome);
+            outcomes.push_back(std::move(result));
         });
 
-    EXPECT_TRUE(window->close());
-    EXPECT_TRUE(invalidated);
+    EXPECT_FALSE(window->close());
     EXPECT_FALSE(window->acquireLease().unlocked);
-    EXPECT_EQ(requests, 0); // The production generation consumer is still disabled.
-    EXPECT_TRUE(outcomes.isEmpty());
-    EXPECT_TRUE(coordinator->canClose());
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return outcomes.size() == 1; },
+        10000));
+    EXPECT_EQ(outcomes.front().outcome, MutationBackupOutcome::Published);
+    EXPECT_EQ(outcomes.front().kind,
+        passwall::services::GenerationalBackupRequestKind::CrudGeneration);
+    EXPECT_TRUE(outcomes.front().workerTerminated);
+    ASSERT_TRUE(outcomes.front().publication.has_value());
+    EXPECT_TRUE(QFileInfo::exists(outcomes.front().publication->destination));
+    EXPECT_EQ(QFileInfo(outcomes.front().publication->destination).suffix(),
+        QStringLiteral("pwdb"));
+    QDirIterator historical(backupRoot, {QStringLiteral("*.db")},
+        QDir::Files, QDirIterator::Subdirectories);
+    EXPECT_FALSE(historical.hasNext());
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return !window->isVisible(); },
+        10000));
 }
 
 #ifdef PASSWALL_GUI_TESTING
+TEST_F(MainWindowEditorLockTest,
+    GenerationalStatusKeepsPublicationRotationAndStaleTokensDistinct)
+{
+    using namespace passwall::services;
+    AutomaticBackupCoordinator coordinator(VaultPreferencesStore(),
+        QStringLiteral("unused-test-worker"), 100, 100,
+        BackupTriggerMode::Generational);
+    GenerationalBackupRotationController rotation(coordinator);
+    passwall::gui::GenerationalBackupStatusController status(
+        coordinator, rotation, window.get());
+    VaultFileIdentity identity;
+    QString error;
+    ASSERT_TRUE(VaultPreferencesStore::inspectVault(
+        vaultPath, identity, error)) << error.toStdString();
+    status.setAuthenticatedVault(identity);
+    status.preferencesReadSettled(GlobalBackupPreferencesStatus::ReadError);
+    EXPECT_TRUE(status.configurationStatus().contains(
+        QStringLiteral("Lecture sûre"), Qt::CaseInsensitive));
+    status.preferencesWriteSettled(GlobalBackupPreferencesStatus::WriteError);
+    EXPECT_TRUE(status.configurationStatus().contains(
+        QStringLiteral("persistance"), Qt::CaseInsensitive));
+
+    GenerationalBackupSuspensionState liveUnknown;
+    liveUnknown.suspended = true;
+    liveUnknown.reason = GenerationalBackupSuspensionReason::Unknown;
+    liveUnknown.vaultPath = identity.path;
+    liveUnknown.vaultId = identity.vaultId;
+    liveUnknown.device = identity.device;
+    liveUnknown.inode = identity.inode;
+    liveUnknown.workerAlive = true;
+    coordinator.generationalBackupSuspensionChanged(liveUnknown);
+    EXPECT_FALSE(status.retryAvailable());
+    liveUnknown.workerAlive = false;
+    coordinator.generationalBackupSuspensionChanged(liveUnknown);
+    EXPECT_TRUE(status.retryAvailable());
+    status.invalidateAuthenticatedSession();
+    EXPECT_FALSE(status.retryAvailable());
+    status.setAuthenticatedVault(identity);
+    GenerationalBackupSuspensionState cleared = liveUnknown;
+    cleared.suspended = false;
+    coordinator.generationalBackupSuspensionChanged(cleared);
+    EXPECT_FALSE(status.retryAvailable());
+
+    GenerationalBackupRequestOffer offer;
+    offer.kind = GenerationalBackupRequestKind::CrudGeneration;
+    offer.vaultPath = identity.path;
+    offer.vault = identity;
+    offer.vault.birthTime.clear(); // offerFor() carries the stable tuple only.
+    offer.mutationGeneration = 8;
+    offer.requestId = 41;
+    coordinator.generationalBackupRequested(offer);
+    EXPECT_TRUE(status.backupStatus().contains(
+        QStringLiteral("attente"), Qt::CaseInsensitive))
+        << vaultCorrelationDiagnostic(identity, offer.vault).toStdString();
+    GenerationalOperationState active;
+    active.phase = GenerationalOperationPhase::WorkerActive;
+    active.vaultPath = identity.path;
+    active.mutationGeneration = 8;
+    active.requestId = 41;
+    active.workerAlive = true;
+    coordinator.generationalOperationStateChanged(active);
+    EXPECT_TRUE(status.backupStatus().contains(
+        QStringLiteral("en cours"), Qt::CaseInsensitive))
+        << vaultCorrelationDiagnostic(identity, offer.vault).toStdString();
+    EXPECT_FALSE(status.backupStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive));
+
+    MutationBackupResult published;
+    published.vaultPath = identity.path;
+    published.generation = 8;
+    published.requestId = 41;
+    published.outcome = MutationBackupOutcome::Published;
+    published.workerOutcome = BackupOutcome::Published;
+    published.publication = MutationBackupPublicationReceipt{};
+    published.publication->vaultPath = identity.path;
+    published.publication->destination =
+        QStringLiteral("/tmp/fictitious-status-copy.pwdb");
+    published.publication->generation = 8;
+    published.publication->requestId = 41;
+    published.publication->kind =
+        GenerationalBackupRequestKind::CrudGeneration;
+    BackupFileEvidence evidence;
+    evidence.device = 1;
+    evidence.inode = 2;
+    evidence.size = 3;
+    evidence.mount = 4;
+    evidence.directoryDevice = 5;
+    evidence.directoryInode = 6;
+    evidence.directoryMount = 7;
+    evidence.birth = QStringLiteral("1:0");
+    evidence.modified = QStringLiteral("2:0");
+    evidence.changed = QStringLiteral("3:0");
+    evidence.directoryBirth = QStringLiteral("4:0");
+    evidence.sha256 = QByteArray(32, '\x42');
+    published.publication->evidence = evidence;
+    published.confirmedPublicationResult = BackupResult{
+        BackupOutcome::Published, QStringLiteral("publication-test"),
+        evidence, published.publication->destination};
+    published.workerTerminated = true;
+    {
+        // This test drives the presentation contract directly. Prevent the
+        // real rotation consumer from first rejecting this intentionally
+        // context-free publication and consuming the same presentation token.
+        const QSignalBlocker blockRotation(&rotation);
+        coordinator.mutationBatchSettled(published);
+    }
+    EXPECT_TRUE(status.backupStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive));
+    EXPECT_TRUE(status.lastBackupResultStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive));
+
+    GenerationalBackupRotationResult uncertainRotation;
+    uncertainRotation.requestId = 41;
+    uncertainRotation.generation = 8;
+    uncertainRotation.publishedPath = published.publication->destination;
+    uncertainRotation.rotation.outcome =
+        BackupSeriesRotationOutcome::DeletionDurabilityUnconfirmed;
+    uncertainRotation.rotation.diagnostic =
+        QStringLiteral("fsync [errno=5]");
+    rotation.rotationSettled(uncertainRotation);
+    EXPECT_TRUE(status.backupStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive));
+    EXPECT_TRUE(status.rotationStatus().contains(
+        QStringLiteral("durabilité non confirmée"), Qt::CaseInsensitive));
+    EXPECT_TRUE(status.rotationDetail().contains(QStringLiteral("errno=5")));
+    auto duplicateRotation = uncertainRotation;
+    duplicateRotation.rotation.outcome = BackupSeriesRotationOutcome::Complete;
+    duplicateRotation.rotation.diagnostic = QStringLiteral("duplicate-rotation");
+    rotation.rotationSettled(duplicateRotation);
+    EXPECT_TRUE(status.rotationStatus().contains(
+        QStringLiteral("durabilité non confirmée"), Qt::CaseInsensitive));
+    EXPECT_FALSE(status.rotationDetail().contains(
+        QStringLiteral("duplicate-rotation")));
+
+    MutationBackupResult stale = published;
+    stale.outcome = MutationBackupOutcome::Failed;
+    stale.workerOutcome = BackupOutcome::FailedBeforePublication;
+    stale.diagnostic = QStringLiteral("stale-duplicate");
+    stale.publication.reset();
+    stale.confirmedPublicationResult.reset();
+    coordinator.mutationBatchSettled(stale);
+    EXPECT_TRUE(status.backupStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive));
+    EXPECT_FALSE(status.backupDetail().contains(
+        QStringLiteral("stale-duplicate")));
+
+    offer.requestId = 42;
+    offer.vault.inode += 1;
+    coordinator.generationalBackupRequested(offer);
+    EXPECT_TRUE(status.backupStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive));
+    MutationBackupResult substituted = stale;
+    substituted.requestId = 42;
+    substituted.diagnostic = QStringLiteral("substituted-vault");
+    coordinator.mutationBatchSettled(substituted);
+    EXPECT_FALSE(status.backupDetail().contains(
+        QStringLiteral("substituted-vault")));
+
+    GenerationalOperationState latePending;
+    latePending.phase = GenerationalOperationPhase::PendingRequest;
+    latePending.vaultPath = identity.path;
+    latePending.mutationGeneration = 9;
+    coordinator.generationalOperationStateChanged(latePending);
+    EXPECT_TRUE(status.backupStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive));
+
+    status.invalidateAuthenticatedSession();
+    offer.requestId = 43;
+    offer.vault = identity;
+    offer.mutationGeneration = 9;
+    coordinator.generationalBackupRequested(offer);
+    EXPECT_TRUE(status.backupStatus().contains(
+        QStringLiteral("attente"), Qt::CaseInsensitive));
+    EXPECT_FALSE(status.retryAvailable());
+    MutationBackupResult drained = published;
+    drained.generation = 9;
+    drained.requestId = 43;
+    drained.publication->generation = 9;
+    drained.publication->requestId = 43;
+    drained.publication->destination =
+        QStringLiteral("/tmp/fictitious-drained-status-copy.pwdb");
+    drained.confirmedPublicationResult->publishedPath =
+        drained.publication->destination;
+    coordinator.mutationBatchSettled(drained);
+    EXPECT_TRUE(status.backupStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive));
+    EXPECT_FALSE(status.retryAvailable());
+
+    offer.requestId = 44;
+    offer.mutationGeneration = 10;
+    coordinator.generationalBackupRequested(offer);
+    MutationBackupResult wrongGeneration = drained;
+    wrongGeneration.requestId = 44;
+    wrongGeneration.generation = 11;
+    wrongGeneration.publication->requestId = 44;
+    wrongGeneration.publication->generation = 11;
+    wrongGeneration.diagnostic = QStringLiteral("wrong-generation");
+    coordinator.mutationBatchSettled(wrongGeneration);
+    EXPECT_TRUE(status.backupStatus().contains(
+        QStringLiteral("attente"), Qt::CaseInsensitive));
+    EXPECT_FALSE(status.backupDetail().contains(
+        QStringLiteral("wrong-generation")));
+    EXPECT_TRUE(status.lastBackupResultStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive));
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalMissingPreferencesAreProposedOnceWithoutBlockingVaultAccess)
+{
+    using namespace passwall::services;
+    using passwall::gui::GlobalBackupPreferencesController;
+    using passwall::gui::GlobalBackupPreferencesDialog;
+    const QString preferencesFile =
+        passwall::services::GlobalBackupPreferencesStore().fileName();
+    ASSERT_FALSE(QFileInfo::exists(preferencesFile));
+    const QString unchosenRoot =
+        testDirectory->filePath(QStringLiteral("not-created-by-dialog"));
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    EXPECT_EQ(window->findChild<QAction*>(
+        QStringLiteral("backupSettingsAction")), nullptr);
+    auto* action = window->findChild<QAction*>(
+        QStringLiteral("globalBackupPreferencesAction"));
+    ASSERT_NE(action, nullptr);
+    auto* statusAction = window->findChild<QAction*>(
+        QStringLiteral("generationalBackupStatusAction"));
+    ASSERT_NE(statusAction, nullptr);
+    ASSERT_NE(window->findChild<QToolButton*>(
+        QStringLiteral("generationalBackupStatusButton")), nullptr);
+    auto* statusController = window->findChild<
+        passwall::gui::GenerationalBackupStatusController*>();
+    ASSERT_NE(statusController, nullptr);
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    ASSERT_NE(coordinator, nullptr);
+    QVector<GenerationalBackupRequestOffer> offers;
+    QVector<MutationBackupResult> terminalResults;
+    QObject backupObserver;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequested,
+        &backupObserver, [&](GenerationalBackupRequestOffer offer) {
+            offers.push_back(std::move(offer));
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled,
+        &backupObserver, [&](MutationBackupResult result) {
+            terminalResults.push_back(std::move(result));
+        });
+    auto* controller = window->findChild<GlobalBackupPreferencesController*>();
+    ASSERT_NE(controller, nullptr);
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return window->findChild<GlobalBackupPreferencesDialog*>(
+            QStringLiteral("globalBackupPreferencesDialog")) != nullptr;
+    }));
+    QPointer<GlobalBackupPreferencesDialog> dialog =
+        window->findChild<GlobalBackupPreferencesDialog*>(
+            QStringLiteral("globalBackupPreferencesDialog"));
+    ASSERT_TRUE(dialog);
+    EXPECT_FALSE(dialog->isModal());
+    dialog->findChild<QLineEdit*>(
+        QStringLiteral("globalBackupRootEdit"))->setText(unchosenRoot);
+    dialog->findChild<QLineEdit*>(
+        QStringLiteral("globalBackupRetentionEdit"))->setText(
+            QStringLiteral("9"));
+    dialog->findChild<QPushButton*>(
+        QStringLiteral("globalBackupCloseButton"))->click();
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return dialog.isNull(); }));
+    EXPECT_FALSE(QFileInfo::exists(preferencesFile));
+    EXPECT_FALSE(QFileInfo::exists(unchosenRoot));
+
+    statusAction->trigger();
+    auto* statusDialog = window->findChild<QDialog*>(
+        QStringLiteral("generationalBackupStatusDialog"));
+    ASSERT_NE(statusDialog, nullptr);
+    EXPECT_FALSE(statusDialog->isModal());
+    statusDialog->reject();
+
+    runBounded([&] { unlock(); });
+    EXPECT_TRUE(window->acquireLease().unlocked);
+    QCoreApplication::sendPostedEvents();
+    QCoreApplication::processEvents();
+    EXPECT_FALSE(coordinator->isActive());
+    EXPECT_TRUE(statusController->backupStatus().contains(
+        QStringLiteral("Aucune opération"), Qt::CaseInsensitive));
+    EXPECT_TRUE(statusController->configurationStatus().contains(
+        QStringLiteral("absentes"), Qt::CaseInsensitive));
+    Credential added = makeCredential();
+    added.id = {};
+    added.title = "Fictitious mutation while global preferences are absent";
+    const auto wipe = qScopeGuard([&] { wipeCredential(added); });
+    std::string mutationError;
+    ASSERT_TRUE(CredentialService::add(
+        vaultPath.toStdString(), verificationKey, added, mutationError,
+        BackupTriggerMode::Generational))
+        << mutationError;
+    coordinator->requestPendingMutationsForLock(vaultPath);
+    QCoreApplication::processEvents();
+    EXPECT_TRUE(offers.isEmpty());
+    EXPECT_TRUE(terminalResults.isEmpty());
+    EXPECT_FALSE(coordinator->generationalBackupSuspension(vaultPath).suspended);
+    EXPECT_EQ(window->findChild<GlobalBackupPreferencesDialog*>(
+        QStringLiteral("globalBackupPreferencesDialog")), nullptr);
+
+    int reopenedPreferenceReads = 0;
+    GlobalBackupPreferencesStatus reopenedPreferenceStatus =
+        GlobalBackupPreferencesStatus::ReadError;
+    QObject::connect(controller,
+        &GlobalBackupPreferencesController::readSettled,
+        &backupObserver, [&](GlobalBackupPreferencesStatus status) {
+            reopenedPreferenceStatus = status;
+            ++reopenedPreferenceReads;
+        });
+    action->trigger();
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        auto* reopened = window->findChild<GlobalBackupPreferencesDialog*>(
+            QStringLiteral("globalBackupPreferencesDialog"));
+        auto* save = reopened ? reopened->findChild<QPushButton*>(
+            QStringLiteral("globalBackupSaveButton")) : nullptr;
+        return reopenedPreferenceReads == 1 && save && save->isEnabled();
+    }));
+    EXPECT_EQ(reopenedPreferenceStatus,
+        GlobalBackupPreferencesStatus::Absent);
+    auto* configuredDialog = window->findChild<GlobalBackupPreferencesDialog*>(
+        QStringLiteral("globalBackupPreferencesDialog"));
+    ASSERT_NE(configuredDialog, nullptr);
+    const QString configuredRoot =
+        testDirectory->filePath(QStringLiteral("configured-after-first-crud"));
+    ASSERT_TRUE(QDir().mkpath(configuredRoot));
+    configuredDialog->findChild<QLineEdit*>(
+        QStringLiteral("globalBackupRootEdit"))->setText(configuredRoot);
+    configuredDialog->findChild<QLineEdit*>(
+        QStringLiteral("globalBackupRetentionEdit"))->setText(
+            QStringLiteral("7"));
+    int preferenceWrites = 0;
+    GlobalBackupPreferencesStatus preferenceWriteStatus =
+        GlobalBackupPreferencesStatus::WriteError;
+    QObject::connect(controller,
+        &GlobalBackupPreferencesController::writeSettled,
+        &backupObserver, [&](GlobalBackupPreferencesStatus status) {
+            preferenceWriteStatus = status;
+            ++preferenceWrites;
+        });
+    configuredDialog->findChild<QPushButton*>(
+        QStringLiteral("globalBackupSaveButton"))->click();
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return preferenceWrites == 1;
+    }, 10000));
+    ASSERT_EQ(preferenceWriteStatus,
+        GlobalBackupPreferencesStatus::Valid);
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return terminalResults.size() == 1;
+    }, 10000))
+        << generationalStatusDiagnostic(coordinator, statusController,
+               vaultPath, terminalResults.size(), 0).toStdString();
+    ASSERT_EQ(offers.size(), 1)
+        << generationalStatusDiagnostic(coordinator, statusController,
+               vaultPath, terminalResults.size(), 0).toStdString();
+    EXPECT_EQ(offers[0].kind,
+        GenerationalBackupRequestKind::CrudGeneration);
+    EXPECT_GT(offers[0].mutationGeneration, 0U);
+    ASSERT_EQ(terminalResults[0].outcome,
+        MutationBackupOutcome::Published);
+    EXPECT_EQ(terminalResults[0].requestId, offers[0].requestId);
+    EXPECT_EQ(terminalResults[0].generation,
+        offers[0].mutationGeneration);
+    ASSERT_TRUE(terminalResults[0].publication.has_value());
+    EXPECT_TRUE(QFileInfo::exists(
+        terminalResults[0].publication->destination));
+    QCoreApplication::sendPostedEvents();
+    QCoreApplication::processEvents();
+    EXPECT_EQ(offers.size(), 1);
+    EXPECT_EQ(terminalResults.size(), 1);
+}
+
+TEST_F(MainWindowEditorLockTest,
+    ConfirmedGlobalConfigurationWaitsForFirstCommitThenPublishesCrud)
+{
+    using namespace passwall::services;
+    using passwall::gui::GlobalBackupPreferencesController;
+    using passwall::gui::GlobalBackupPreferencesDialog;
+    const QString preferencesFile = GlobalBackupPreferencesStore().fileName();
+    ASSERT_FALSE(QFileInfo::exists(preferencesFile));
+    const QString backupRoot =
+        testDirectory->filePath(QStringLiteral("configured-backups"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    auto* controller = window->findChild<GlobalBackupPreferencesController*>();
+    ASSERT_NE(coordinator, nullptr);
+    ASSERT_NE(controller, nullptr);
+    QVector<GenerationalBackupRequestOffer> offers;
+    QVector<MutationBackupResult> publications;
+    QObject observer;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequested,
+        &observer, [&](GenerationalBackupRequestOffer offer) {
+            offers.push_back(std::move(offer));
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult result) {
+            publications.push_back(std::move(result));
+        });
+    runBounded([&] { unlock(); });
+    ASSERT_TRUE(window->acquireLease().unlocked);
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return window->findChild<GlobalBackupPreferencesDialog*>(
+            QStringLiteral("globalBackupPreferencesDialog")) != nullptr;
+    }));
+    auto* dialog = window->findChild<GlobalBackupPreferencesDialog*>(
+        QStringLiteral("globalBackupPreferencesDialog"));
+    ASSERT_NE(dialog, nullptr);
+
+    QSettings historical(QStringLiteral("PassWall"), QStringLiteral("PassWall"));
+    historical.sync();
+    QFile historicalFile(historical.fileName());
+    ASSERT_TRUE(historicalFile.open(QIODevice::ReadOnly));
+    const QByteArray historicalBefore = historicalFile.readAll();
+    historicalFile.close();
+
+    GlobalBackupPreferencesStatus writeStatus =
+        GlobalBackupPreferencesStatus::Absent;
+    int writes = 0;
+    QObject::connect(controller,
+        &GlobalBackupPreferencesController::writeSettled,
+        &observer, [&](GlobalBackupPreferencesStatus status) {
+            writeStatus = status;
+            ++writes;
+        });
+    dialog->findChild<QLineEdit*>(
+        QStringLiteral("globalBackupRootEdit"))->setText(backupRoot);
+    dialog->findChild<QLineEdit*>(
+        QStringLiteral("globalBackupRetentionEdit"))->setText(
+            QString::number(std::numeric_limits<quint64>::max()));
+    dialog->findChild<QPushButton*>(
+        QStringLiteral("globalBackupSaveButton"))->click();
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return writes == 1 && writeStatus == GlobalBackupPreferencesStatus::Valid;
+    }, 10000));
+    QCoreApplication::sendPostedEvents();
+    QCoreApplication::processEvents();
+    EXPECT_TRUE(offers.isEmpty());
+    EXPECT_TRUE(publications.isEmpty());
+    EXPECT_FALSE(coordinator->isActive());
+
+    commitGenerationalCredential(
+        "Fictitious first committed generational entry");
+    commitGenerationalCredential(
+        "Fictitious nearby committed generational entry");
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return publications.size() == 1;
+    }, 10000));
+    ASSERT_EQ(publications[0].kind,
+        GenerationalBackupRequestKind::CrudGeneration);
+    ASSERT_EQ(offers.size(), 1);
+    EXPECT_EQ(offers[0].kind,
+        GenerationalBackupRequestKind::CrudGeneration);
+    EXPECT_EQ(offers[0].mutationGeneration, 2U);
+    EXPECT_EQ(publications[0].generation, 2U);
+    ASSERT_EQ(publications[0].outcome, MutationBackupOutcome::Published);
+    ASSERT_TRUE(publications[0].publication.has_value());
+    EXPECT_TRUE(QFileInfo::exists(publications[0].publication->destination));
+    EXPECT_EQ(GlobalBackupPreferencesStore().load().preferences.retainedVersions,
+        std::numeric_limits<quint64>::max());
+
+    ASSERT_TRUE(historicalFile.open(QIODevice::ReadOnly));
+    EXPECT_EQ(historicalFile.readAll(), historicalBefore);
+    historicalFile.close();
+    EXPECT_TRUE(window->acquireLease().unlocked);
+
+    QPointer<GlobalBackupPreferencesDialog> oldDialog(dialog);
+    dialog->reject();
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return oldDialog.isNull(); }));
+    window->findChild<QAction*>(
+        QStringLiteral("globalBackupPreferencesAction"))->trigger();
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        auto* reopened = window->findChild<GlobalBackupPreferencesDialog*>(
+            QStringLiteral("globalBackupPreferencesDialog"));
+        return reopened
+            && reopened->findChild<QLineEdit*>(
+                QStringLiteral("globalBackupRootEdit"))->text() == backupRoot
+            && reopened->findChild<QLineEdit*>(
+                QStringLiteral("globalBackupRetentionEdit"))->text()
+                == QString::number(std::numeric_limits<quint64>::max());
+    }));
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* restartedCoordinator =
+        window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+            QStringLiteral("automaticBackupCoordinator"));
+    auto* restartedPreferences =
+        window->findChild<GlobalBackupPreferencesController*>();
+    ASSERT_NE(restartedCoordinator, nullptr);
+    ASSERT_NE(restartedPreferences, nullptr);
+    int restartedOffers = 0;
+    int restartedPreferenceReads = 0;
+    QObject restartObserver;
+    QObject::connect(restartedCoordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequested,
+        &restartObserver, [&](GenerationalBackupRequestOffer) {
+            ++restartedOffers;
+        });
+    QObject::connect(restartedPreferences,
+        &GlobalBackupPreferencesController::readSettled,
+        &restartObserver, [&](GlobalBackupPreferencesStatus status) {
+            EXPECT_EQ(status, GlobalBackupPreferencesStatus::Valid);
+            ++restartedPreferenceReads;
+        });
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return restartedPreferenceReads == 1;
+    }));
+    runBounded([&] { unlock(); });
+    QCoreApplication::sendPostedEvents();
+    QCoreApplication::processEvents();
+    EXPECT_FALSE(restartedCoordinator->isActive());
+    EXPECT_EQ(restartedOffers, 0);
+}
+
+TEST_F(MainWindowEditorLockTest,
+    LateGlobalPreferenceSaveAfterLockCannotStartAWorker)
+{
+    using namespace passwall::services;
+    using passwall::gui::GlobalBackupPreferencesDialog;
+    const QString backupRoot =
+        testDirectory->filePath(QStringLiteral("late-settings-backups"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    ASSERT_NE(coordinator, nullptr);
+    int publications = 0;
+    bool preferenceChangeObserved = false;
+    QObject observer;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult) { ++publications; });
+    QObject::connect(&GlobalBackupPreferencesStore::events(),
+        &GlobalBackupPreferencesEvents::changed,
+        &observer, [&](const QString&, bool) {
+            preferenceChangeObserved = true;
+        });
+    runBounded([&] { unlock(); });
+    ASSERT_TRUE(window->acquireLease().unlocked);
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return window->findChild<GlobalBackupPreferencesDialog*>(
+            QStringLiteral("globalBackupPreferencesDialog")) != nullptr;
+    }));
+    auto* dialog = window->findChild<GlobalBackupPreferencesDialog*>(
+        QStringLiteral("globalBackupPreferencesDialog"));
+    ASSERT_NE(dialog, nullptr);
+    dialog->findChild<QLineEdit*>(
+        QStringLiteral("globalBackupRootEdit"))->setText(backupRoot);
+    dialog->findChild<QLineEdit*>(
+        QStringLiteral("globalBackupRetentionEdit"))->setText(
+            QStringLiteral("7"));
+
+    int heartbeatTicks = 0;
+    QTimer heartbeat;
+    QObject::connect(&heartbeat, &QTimer::timeout,
+        [&] { ++heartbeatTicks; });
+    heartbeat.start(0);
+    passwall::tests::holdSettingsSync();
+    const auto release = qScopeGuard([] {
+        passwall::tests::releaseSettingsSync();
+    });
+    dialog->findChild<QPushButton*>(
+        QStringLiteral("globalBackupSaveButton"))->click();
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [] { return passwall::tests::settingsSyncEntered(); }, 10000));
+    EXPECT_GT(heartbeatTicks, 0);
+
+    lock();
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    passwall::tests::releaseSettingsSync();
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return preferenceChangeObserved
+            && GlobalBackupPreferencesStore().load().valid();
+    }, 10000));
+    QCoreApplication::sendPostedEvents();
+    QCoreApplication::processEvents();
+    EXPECT_EQ(publications, 0);
+    EXPECT_FALSE(coordinator->isActive());
+}
+
+TEST_F(MainWindowEditorLockTest,
+    ValidGlobalPreferencesNeitherSearchClosedVaultsNorBackUpAnEmptyVault)
+{
+    using namespace passwall::services;
+    const QString backupRoot =
+        testDirectory->filePath(QStringLiteral("empty-vault-backups"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+    const QString emptyVault =
+        testDirectory->filePath(QStringLiteral("empty.pwdb"));
+    SecureBuffer emptyKey(0);
+    std::string error;
+    ASSERT_TRUE(VaultLifecycleService::createVault(emptyVault.toStdString(),
+        "fictitious-master-password", emptyKey, error)) << error;
+    emptyKey = SecureBuffer(0);
+    vaultPath = emptyVault;
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    auto* preferencesController = window->findChild<
+        passwall::gui::GlobalBackupPreferencesController*>();
+    ASSERT_NE(coordinator, nullptr);
+    ASSERT_NE(preferencesController, nullptr);
+    int offers = 0;
+    int publications = 0;
+    int preferenceReads = 0;
+    QObject observer;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequested,
+        &observer, [&](GenerationalBackupRequestOffer) { ++offers; });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult) { ++publications; });
+    QObject::connect(preferencesController,
+        &passwall::gui::GlobalBackupPreferencesController::readSettled,
+        &observer, [&](GlobalBackupPreferencesStatus status) {
+            EXPECT_EQ(status, GlobalBackupPreferencesStatus::Valid);
+            ++preferenceReads;
+        });
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return preferenceReads == 1;
+    }));
+    EXPECT_EQ(window->findChild<passwall::gui::GlobalBackupPreferencesDialog*>(
+        QStringLiteral("globalBackupPreferencesDialog")), nullptr);
+    EXPECT_EQ(offers, 0);
+    EXPECT_EQ(publications, 0);
+
+    runBounded([&] { unlock(); });
+    ASSERT_TRUE(window->acquireLease().unlocked);
+    QCoreApplication::sendPostedEvents();
+    QCoreApplication::processEvents();
+    EXPECT_FALSE(coordinator->isActive());
+    EXPECT_EQ(offers, 0);
+    EXPECT_EQ(publications, 0);
+    EXPECT_TRUE(QDir(backupRoot).isEmpty());
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalProductionCompositionUsesSystemIdentityRealWorkerAndRealGrouping)
+{
+    using namespace passwall::services;
+    const QString backupRoot =
+        testDirectory->filePath(QStringLiteral("production-composition-backups"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+
+    // This vault intentionally starts empty.  A valid configuration and an
+    // authenticated session must not manufacture a backup request.
+    const QString emptyVault =
+        testDirectory->filePath(QStringLiteral("production-composition.pwdb"));
+    SecureBuffer emptyKey(0);
+    std::string error;
+    ASSERT_TRUE(VaultLifecycleService::createVault(emptyVault.toStdString(),
+        "fictitious-master-password", emptyKey, error)) << error;
+    vaultPath = emptyVault;
+
+    BackupInstallationIdentity firstInstallation;
+    BackupInstallationIdentity secondInstallation;
+    QString identityError;
+    ASSERT_TRUE(BackupSeriesIdentityService::currentInstallation(
+        firstInstallation, identityError)) << identityError.toStdString();
+    ASSERT_TRUE(BackupSeriesIdentityService::currentInstallation(
+        secondInstallation, identityError)) << identityError.toStdString();
+    EXPECT_EQ(firstInstallation, secondInstallation);
+    EXPECT_EQ(firstInstallation.domain,
+        BackupInstallationIdentityDomain::LinuxSystemdMachineAppSpecificV1);
+    EXPECT_EQ(firstInstallation.value.size(),
+        BackupSeriesIdentityService::InstallationIdentitySize);
+    VaultFileIdentity inspectedVault;
+    QString expectedSeries;
+    ASSERT_TRUE(VaultPreferencesStore::inspectVault(emptyVault, inspectedVault,
+        identityError)) << identityError.toStdString();
+    ASSERT_TRUE(BackupSeriesIdentityService::deriveSeriesId(firstInstallation,
+        inspectedVault.vaultId, expectedSeries, identityError))
+        << identityError.toStdString();
+
+    restartWithGenerationalProductionComposition();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    auto* preferencesController = window->findChild<
+        passwall::gui::GlobalBackupPreferencesController*>();
+    ASSERT_NE(coordinator, nullptr);
+    ASSERT_NE(preferencesController, nullptr);
+    ASSERT_EQ(coordinator->triggerMode(), BackupTriggerMode::Generational);
+    EXPECT_EQ(QFileInfo(BackupJob::siblingWorkerPath()).fileName(),
+        QStringLiteral("passwall_backup_worker"));
+
+    int preferenceReads = 0;
+    QVector<GenerationalBackupRequestOffer> offers;
+    QVector<MutationBackupResult> results;
+    QObject observer;
+    QObject::connect(preferencesController,
+        &passwall::gui::GlobalBackupPreferencesController::readSettled,
+        &observer, [&](GlobalBackupPreferencesStatus status) {
+            EXPECT_EQ(status, GlobalBackupPreferencesStatus::Valid);
+            ++preferenceReads;
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequested,
+        &observer, [&](GenerationalBackupRequestOffer offer) {
+            offers.push_back(std::move(offer));
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult result) {
+            results.push_back(std::move(result));
+        });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return preferenceReads == 1; },
+        10000));
+    QCoreApplication::sendPostedEvents();
+    QCoreApplication::processEvents();
+    EXPECT_TRUE(offers.isEmpty());
+    EXPECT_TRUE(results.isEmpty());
+    EXPECT_TRUE(QDir(backupRoot).isEmpty());
+
+    Credential added = makeCredential();
+    added.id = {};
+    added.title = "Fictitious production-composition commit";
+    const auto wipe = qScopeGuard([&] { wipeCredential(added); });
+    ASSERT_TRUE(CredentialService::add(emptyVault.toStdString(), emptyKey,
+        added, error, BackupTriggerMode::Generational)) << error;
+
+    // The production composition is intentionally not the 100 ms fixture.
+    // It must retain the committed generation for the real 20-second window.
+    QElapsedTimer groupingDelay;
+    groupingDelay.start();
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return groupingDelay.elapsed() >= 750; }, 1500));
+    EXPECT_TRUE(offers.isEmpty());
+    EXPECT_TRUE(results.isEmpty());
+
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return results.size() == 1; },
+        30000));
+    EXPECT_GE(groupingDelay.elapsed(), 19000);
+    ASSERT_EQ(offers.size(), 1);
+    EXPECT_EQ(offers.front().kind,
+        GenerationalBackupRequestKind::CrudGeneration);
+    ASSERT_EQ(results.front().kind,
+        GenerationalBackupRequestKind::CrudGeneration);
+    ASSERT_EQ(results.front().outcome, MutationBackupOutcome::Published);
+    EXPECT_TRUE(results.front().workerTerminated);
+    ASSERT_TRUE(results.front().publication.has_value());
+    const QString published = results.front().publication->destination;
+    EXPECT_TRUE(QFileInfo::exists(published));
+    EXPECT_EQ(QFileInfo(published).suffix(), QStringLiteral("pwdb"));
+    EXPECT_TRUE(published.startsWith(backupRoot + QLatin1Char('/')));
+    EXPECT_EQ(QFileInfo(published).absoluteDir().dirName(), expectedSeries);
+
+    // The result is a generation proof, not an historical .db publication.
+    QDirIterator allFiles(backupRoot, QDir::Files, QDirIterator::Subdirectories);
+    while (allFiles.hasNext())
+        EXPECT_NE(QFileInfo(allFiles.next()).suffix(), QStringLiteral("db"));
+    EXPECT_FALSE(coordinator->isActive());
+
+    // Closing immediately after a later COMMIT must retain the request and
+    // wait for the real worker/reservation rather than dropping the COMMIT.
+    Credential second = makeCredential();
+    second.id = {};
+    second.title = "Fictitious production-composition close commit";
+    const auto wipeSecond = qScopeGuard([&] { wipeCredential(second); });
+    ASSERT_TRUE(CredentialService::add(emptyVault.toStdString(), emptyKey,
+        second, error, BackupTriggerMode::Generational)) << error;
+    EXPECT_FALSE(window->close());
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return results.size() == 2; },
+        30000));
+    EXPECT_EQ(results.back().outcome, MutationBackupOutcome::Published);
+    EXPECT_TRUE(results.back().workerTerminated);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return !window->isVisible(); },
+        10000));
+    emptyKey = SecureBuffer(0);
+}
+
 TEST_F(MainWindowEditorLockTest,
     GenerationalCloseWithoutMutationWipesImmediatelyAndClosesWithoutARequest)
 {
     using passwall::services::AutomaticBackupCoordinator;
     restartWithGenerationalCoordinator();
-    auto* coordinator = window->findChild<AutomaticBackupCoordinator*>(
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
         QStringLiteral("automaticBackupCoordinator"));
     ASSERT_NE(coordinator, nullptr);
     ASSERT_EQ(coordinator->triggerMode(),
@@ -948,31 +1887,179 @@ TEST_F(MainWindowEditorLockTest,
 }
 
 TEST_F(MainWindowEditorLockTest,
-    GenerationalCloseDrainsEachCommittedGenerationBeforeClosingWithoutRetry)
+    GenerationalConsumerPublishesFirstCrudThenDrainsOnRepeatedClose)
 {
     using passwall::services::AutomaticBackupCoordinator;
-    using passwall::services::BackupFileEvidence;
     using passwall::services::GenerationalBackupRequestOffer;
+    using passwall::services::GenerationalOperationPhase;
+    using passwall::services::GenerationalOperationState;
+    using passwall::services::GenerationalShutdownDrainState;
     using passwall::services::MutationBackupOutcome;
-    using passwall::services::MutationBackupPublicationReceipt;
+    using passwall::services::MutationBackupResult;
     const QString backupRoot = testDirectory->filePath(QStringLiteral("automatic-backups"));
     ASSERT_TRUE(QDir().mkpath(backupRoot));
     const auto saved = passwall::services::GlobalBackupPreferencesStore().save({backupRoot, 7});
     ASSERT_TRUE(saved.valid()) << saved.diagnostic.toStdString();
-    restartWithGenerationalCoordinator();
-    auto* coordinator = window->findChild<AutomaticBackupCoordinator*>(
+    passwall::tests::setBackupSettingsTestWorker(
+        QString::fromLatin1(EXPORT_FAKE_WORKER));
+    const auto resetWorker = qScopeGuard([] {
+        passwall::tests::setBackupSettingsTestWorker({});
+    });
+    QFile workerMode(vaultPath + QStringLiteral(".fake-mode"));
+    ASSERT_TRUE(workerMode.open(
+        QIODevice::WriteOnly | QIODevice::Truncate));
+    const QByteArray gatedMode("gated-snapshot-published-file");
+    ASSERT_EQ(workerMode.write(gatedMode), gatedMode.size());
+    workerMode.close();
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
         QStringLiteral("automaticBackupCoordinator"));
     ASSERT_NE(coordinator, nullptr);
-
+    auto* rotationController = window->findChild<
+        passwall::services::GenerationalBackupRotationController*>(
+            QStringLiteral("generationalBackupRotationController"));
+    ASSERT_NE(rotationController, nullptr);
+    auto* statusController = window->findChild<
+        passwall::gui::GenerationalBackupStatusController*>();
+    ASSERT_NE(statusController, nullptr);
     QVector<GenerationalBackupRequestOffer> offers;
+    QVector<GenerationalOperationState> operationStates;
+    QVector<GenerationalShutdownDrainState> drainStates;
+    QVector<MutationBackupResult> results;
+    QVector<passwall::services::GenerationalBackupRotationResult> rotations;
     bool invalidated = false;
     QObject observer;
     QObject::connect(window.get(), &MainWindow::vaultSessionInvalidated,
         &observer, [&] { invalidated = true; });
-    QObject::connect(coordinator, &AutomaticBackupCoordinator::generationalBackupRequested,
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequested,
         &observer, [&](GenerationalBackupRequestOffer offer) {
             offers.push_back(std::move(offer));
         });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalOperationStateChanged,
+        &observer, [&](GenerationalOperationState state) {
+            operationStates.push_back(std::move(state));
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalShutdownDrainChanged,
+        &observer, [&](GenerationalShutdownDrainState state) {
+            drainStates.push_back(std::move(state));
+        });
+    QObject::connect(coordinator, &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult result) {
+            results.push_back(std::move(result));
+        });
+    QObject::connect(rotationController,
+        &passwall::services::GenerationalBackupRotationController::rotationSettled,
+        &observer, [&](passwall::services::GenerationalBackupRotationResult result) {
+            rotations.push_back(std::move(result));
+        });
+    const auto pipelineDiagnostic = [&] {
+        QStringList offerDetails;
+        for (const auto& offer : offers) {
+            offerDetails.push_back(QStringLiteral(
+                "{request=%1 kind=%2 mutation=%3 session=%4}")
+                .arg(offer.requestId)
+                .arg(static_cast<int>(offer.kind))
+                .arg(offer.mutationGeneration)
+                .arg(offer.sessionGeneration));
+        }
+        QStringList stateDetails;
+        for (const auto& state : operationStates) {
+            stateDetails.push_back(QStringLiteral(
+                "{request=%1 phase=%2 kind=%3 mutation=%4 session=%5 "
+                "workerAlive=%6 resultObserved=%7 outcome=%8}")
+                .arg(state.requestId)
+                .arg(static_cast<int>(state.phase))
+                .arg(static_cast<int>(state.kind))
+                .arg(state.mutationGeneration)
+                .arg(state.sessionGeneration)
+                .arg(state.workerAlive)
+                .arg(state.resultObserved)
+                .arg(static_cast<int>(state.workerOutcome)));
+        }
+        QStringList resultDetails;
+        for (const auto& result : results) {
+            resultDetails.push_back(QStringLiteral(
+                "{request=%1 kind=%2 mutation=%3 session=%4 outcome=%5 "
+                "workerOutcome=%6 terminated=%7 publication=%8 diagnostic='%9'}")
+                .arg(result.requestId)
+                .arg(static_cast<int>(result.kind))
+                .arg(result.generation)
+                .arg(result.sessionGeneration)
+                .arg(static_cast<int>(result.outcome))
+                .arg(static_cast<int>(result.workerOutcome))
+                .arg(result.workerTerminated)
+                .arg(result.publication.has_value())
+                .arg(result.diagnostic));
+        }
+        QStringList drainDetails;
+        for (const auto& state : drainStates) {
+            drainDetails.push_back(QStringLiteral(
+                "{status=%1 workerAlive=%2 pending=%3 latest=%4 diagnostic='%5'}")
+                .arg(static_cast<int>(state.status))
+                .arg(state.workerAlive)
+                .arg(state.requestPending)
+                .arg(state.latestMutationGeneration)
+                .arg(state.diagnostic));
+        }
+        QStringList rotationDetails;
+        for (const auto& rotation : rotations) {
+            rotationDetails.push_back(QStringLiteral(
+                "{request=%1 kind=%2 mutation=%3 session=%4 outcome=%5}")
+                .arg(rotation.requestId)
+                .arg(static_cast<int>(rotation.kind))
+                .arg(rotation.generation)
+                .arg(rotation.sessionGeneration)
+                .arg(static_cast<int>(rotation.rotation.outcome)));
+        }
+        return QStringLiteral(
+                   "fixture={pid=%1 vault='%2' settings='%3' "
+                   "recoverySettings='%4' recoveryLock='%5' "
+                   "xdgConfigHome='%6' backupRoot='%7'}; ")
+                .arg(QCoreApplication::applicationPid())
+                .arg(vaultPath)
+                .arg(passwall::services::GlobalBackupPreferencesStore().fileName())
+                .arg(QSettings(QStringLiteral("PassWall"),
+                    QStringLiteral("PassWall")).fileName())
+                .arg(QSettings(QStringLiteral("PassWall"),
+                    QStringLiteral("PassWall")).fileName()
+                    + QStringLiteral(".registry-lock"))
+                .arg(qEnvironmentVariable("XDG_CONFIG_HOME"))
+                .arg(backupRoot)
+            + generationalStatusDiagnostic(coordinator, statusController,
+                vaultPath, results.size(), rotations.size())
+            + QStringLiteral("; offers=[%1]; states=[%2]; results=[%3]; "
+                             "drain=[%4]; rotationResults=[%5]")
+                  .arg(offerDetails.join(QStringLiteral(", ")),
+                      stateDetails.join(QStringLiteral(", ")),
+                      resultDetails.join(QStringLiteral(", ")),
+                      drainDetails.join(QStringLiteral(", ")),
+                      rotationDetails.join(QStringLiteral(", ")));
+    };
+    const auto reachedWorker = [&](quint64 requestId) {
+        return std::any_of(operationStates.cbegin(), operationStates.cend(),
+            [&](const GenerationalOperationState& state) {
+                return state.requestId == requestId
+                    && state.phase == GenerationalOperationPhase::WorkerActive;
+            });
+    };
+    runBounded([&] { unlock(); });
+    ASSERT_TRUE(window->acquireLease().unlocked);
+    QCoreApplication::sendPostedEvents();
+    QCoreApplication::processEvents();
+    EXPECT_TRUE(offers.isEmpty());
+    EXPECT_TRUE(results.isEmpty());
+    EXPECT_TRUE(rotations.isEmpty());
+    EXPECT_FALSE(coordinator->isActive());
+
     auto commit = [&](const QString& title) {
         Credential added = makeCredential();
         added.id = {};
@@ -983,45 +2070,1694 @@ TEST_F(MainWindowEditorLockTest,
             added, error, passwall::services::BackupTriggerMode::Generational))
             << error;
     };
-    const auto receiptFor = [](const GenerationalBackupRequestOffer& offer,
-                               const QString& destination) {
-        BackupFileEvidence evidence;
-        evidence.device = 1; evidence.inode = 2; evidence.size = 3; evidence.mount = 4;
-        evidence.directoryDevice = 5; evidence.directoryInode = 6; evidence.directoryMount = 7;
-        evidence.birth = QStringLiteral("1:0"); evidence.modified = QStringLiteral("2:0");
-        evidence.changed = QStringLiteral("3:0"); evidence.directoryBirth = QStringLiteral("4:0");
-        evidence.sha256 = QByteArray(32, 'p');
-        return MutationBackupPublicationReceipt{offer.vaultPath, destination,
-            offer.mutationGeneration, offer.requestId, evidence};
-    };
 
-    commit(QStringLiteral("first close generation"));
+    commit(QStringLiteral("generation drained by close"));
+    const quint64 closeGeneration = coordinator->mutationGeneration();
+    ASSERT_GT(closeGeneration, 0U);
+    QString firstWorkerReady;
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        QDirIterator markers(backupRoot, {QStringLiteral("*.ready")},
+            QDir::Files, QDirIterator::Subdirectories);
+        if (!markers.hasNext()) return false;
+        firstWorkerReady = markers.next();
+        const auto state = coordinator->generationalOperationState(vaultPath);
+        return state.phase == GenerationalOperationPhase::WorkerActive
+            && state.workerAlive;
+    }, 10000)) << pipelineDiagnostic().toStdString();
+    ASSERT_EQ(offers.size(), 1) << pipelineDiagnostic().toStdString();
+    EXPECT_EQ(offers[0].mutationGeneration, closeGeneration);
+    EXPECT_TRUE(results.isEmpty()) << pipelineDiagnostic().toStdString();
+    EXPECT_EQ(coordinator->generationalShutdownDrainState().status,
+        passwall::services::GenerationalShutdownDrainStatus::NotRequested);
     EXPECT_FALSE(window->close());
     EXPECT_FALSE(window->close()); // Reentrant close cannot start another drain.
     EXPECT_TRUE(invalidated);
     EXPECT_FALSE(window->acquireLease().unlocked);
-    ASSERT_TRUE(passwall::tests::waitFor([&] { return offers.size() == 1; }));
-    const auto first = offers[0];
-    const QString firstDestination = testDirectory->filePath(QStringLiteral("first-close.pwdb"));
-    ASSERT_TRUE(coordinator->markMutationBackupStarted(first.requestId,
-        first.vaultPath, first.mutationGeneration, firstDestination));
+    EXPECT_EQ(coordinator->generationalShutdownDrainState().status,
+        passwall::services::GenerationalShutdownDrainStatus::WorkerActive)
+        << pipelineDiagnostic().toStdString();
+    EXPECT_TRUE(coordinator->generationalShutdownDrainState().workerAlive)
+        << pipelineDiagnostic().toStdString();
+    // The session identity retained by the drain must still route a COMMIT
+    // that completes after secret cleanup into its own generation.
+    commit(QStringLiteral("late generation during close drain"));
+    const quint64 lateGeneration = coordinator->mutationGeneration();
+    ASSERT_GT(lateGeneration, closeGeneration);
+    EXPECT_EQ(offers.size(), 1) << pipelineDiagnostic().toStdString();
+    EXPECT_TRUE(results.isEmpty()) << pipelineDiagnostic().toStdString();
+    ASSERT_TRUE(workerMode.open(
+        QIODevice::WriteOnly | QIODevice::Truncate));
+    const QByteArray ordinaryMode("snapshot-published-file");
+    ASSERT_EQ(workerMode.write(ordinaryMode), ordinaryMode.size());
+    workerMode.close();
+    const QString readySuffix = QStringLiteral(".ready");
+    ASSERT_TRUE(firstWorkerReady.endsWith(readySuffix));
+    QFile release(firstWorkerReady.left(
+        firstWorkerReady.size() - readySuffix.size())
+        + QStringLiteral(".release"));
+    ASSERT_TRUE(release.open(QIODevice::WriteOnly));
+    const QByteArray releaseMarker("continue");
+    ASSERT_EQ(release.write(releaseMarker), releaseMarker.size());
+    release.close();
+
+    // Each CRUD owns a distinct request and a distinct serialized worker.
+    // One wall-clock budget cannot distinguish a lost result from two
+    // serialized workers whose aggregate time exceeds that budget under load.
+    // Observe every offer and terminal worker independently so a failure names
+    // the exact request and phase that stopped progressing.
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return offers.size() >= 1; }, 10000))
+        << pipelineDiagnostic().toStdString();
+    ASSERT_EQ(offers[0].kind,
+        passwall::services::GenerationalBackupRequestKind::CrudGeneration);
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return results.size() >= 1; }, 10000))
+        << pipelineDiagnostic().toStdString();
+    ASSERT_EQ(results[0].kind,
+        passwall::services::GenerationalBackupRequestKind::CrudGeneration);
+    EXPECT_EQ(results[0].requestId, offers[0].requestId);
+    EXPECT_EQ(results[0].generation, offers[0].mutationGeneration);
+    ASSERT_EQ(results[0].outcome, MutationBackupOutcome::Published);
+    EXPECT_TRUE(results[0].workerTerminated);
+    EXPECT_TRUE(reachedWorker(offers[0].requestId))
+        << pipelineDiagnostic().toStdString();
+    ASSERT_TRUE(results[0].confirmedPublicationResult.has_value());
+    ASSERT_TRUE(results[0].publication.has_value());
+    const QFileInfo firstCrudCopy(results[0].publication->destination);
+    EXPECT_TRUE(firstCrudCopy.isFile());
+    EXPECT_GT(firstCrudCopy.size(), 0);
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return offers.size() >= 2; }, 10000))
+        << pipelineDiagnostic().toStdString();
+    ASSERT_EQ(offers[1].kind,
+        passwall::services::GenerationalBackupRequestKind::CrudGeneration);
+    EXPECT_GT(offers[1].mutationGeneration, offers[0].mutationGeneration);
+    EXPECT_NE(offers[1].requestId, offers[0].requestId);
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return results.size() >= 2; }, 10000))
+        << pipelineDiagnostic().toStdString();
+    ASSERT_EQ(results[1].kind,
+        passwall::services::GenerationalBackupRequestKind::CrudGeneration);
+    EXPECT_EQ(results[1].requestId, offers[1].requestId);
+    EXPECT_EQ(results[1].generation, offers[1].mutationGeneration);
+    ASSERT_EQ(results[1].outcome, MutationBackupOutcome::Published);
+    EXPECT_TRUE(results[1].workerTerminated);
+    EXPECT_TRUE(reachedWorker(offers[1].requestId))
+        << pipelineDiagnostic().toStdString();
+    ASSERT_TRUE(results[1].confirmedPublicationResult.has_value());
+    ASSERT_TRUE(results[1].publication.has_value());
+    const QFileInfo lateCrudCopy(results[1].publication->destination);
+    EXPECT_TRUE(lateCrudCopy.isFile());
+    EXPECT_GT(lateCrudCopy.size(), 0);
+    EXPECT_NE(lateCrudCopy.absoluteFilePath(),
+        firstCrudCopy.absoluteFilePath());
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return rotations.size() >= 2; }, 10000))
+        << pipelineDiagnostic().toStdString();
+    EXPECT_TRUE(passwall::tests::waitFor([&] { return !window->isVisible(); },
+        10000)) << pipelineDiagnostic().toStdString();
+    EXPECT_EQ(offers.size(), 2) << pipelineDiagnostic().toStdString();
+    EXPECT_EQ(results.size(), 2);
+    ASSERT_EQ(rotations.size(), 2) << pipelineDiagnostic().toStdString();
+    EXPECT_EQ(rotations[0].requestId, results[0].requestId);
+    EXPECT_EQ(rotations[1].requestId, results[1].requestId);
+    EXPECT_EQ(rotations[0].rotation.outcome,
+        passwall::services::BackupSeriesRotationOutcome::NoRotationNecessary);
+    EXPECT_EQ(rotations[1].rotation.outcome,
+        passwall::services::BackupSeriesRotationOutcome::NoRotationNecessary);
+    const auto presentationDiagnostic = generationalStatusDiagnostic(
+        coordinator, statusController, vaultPath, results.size(),
+        rotations.size());
+    EXPECT_TRUE(statusController->backupStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive))
+        << presentationDiagnostic.toStdString();
+    EXPECT_TRUE(statusController->lastBackupResultStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive))
+        << presentationDiagnostic.toStdString();
+    EXPECT_TRUE(statusController->rotationStatus().contains(
+        QStringLiteral("Aucune rotation"), Qt::CaseInsensitive))
+        << presentationDiagnostic.toStdString();
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalRealCrudPublicationRotatesEightVersionsWithoutBlockingGui)
+{
+    using namespace passwall::services;
+    const QString backupRoot = testDirectory->filePath(
+        QStringLiteral("automatic-backups"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    auto* rotationController = window->findChild<
+        GenerationalBackupRotationController*>(
+            QStringLiteral("generationalBackupRotationController"));
+    ASSERT_NE(coordinator, nullptr);
+    ASSERT_NE(rotationController, nullptr);
+    QVector<MutationBackupResult> publications;
+    QVector<GenerationalBackupRotationResult> rotations;
+    QObject observer;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled, &observer,
+        [&](MutationBackupResult result) {
+            publications.push_back(std::move(result));
+        });
+    QObject::connect(rotationController,
+        &GenerationalBackupRotationController::rotationSettled, &observer,
+        [&](GenerationalBackupRotationResult result) {
+            rotations.push_back(std::move(result));
+        });
+    int heartbeatTicks = 0;
+    QTimer heartbeat;
+    QObject::connect(&heartbeat, &QTimer::timeout,
+        [&] { ++heartbeatTicks; });
+    heartbeat.start(0);
+
+    runBounded([&] { unlock(); });
+    commitGenerationalCredential(
+        "Fictitious first published generation for rotation");
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return publications.size() == 1 && rotations.size() == 1;
+    }, 10000));
+    ASSERT_EQ(publications[0].kind,
+        GenerationalBackupRequestKind::CrudGeneration);
+    ASSERT_EQ(publications[0].outcome, MutationBackupOutcome::Published);
+    ASSERT_TRUE(publications[0].publication);
+    const QString firstPublished = publications[0].publication->destination;
+    const QString series = QFileInfo(firstPublished).absolutePath();
+    const QString family = QFileInfo(series).absolutePath();
+    QString otherSeriesId = QStringLiteral("a").repeated(
+        BackupSeriesIdentityService::EncodedSeriesIdSize);
+    if (QFileInfo(series).fileName() == otherSeriesId)
+        otherSeriesId = QStringLiteral("b").repeated(
+            BackupSeriesIdentityService::EncodedSeriesIdSize);
+    const QString otherSeries = QDir(family).filePath(otherSeriesId);
+    ASSERT_TRUE(QDir().mkpath(otherSeries));
+    ASSERT_TRUE(QFile::setPermissions(otherSeries,
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner
+            | QFileDevice::ExeOwner));
+    const QString otherSeriesSentinel = QDir(otherSeries).filePath(
+        QStringLiteral("generation_1_2025-01-01_00-00-00.pwdb"));
+    ASSERT_TRUE(QFile::copy(firstPublished, otherSeriesSentinel));
+    ASSERT_TRUE(QFile::setPermissions(otherSeriesSentinel,
+        QFileDevice::ReadOwner | QFileDevice::WriteOwner));
+    QFile otherSeriesBeforeFile(otherSeriesSentinel);
+    ASSERT_TRUE(otherSeriesBeforeFile.open(QIODevice::ReadOnly));
+    const QByteArray otherSeriesBefore = otherSeriesBeforeFile.readAll();
+    otherSeriesBeforeFile.close();
+    for (int day = 1; day <= 6; ++day) {
+        const QString copy = QDir(series).filePath(
+            QStringLiteral("generation_%1_2026-01-01_00-00-00.pwdb").arg(day + 1));
+        ASSERT_TRUE(QFile::copy(firstPublished, copy));
+        ASSERT_TRUE(QFile::setPermissions(copy,
+            QFileDevice::ReadOwner | QFileDevice::WriteOwner));
+    }
+    const QString oldest = firstPublished;
+    ASSERT_EQ(QDir(series).entryList({QStringLiteral("*.pwdb")},
+        QDir::Files).size(), 7);
+
+    Credential added = makeCredential();
+    added.id = {};
+    added.title = "Fictitious eighth published generation";
+    const auto wipe = qScopeGuard([&] { wipeCredential(added); });
+    std::string error;
+    ASSERT_TRUE(CredentialService::add(vaultPath.toStdString(), verificationKey,
+        added, error, BackupTriggerMode::Generational)) << error;
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return publications.size() == 2 && rotations.size() == 2;
+    }, 10000));
+    EXPECT_GT(heartbeatTicks, 1);
+    ASSERT_EQ(publications[1].outcome, MutationBackupOutcome::Published);
+    EXPECT_EQ(rotations[1].rotation.outcome,
+        BackupSeriesRotationOutcome::Complete)
+        << rotations[1].rotation.diagnostic.toStdString();
+    ASSERT_EQ(rotations[1].rotation.deleted.size(), 1);
+    EXPECT_EQ(rotations[1].rotation.deleted.front().path, oldest);
+    EXPECT_FALSE(QFileInfo::exists(oldest));
+    EXPECT_TRUE(QFileInfo::exists(
+        publications[1].publication->destination));
+    EXPECT_EQ(QDir(series).entryList({QStringLiteral("*.pwdb")},
+        QDir::Files).size(), 7);
+
+    for (int day = 1; day <= 3; ++day) {
+        const QString copy = QDir(series).filePath(
+            QStringLiteral("generation_%1_2026-02-01_00-00-00.pwdb").arg(day + 8));
+        ASSERT_TRUE(QFile::copy(publications[1].publication->destination, copy));
+        ASSERT_TRUE(QFile::setPermissions(copy,
+            QFileDevice::ReadOwner | QFileDevice::WriteOwner));
+    }
+    Credential later = makeCredential();
+    later.id = {};
+    later.title = "Fictitious publication with several excess versions";
+    const auto wipeLater = qScopeGuard([&] { wipeCredential(later); });
+    ASSERT_TRUE(CredentialService::add(vaultPath.toStdString(), verificationKey,
+        later, error, BackupTriggerMode::Generational)) << error;
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return publications.size() == 3 && rotations.size() == 3;
+    }, 10000));
+    EXPECT_EQ(rotations[2].rotation.outcome,
+        BackupSeriesRotationOutcome::Complete)
+        << rotations[2].rotation.diagnostic.toStdString();
+    EXPECT_EQ(rotations[2].rotation.deleted.size(), 4);
+    EXPECT_EQ(rotations[2].rotation.durableDeletions, 4U);
+    ASSERT_TRUE(publications[2].publication);
+    EXPECT_TRUE(QFileInfo::exists(
+        publications[2].publication->destination));
+    EXPECT_EQ(QDir(series).entryList({QStringLiteral("*.pwdb")},
+        QDir::Files).size(), 7);
+    QFile otherSeriesAfterFile(otherSeriesSentinel);
+    ASSERT_TRUE(otherSeriesAfterFile.open(QIODevice::ReadOnly));
+    EXPECT_EQ(otherSeriesAfterFile.readAll(), otherSeriesBefore);
+    EXPECT_EQ(QDir(otherSeries).entryList({QStringLiteral("*.pwdb")},
+        QDir::Files), QStringList{QFileInfo(otherSeriesSentinel).fileName()});
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalPublicationsQueueBehindAnActiveRotation)
+{
+    using namespace passwall::services;
+    const QString backupRoot = testDirectory->filePath(
+        QStringLiteral("queued-rotations"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    auto* controller = window->findChild<
+        GenerationalBackupRotationController*>(
+            QStringLiteral("generationalBackupRotationController"));
+    auto* statusController = window->findChild<
+        passwall::gui::GenerationalBackupStatusController*>();
+    ASSERT_NE(coordinator, nullptr);
+    ASSERT_NE(controller, nullptr);
+    ASSERT_NE(statusController, nullptr);
+    QVector<GenerationalBackupRequestOffer> offers;
+    QVector<GenerationalOperationState> operationStates;
+    QVector<GenerationalShutdownDrainState> drainStates;
+    QVector<MutationBackupResult> publications;
+    QVector<GenerationalBackupRotationResult> rotations;
+    QStringList mutationDiagnostics;
+    QVector<bool> rotationBusyStates;
+    RotationCheckpointPause pause;
+    QObject observer;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequested, &observer,
+        [&](GenerationalBackupRequestOffer offer) {
+            offers.push_back(std::move(offer));
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalOperationStateChanged,
+        &observer, [&](GenerationalOperationState state) {
+            operationStates.push_back(std::move(state));
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalShutdownDrainChanged,
+        &observer, [&](GenerationalShutdownDrainState state) {
+            drainStates.push_back(std::move(state));
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchDiagnostic, &observer,
+        [&](const QString& path, quint64 generation,
+            const QString& diagnostic) {
+            mutationDiagnostics.push_back(QStringLiteral(
+                "{path='%1' generation=%2 diagnostic='%3'}")
+                .arg(path).arg(generation).arg(diagnostic));
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled, &observer,
+        [&](MutationBackupResult result) {
+            publications.push_back(std::move(result));
+        });
+    QObject::connect(controller,
+        &GenerationalBackupRotationController::rotationSettled, &observer,
+        [&](GenerationalBackupRotationResult result) {
+            rotations.push_back(std::move(result));
+        });
+    QObject::connect(controller,
+        &GenerationalBackupRotationController::busyChanged, &observer,
+        [&](bool busy) { rotationBusyStates.push_back(busy); });
+    const auto mutationOutcomeName = [](MutationBackupOutcome outcome) {
+        switch (outcome) {
+        case MutationBackupOutcome::Published:
+            return QStringLiteral("Published");
+        case MutationBackupOutcome::Failed:
+            return QStringLiteral("Failed");
+        case MutationBackupOutcome::Unknown:
+            return QStringLiteral("Unknown");
+        }
+        return QStringLiteral("<invalid>");
+    };
+    const auto workerOutcomeName = [](BackupOutcome outcome) {
+        switch (outcome) {
+        case BackupOutcome::FailedBeforePublication:
+            return QStringLiteral("FailedBeforePublication");
+        case BackupOutcome::Published:
+            return QStringLiteral("Published");
+        case BackupOutcome::DurabilityUnconfirmed:
+            return QStringLiteral("DurabilityUnconfirmed");
+        case BackupOutcome::CancelledBeforePublication:
+            return QStringLiteral("CancelledBeforePublication");
+        case BackupOutcome::Unknown:
+            return QStringLiteral("Unknown");
+        }
+        return QStringLiteral("<invalid>");
+    };
+    const auto progressDiagnostic = [&] {
+        const auto state = coordinator->generationalOperationState(vaultPath);
+        const auto suspension =
+            coordinator->generationalBackupSuspension(vaultPath);
+        const auto drain = coordinator->generationalShutdownDrainState();
+        QStringList offerDetails;
+        for (const auto& offer : offers) {
+            offerDetails.push_back(QStringLiteral(
+                "{request=%1 kind=%2 mutation=%3 session=%4 path='%5'}")
+                .arg(offer.requestId)
+                .arg(static_cast<int>(offer.kind))
+                .arg(offer.mutationGeneration)
+                .arg(offer.sessionGeneration)
+                .arg(offer.vaultPath));
+        }
+        QStringList operationDetails;
+        for (const auto& operation : operationStates) {
+            operationDetails.push_back(QStringLiteral(
+                "{request=%1 phase=%2 kind=%3 mutation=%4 session=%5 "
+                "reservation=%6 workerAlive=%7 resultObserved=%8 "
+                "workerOutcome=%9}")
+                .arg(operation.requestId)
+                .arg(static_cast<int>(operation.phase))
+                .arg(static_cast<int>(operation.kind))
+                .arg(operation.mutationGeneration)
+                .arg(operation.sessionGeneration)
+                .arg(operation.reservationHeld)
+                .arg(operation.workerAlive)
+                .arg(operation.resultObserved)
+                .arg(workerOutcomeName(operation.workerOutcome)));
+        }
+        QStringList resultDetails;
+        for (const auto& result : publications) {
+            const bool coordinatorReceipt = result.publication.has_value();
+            const bool confirmed =
+                result.confirmedPublicationResult.has_value();
+            const bool workerReceipt = confirmed
+                && result.confirmedPublicationResult->receipt.has_value();
+            const bool receiptValid = coordinatorReceipt && workerReceipt
+                && result.publication->evidence
+                    == *result.confirmedPublicationResult->receipt
+                && result.publication->evidence.permitsDeletion();
+            const QString destination = coordinatorReceipt
+                ? result.publication->destination
+                : QStringLiteral("<absente>");
+            const QString publishedPath = confirmed
+                ? result.confirmedPublicationResult->publishedPath
+                : QStringLiteral("<absent>");
+            const QString confirmedOutcome = confirmed
+                ? workerOutcomeName(
+                    result.confirmedPublicationResult->outcome)
+                : QStringLiteral("<absent>");
+            const QString workerDiagnostic = confirmed
+                ? result.confirmedPublicationResult->diagnostic
+                : QStringLiteral("<absent>");
+            resultDetails.push_back(QStringLiteral(
+                "{request=%1 kind=%2 mutation=%3 session=%4 outcome=%5 "
+                "workerOutcome=%6 terminated=%7 diagnostic='%8' "
+                "destination='%9' destinationExists=%10 confirmed=%11 "
+                "confirmedOutcome=%12 workerDiagnostic='%13' "
+                "publishedPath='%14' coordinatorReceipt=%15 "
+                "workerReceipt=%16 receiptValid=%17}")
+                .arg(result.requestId)
+                .arg(static_cast<int>(result.kind))
+                .arg(result.generation)
+                .arg(result.sessionGeneration)
+                .arg(mutationOutcomeName(result.outcome))
+                .arg(workerOutcomeName(result.workerOutcome))
+                .arg(result.workerTerminated)
+                .arg(result.diagnostic)
+                .arg(destination)
+                .arg(coordinatorReceipt && QFileInfo::exists(destination))
+                .arg(confirmed)
+                .arg(confirmedOutcome)
+                .arg(workerDiagnostic)
+                .arg(publishedPath)
+                .arg(coordinatorReceipt)
+                .arg(workerReceipt)
+                .arg(receiptValid));
+        }
+        QStringList rotationDetails;
+        for (const auto& rotation : rotations) {
+            rotationDetails.push_back(QStringLiteral(
+                "{request=%1 kind=%2 mutation=%3 session=%4 outcome=%5 "
+                "publishedPath='%6' deleted=%7 durable=%8 diagnostic='%9'}")
+                .arg(rotation.requestId)
+                .arg(static_cast<int>(rotation.kind))
+                .arg(rotation.generation)
+                .arg(rotation.sessionGeneration)
+                .arg(static_cast<int>(rotation.rotation.outcome))
+                .arg(rotation.publishedPath)
+                .arg(rotation.rotation.deleted.size())
+                .arg(rotation.rotation.durableDeletions)
+                .arg(rotation.rotation.diagnostic));
+        }
+        QStringList busyDetails;
+        for (bool busy : rotationBusyStates)
+            busyDetails.push_back(busy ? QStringLiteral("busy")
+                                       : QStringLiteral("idle"));
+        QStringList drainDetails;
+        for (const auto& observed : drainStates) {
+            drainDetails.push_back(QStringLiteral(
+                "{status=%1 workerAlive=%2 pending=%3 latest=%4 "
+                "diagnostic='%5'}")
+                .arg(static_cast<int>(observed.status))
+                .arg(observed.workerAlive)
+                .arg(observed.requestPending)
+                .arg(observed.latestMutationGeneration)
+                .arg(observed.diagnostic));
+        }
+        QStringList materialFiles;
+        QDirIterator files(backupRoot, {QStringLiteral("*.pwdb")},
+            QDir::Files, QDirIterator::Subdirectories);
+        while (files.hasNext())
+            materialFiles.push_back(files.next());
+        return QStringLiteral(
+            "fixture={pid=%1 vault='%2' settings='%3' recoverySettings='%4' "
+            "recoveryLock='%5' xdgConfigHome='%6' root='%7'}; "
+            "checkpoint=%8 idle=%9 current={phase=%10 request=%11 "
+            "generation=%12 session=%13 reservation=%14 workerAlive=%15 "
+            "resultObserved=%16}; suspension={active=%17 reason=%18 "
+            "latest=%19 workerAlive=%20 diagnostic='%21'}; "
+            "drainCurrent={status=%22 workerAlive=%23 pending=%24 latest=%25 "
+            "diagnostic='%26'}; offers=[%27]; operations=[%28]; "
+            "results=[%29]; mutationDiagnostics=[%30]; rotations=[%31]; "
+            "rotationBusy=[%32]; drainHistory=[%33]; materialFiles=[%34]; "
+            "status={%35}")
+            .arg(QCoreApplication::applicationPid())
+            .arg(vaultPath)
+            .arg(GlobalBackupPreferencesStore().fileName())
+            .arg(QSettings(QStringLiteral("PassWall"),
+                QStringLiteral("PassWall")).fileName())
+            .arg(QSettings(QStringLiteral("PassWall"),
+                QStringLiteral("PassWall")).fileName()
+                + QStringLiteral(".registry-lock"))
+            .arg(qEnvironmentVariable("XDG_CONFIG_HOME"))
+            .arg(backupRoot)
+            .arg(pause.entered.load())
+            .arg(controller->idle())
+            .arg(static_cast<int>(state.phase))
+            .arg(state.requestId)
+            .arg(state.mutationGeneration)
+            .arg(state.sessionGeneration)
+            .arg(state.reservationHeld)
+            .arg(state.workerAlive)
+            .arg(state.resultObserved)
+            .arg(suspension.suspended)
+            .arg(static_cast<int>(suspension.reason))
+            .arg(suspension.latestMutationGeneration)
+            .arg(suspension.workerAlive)
+            .arg(suspension.diagnostic)
+            .arg(static_cast<int>(drain.status))
+            .arg(drain.workerAlive)
+            .arg(drain.requestPending)
+            .arg(drain.latestMutationGeneration)
+            .arg(drain.diagnostic)
+            .arg(offerDetails.join(QStringLiteral(", ")))
+            .arg(operationDetails.join(QStringLiteral(", ")))
+            .arg(resultDetails.join(QStringLiteral(", ")))
+            .arg(mutationDiagnostics.join(QStringLiteral(", ")))
+            .arg(rotationDetails.join(QStringLiteral(", ")))
+            .arg(busyDetails.join(QStringLiteral(", ")))
+            .arg(drainDetails.join(QStringLiteral(", ")))
+            .arg(materialFiles.join(QStringLiteral(", ")))
+            .arg(generationalStatusDiagnostic(coordinator, statusController,
+                vaultPath, publications.size(), rotations.size()))
+            .toStdString();
+    };
+    const auto reachedWorker = [&](quint64 requestId) {
+        return std::any_of(operationStates.cbegin(), operationStates.cend(),
+            [&](const GenerationalOperationState& state) {
+                return state.requestId == requestId
+                    && state.phase == GenerationalOperationPhase::WorkerActive;
+            });
+    };
+
+    runBounded([&] { unlock(); });
+    commitGenerationalCredential(
+        "Fictitious first publication before queued rotations");
+    const bool firstPublicationSettled = passwall::tests::waitFor([&] {
+        return publications.size() == 1 && rotations.size() == 1;
+    }, 10000);
+    ASSERT_TRUE(firstPublicationSettled) << progressDiagnostic();
+    ASSERT_EQ(publications[0].kind,
+        GenerationalBackupRequestKind::CrudGeneration);
+    ASSERT_TRUE(publications[0].workerTerminated) << progressDiagnostic();
+    ASSERT_EQ(publications[0].outcome, MutationBackupOutcome::Published)
+        << progressDiagnostic();
+    ASSERT_EQ(rotations[0].requestId, publications[0].requestId);
+    ASSERT_EQ(rotations[0].rotation.outcome,
+        BackupSeriesRotationOutcome::NoRotationNecessary);
+    ASSERT_TRUE(controller->idle()) << progressDiagnostic();
+
+    passwall::tests::setGenerationalRotationCheckpointHook(
+        pauseGenerationalRotation, &pause);
+    const auto release = qScopeGuard([&] {
+        pause.released = true;
+        pause.condition.notify_all();
+        passwall::tests::setGenerationalRotationCheckpointHook(nullptr, nullptr);
+    });
+    Credential first = makeCredential();
+    first.id = {};
+    first.title = "Fictitious first queued rotation";
+    const auto wipeFirst = qScopeGuard([&] { wipeCredential(first); });
+    std::string error;
+    ASSERT_TRUE(CredentialService::add(vaultPath.toStdString(), verificationKey,
+        first, error, BackupTriggerMode::Generational)) << error;
+    const bool firstRotationPaused = passwall::tests::waitFor([&] {
+        return publications.size() == 2 && pause.entered.load();
+    }, 10000);
+    ASSERT_TRUE(firstRotationPaused) << progressDiagnostic();
+    ASSERT_EQ(publications[1].kind,
+        GenerationalBackupRequestKind::CrudGeneration);
+    ASSERT_TRUE(reachedWorker(publications[1].requestId))
+        << progressDiagnostic();
+    ASSERT_TRUE(publications[1].workerTerminated) << progressDiagnostic();
+    ASSERT_EQ(publications[1].outcome, MutationBackupOutcome::Published)
+        << progressDiagnostic();
+    ASSERT_EQ(rotations.size(), 1) << progressDiagnostic();
+    EXPECT_FALSE(controller->idle());
+
+    Credential second = makeCredential();
+    second.id = {};
+    second.title = "Fictitious publication queued behind active rotation";
+    const auto wipeSecond = qScopeGuard([&] { wipeCredential(second); });
+    ASSERT_TRUE(CredentialService::add(vaultPath.toStdString(), verificationKey,
+        second, error, BackupTriggerMode::Generational)) << error;
+    const bool secondPublished = passwall::tests::waitFor(
+        [&] { return publications.size() == 3; }, 10000);
+    ASSERT_TRUE(secondPublished) << progressDiagnostic();
+    ASSERT_EQ(offers.size(), 3) << progressDiagnostic();
+    ASSERT_EQ(publications[2].kind,
+        GenerationalBackupRequestKind::CrudGeneration);
+    EXPECT_EQ(publications[2].requestId, offers[2].requestId)
+        << progressDiagnostic();
+    EXPECT_EQ(publications[2].generation, offers[2].mutationGeneration)
+        << progressDiagnostic();
+    ASSERT_TRUE(reachedWorker(publications[2].requestId))
+        << progressDiagnostic();
+    ASSERT_TRUE(publications[2].workerTerminated) << progressDiagnostic();
+    ASSERT_EQ(publications[2].outcome, MutationBackupOutcome::Published)
+        << progressDiagnostic();
+    ASSERT_EQ(publications[2].workerOutcome, BackupOutcome::Published)
+        << progressDiagnostic();
+    ASSERT_TRUE(publications[2].publication) << progressDiagnostic();
+    ASSERT_TRUE(publications[2].confirmedPublicationResult)
+        << progressDiagnostic();
+    ASSERT_TRUE(publications[2].confirmedPublicationResult->receipt)
+        << progressDiagnostic();
+    EXPECT_EQ(publications[2].publication->destination,
+        publications[2].confirmedPublicationResult->publishedPath)
+        << progressDiagnostic();
+    EXPECT_EQ(publications[2].publication->evidence,
+        *publications[2].confirmedPublicationResult->receipt)
+        << progressDiagnostic();
+    EXPECT_TRUE(publications[2].publication->evidence.permitsDeletion())
+        << progressDiagnostic();
+    EXPECT_TRUE(QFileInfo::exists(
+        publications[2].publication->destination))
+        << progressDiagnostic();
+    ASSERT_EQ(rotations.size(), 1) << progressDiagnostic();
+    EXPECT_FALSE(controller->idle());
+
+    pause.released = true;
+    pause.condition.notify_all();
+    const bool queueDrained = passwall::tests::waitFor([&] {
+        return rotations.size() == 3 && controller->idle();
+    }, 10000);
+    ASSERT_TRUE(queueDrained) << progressDiagnostic();
+    EXPECT_EQ(rotations[1].requestId, publications[1].requestId);
+    EXPECT_EQ(rotations[2].requestId, publications[2].requestId);
+    EXPECT_NE(rotations[1].requestId, rotations[2].requestId);
+    EXPECT_EQ(rotations[1].rotation.outcome,
+        BackupSeriesRotationOutcome::NoRotationNecessary);
+    EXPECT_EQ(rotations[2].rotation.outcome,
+        BackupSeriesRotationOutcome::NoRotationNecessary);
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalFailedUnknownAndInvalidReceiptsNeverStartRotation)
+{
+    using namespace passwall::services;
+    passwall::tests::setBackupSettingsTestWorker(
+        QString::fromLatin1(EXPORT_FAKE_WORKER));
+    const auto resetWorker = qScopeGuard([] {
+        passwall::tests::setBackupSettingsTestWorker({});
+    });
+    const QVector<QByteArray> modes{
+        "failed", "missing", "durability-file",
+        "snapshot-published-without-receipt",
+        "snapshot-insufficient-receipt",
+        "snapshot-wrong-path-receipt"};
+    for (qsizetype index = 0; index < modes.size(); ++index) {
+        const QString backupRoot = testDirectory->filePath(
+            QStringLiteral("refused-rotation-%1").arg(index));
+        ASSERT_TRUE(QDir().mkpath(backupRoot));
+        ASSERT_TRUE(GlobalBackupPreferencesStore().save(
+            {backupRoot, 7}).valid());
+        QFile selection(vaultPath + QStringLiteral(".fake-mode"));
+        ASSERT_TRUE(selection.open(
+            QIODevice::WriteOnly | QIODevice::Truncate));
+        ASSERT_EQ(selection.write(modes[index]), modes[index].size());
+        selection.close();
+
+        window.reset();
+        QApplication::processEvents();
+        window = MainWindow::createForGenerationalTests();
+        window->setLifecycleProtectionValidator([] { return true; }, [] {});
+        window->setLifecycleProtectionAvailable(true);
+        window->show();
+        auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+            QStringLiteral("automaticBackupCoordinator"));
+        auto* controller = window->findChild<
+            GenerationalBackupRotationController*>(
+                QStringLiteral("generationalBackupRotationController"));
+        auto* status = window->findChild<
+            passwall::gui::GenerationalBackupStatusController*>();
+        ASSERT_NE(coordinator, nullptr);
+        ASSERT_NE(controller, nullptr);
+        ASSERT_NE(status, nullptr);
+        QVector<MutationBackupResult> publications;
+        int rotations = 0;
+        QObject observer;
+        QObject::connect(coordinator,
+            &AutomaticBackupCoordinator::mutationBatchSettled, &observer,
+            [&](MutationBackupResult result) {
+                publications.push_back(std::move(result));
+            });
+        QObject::connect(controller,
+            &GenerationalBackupRotationController::rotationSettled, &observer,
+            [&](GenerationalBackupRotationResult) { ++rotations; });
+        runBounded([&] { unlock(); });
+        commitGenerationalCredential(
+            "Fictitious generation with refused publication evidence");
+        const bool terminalResultReceived = passwall::tests::waitFor(
+            [&] { return publications.size() == 1; }, 10000);
+        ASSERT_TRUE(terminalResultReceived)
+            << generationalStatusDiagnostic(coordinator, status, vaultPath,
+                   publications.size(), rotations).toStdString();
+        EXPECT_NE(publications.front().outcome,
+            MutationBackupOutcome::Published) << modes[index].constData();
+        EXPECT_FALSE(status->backupStatus().contains(
+            QStringLiteral("publiée"), Qt::CaseInsensitive));
+        EXPECT_TRUE(status->backupStatus().contains(
+            modes[index] == QByteArray("failed")
+                ? QStringLiteral("échouée")
+                : QStringLiteral("incertain"),
+            Qt::CaseInsensitive))
+            << generationalStatusDiagnostic(coordinator, status, vaultPath,
+                   publications.size(), rotations).toStdString();
+        EXPECT_TRUE(status->lastBackupResultStatus().contains(
+            modes[index] == QByteArray("failed")
+                ? QStringLiteral("échouée")
+                : QStringLiteral("incertain"),
+            Qt::CaseInsensitive))
+            << generationalStatusDiagnostic(coordinator, status, vaultPath,
+                   publications.size(), rotations).toStdString();
+        EXPECT_TRUE(status->retryAvailable())
+            << generationalStatusDiagnostic(coordinator, status, vaultPath,
+                   publications.size(), rotations).toStdString();
+        auto* statusButton = window->findChild<QToolButton*>(
+            QStringLiteral("generationalBackupStatusButton"));
+        ASSERT_NE(statusButton, nullptr);
+        EXPECT_TRUE(statusButton->text().contains(
+            QStringLiteral("intervention"), Qt::CaseInsensitive));
+        QElapsedTimer grace;
+        grace.start();
+        ASSERT_TRUE(passwall::tests::waitFor(
+            [&] { return grace.elapsed() >= 100; }, 1000));
+        EXPECT_EQ(rotations, 0) << modes[index].constData();
+    }
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalDuplicateTerminalCallbackCannotStartASecondRotation)
+{
+    using namespace passwall::services;
+    const QString backupRoot = testDirectory->filePath(
+        QStringLiteral("duplicate-rotation"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    auto* controller = window->findChild<
+        GenerationalBackupRotationController*>(
+            QStringLiteral("generationalBackupRotationController"));
+    ASSERT_NE(coordinator, nullptr);
+    ASSERT_NE(controller, nullptr);
+    std::optional<MutationBackupResult> publication;
+    int rotations = 0;
+    QObject observer;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled, &observer,
+        [&](MutationBackupResult result) {
+            if (!publication) publication = std::move(result);
+        });
+    QObject::connect(controller,
+        &GenerationalBackupRotationController::rotationSettled, &observer,
+        [&](GenerationalBackupRotationResult) { ++rotations; });
+    runBounded([&] { unlock(); });
+    commitGenerationalCredential(
+        "Fictitious generation for duplicate terminal callback");
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return publication.has_value() && rotations == 1; }, 10000));
+    coordinator->mutationBatchSettled(*publication);
+    QElapsedTimer grace;
+    grace.start();
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return grace.elapsed() >= 150; }, 1000));
+    EXPECT_EQ(rotations, 1);
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalVoluntaryBackupButtonPublishesWithoutNewCommitAndLocks)
+{
+    using namespace passwall::services;
+    const QString backupRoot = testDirectory->filePath(
+        QStringLiteral("voluntary-backups"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+    passwall::tests::setBackupSettingsTestWorker(
+        QString::fromLatin1(EXPORT_FAKE_WORKER));
+    const auto resetWorker = qScopeGuard([] {
+        passwall::tests::setBackupSettingsTestWorker({});
+    });
+    {
+        QFile mode(vaultPath + QStringLiteral(".fake-mode"));
+        ASSERT_TRUE(mode.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        ASSERT_EQ(mode.write("snapshot-published-file"), 23);
+    }
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    auto* preferences = window->findChild<
+        passwall::gui::GlobalBackupPreferencesController*>();
+    auto* status = window->findChild<
+        passwall::gui::GenerationalBackupStatusController*>();
+    ASSERT_NE(coordinator, nullptr);
+    ASSERT_NE(preferences, nullptr);
+    ASSERT_NE(status, nullptr);
+    QObject observer;
+    int reads = 0;
+    int offers = 0;
+    QVector<MutationBackupResult> results;
+    QObject::connect(preferences,
+        &passwall::gui::GlobalBackupPreferencesController::readSettled,
+        &observer, [&](GlobalBackupPreferencesStatus value) {
+            EXPECT_EQ(value, GlobalBackupPreferencesStatus::Valid);
+            ++reads;
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequested,
+        &observer, [&](GenerationalBackupRequestOffer) { ++offers; });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult result) {
+            results.push_back(std::move(result));
+        });
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return reads == 1; }, 10000));
+    auto* action = window->findChild<QAction*>(
+        QStringLiteral("generationalBackupStatusAction"));
+    ASSERT_NE(action, nullptr);
+    action->trigger();
+    QPointer<QPushButton> button = window->findChild<QPushButton*>(
+        QStringLiteral("generationalBackupManualButton"));
+    ASSERT_TRUE(button);
+    EXPECT_FALSE(button->isEnabled());
+    button->click();
+    EXPECT_EQ(offers, 0);
+    QPointer<QDialog> dialog = window->findChild<QDialog*>(
+        QStringLiteral("generationalBackupStatusDialog"));
+    ASSERT_TRUE(dialog);
+    dialog->reject();
+    // The controller clears its pointer immediately, but deletes the dialog
+    // later. Do not accidentally retrieve its disabled button on reopening.
+    QCoreApplication::sendPostedEvents(dialog.data(), QEvent::DeferredDelete);
+    ASSERT_TRUE(dialog.isNull());
+    ASSERT_TRUE(button.isNull());
+    runBounded([&] { unlock(); });
+    ASSERT_TRUE(window->acquireLease().unlocked);
+    EXPECT_EQ(offers, 0);
+    EXPECT_EQ(coordinator->mutationGeneration(), 0U);
+    action->trigger();
+    button = window->findChild<QPushButton*>(
+        QStringLiteral("generationalBackupManualButton"));
+    ASSERT_TRUE(button);
+    ASSERT_TRUE(button->isEnabled());
+    button->click();
+    button->click(); // The common coordinator rejects duplicate admission.
+    EXPECT_FALSE(coordinator->modificationGroupingPending());
+    lock(); // The already admitted backup must remain eligible without a key.
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return results.size() == 1; }, 10000));
+    EXPECT_EQ(offers, 1);
+    EXPECT_EQ(results[0].outcome, MutationBackupOutcome::Published);
+    EXPECT_TRUE(results[0].workerTerminated);
+    ASSERT_TRUE(results[0].publication.has_value());
+    EXPECT_TRUE(QFileInfo::exists(results[0].publication->destination));
+    EXPECT_TRUE(status->lastBackupResultStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive));
+    action->trigger();
+    button = window->findChild<QPushButton*>(
+        QStringLiteral("generationalBackupManualButton"));
+    ASSERT_TRUE(button);
+    EXPECT_FALSE(button->isEnabled());
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalSuspensionOffersOneExplicitRevalidatedRetry)
+{
+    using namespace passwall::services;
+    const QString backupRoot = testDirectory->filePath(
+        QStringLiteral("explicit-retry-backups"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+    passwall::tests::setBackupSettingsTestWorker(
+        QString::fromLatin1(EXPORT_FAKE_WORKER));
+    const auto resetWorker = qScopeGuard([] {
+        passwall::tests::setBackupSettingsTestWorker({});
+    });
+    auto setWorkerMode = [&](const QByteArray& mode) {
+        QFile selection(vaultPath + QStringLiteral(".fake-mode"));
+        ASSERT_TRUE(selection.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        ASSERT_EQ(selection.write(mode), mode.size());
+    };
+    setWorkerMode("enospc");
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    auto* status = window->findChild<
+        passwall::gui::GenerationalBackupStatusController*>();
+    ASSERT_NE(coordinator, nullptr);
+    ASSERT_NE(status, nullptr);
+    int offers = 0;
+    QVector<MutationBackupResult> results;
+    QObject observer;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequested,
+        &observer, [&](GenerationalBackupRequestOffer) { ++offers; });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult result) {
+            results.push_back(std::move(result));
+        });
+
+    runBounded([&] { unlock(); });
+    commitGenerationalCredential(
+        "Fictitious generation for explicit retry");
+    const bool failedResultReceived = passwall::tests::waitFor(
+        [&] { return results.size() == 1; }, 10000);
+    ASSERT_TRUE(failedResultReceived)
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               results.size(), 0).toStdString();
+    ASSERT_EQ(results.front().kind,
+        GenerationalBackupRequestKind::CrudGeneration);
+    ASSERT_EQ(results.front().outcome, MutationBackupOutcome::Failed);
+    EXPECT_TRUE(status->backupStatus().contains(
+        QStringLiteral("suspendues"), Qt::CaseInsensitive))
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               results.size(), 0).toStdString();
+    EXPECT_TRUE(status->backupDetail().contains(QStringLiteral("errno=28")))
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               results.size(), 0).toStdString();
+    ASSERT_TRUE(status->retryAvailable())
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               results.size(), 0).toStdString();
+    EXPECT_TRUE(status->lastBackupResultStatus().contains(
+        QStringLiteral("échouée"), Qt::CaseInsensitive))
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               results.size(), 0).toStdString();
+    ASSERT_EQ(offers, 1);
+
+    lock();
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_FALSE(status->retryAvailable());
+    EXPECT_EQ(offers, 1);
+    runBounded([&] { unlock(); });
+    ASSERT_TRUE(window->acquireLease().unlocked);
+    ASSERT_TRUE(status->retryAvailable())
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               results.size(), 0).toStdString();
+    EXPECT_EQ(offers, 1);
+
+    auto* action = window->findChild<QAction*>(
+        QStringLiteral("generationalBackupStatusAction"));
+    ASSERT_NE(action, nullptr);
+    action->trigger();
+    auto* retry = window->findChild<QPushButton*>(
+        QStringLiteral("generationalBackupRetryButton"));
+    ASSERT_NE(retry, nullptr);
+    ASSERT_TRUE(retry->isEnabled());
+    setWorkerMode("snapshot-published-file");
+    retry->click();
+    EXPECT_FALSE(retry->isEnabled());
+    retry->click();
+
+    const bool retryResultReceived = passwall::tests::waitFor(
+        [&] { return results.size() == 2; }, 10000);
+    ASSERT_TRUE(retryResultReceived)
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               results.size(), 0).toStdString();
+    EXPECT_EQ(offers, 2);
+    EXPECT_EQ(results.back().kind,
+        GenerationalBackupRequestKind::CrudGeneration);
+    EXPECT_EQ(results.back().generation, results.front().generation);
+    EXPECT_EQ(results.back().outcome, MutationBackupOutcome::Published);
+    EXPECT_TRUE(results.back().workerTerminated);
+    EXPECT_TRUE(status->backupStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive))
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               results.size(), 0).toStdString();
+    EXPECT_TRUE(status->lastBackupResultStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive))
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               results.size(), 0).toStdString();
+    EXPECT_FALSE(status->retryAvailable());
+    auto* statusButton = window->findChild<QToolButton*>(
+        QStringLiteral("generationalBackupStatusButton"));
+    ASSERT_NE(statusButton, nullptr);
+    EXPECT_TRUE(statusButton->text().contains(
+        QStringLiteral("état disponible"), Qt::CaseInsensitive));
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalCloseFailureStaysLockedUntilReauthenticationAndExplicitRetry)
+{
+    using namespace passwall::services;
+    const QString backupRoot = testDirectory->filePath(
+        QStringLiteral("close-failure-stay"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+    passwall::tests::setBackupSettingsTestWorker(
+        QString::fromLatin1(EXPORT_FAKE_WORKER));
+    const auto resetWorker = qScopeGuard([] {
+        passwall::tests::setBackupSettingsTestWorker({});
+    });
+    auto setWorkerMode = [&](const QByteArray& mode) {
+        QFile selection(vaultPath + QStringLiteral(".fake-mode"));
+        ASSERT_TRUE(selection.open(
+            QIODevice::WriteOnly | QIODevice::Truncate));
+        ASSERT_EQ(selection.write(mode), mode.size());
+    };
+    setWorkerMode("gated-enospc");
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    auto* status = window->findChild<
+        passwall::gui::GenerationalBackupStatusController*>();
+    ASSERT_NE(coordinator, nullptr);
+    ASSERT_NE(status, nullptr);
+    QVector<GenerationalBackupRequestOffer> offers;
+    QVector<MutationBackupResult> results;
+    QObject observer;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequested,
+        &observer, [&](GenerationalBackupRequestOffer offer) {
+            offers.push_back(std::move(offer));
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult result) {
+            results.push_back(std::move(result));
+        });
+
+    runBounded([&] { unlock(); });
+    commitGenerationalCredential(
+        "Fictitious generation failing during close");
+    QString readyMarker;
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        QDirIterator markers(backupRoot, {QStringLiteral("*.ready")},
+            QDir::Files, QDirIterator::Subdirectories);
+        if (!markers.hasNext()) return false;
+        readyMarker = markers.next();
+        const auto operation = coordinator->generationalOperationState(
+            vaultPath);
+        return operation.phase == GenerationalOperationPhase::WorkerActive
+            && operation.workerAlive;
+    }, 10000));
+    ASSERT_EQ(offers.size(), 1);
+    EXPECT_FALSE(window->close());
+    EXPECT_FALSE(window->acquireLease().unlocked);
     EXPECT_TRUE(window->isVisible());
 
-    // The session identity is retained during the drain, although its key was
-    // already wiped.  A COMMIT completing alongside close is therefore not
-    // folded into the first snapshot attempt.
-    commit(QStringLiteral("second close generation"));
-    ASSERT_TRUE(coordinator->markMutationBackupFinished(first.requestId,
-        MutationBackupOutcome::Published, receiptFor(first, firstDestination)));
-    ASSERT_TRUE(passwall::tests::waitFor([&] { return offers.size() == 2; }));
-    const auto second = offers[1];
-    ASSERT_TRUE(coordinator->markMutationBackupStarted(second.requestId,
-        second.vaultPath, second.mutationGeneration));
-    ASSERT_TRUE(coordinator->markMutationBackupFinished(second.requestId,
-        MutationBackupOutcome::Failed));
+    const QString readySuffix = QStringLiteral(".ready");
+    ASSERT_TRUE(readyMarker.endsWith(readySuffix));
+    QFile release(readyMarker.left(
+        readyMarker.size() - readySuffix.size())
+        + QStringLiteral(".release"));
+    ASSERT_TRUE(release.open(QIODevice::WriteOnly));
+    ASSERT_EQ(release.write("continue", 8), 8);
+    release.close();
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return results.size() == 1
+            && window->findChild<QMessageBox*>(
+                QStringLiteral("generationalCloseFailureNotice"));
+    }, 10000))
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               results.size(), 0).toStdString();
+    ASSERT_EQ(results[0].outcome, MutationBackupOutcome::Failed);
+    EXPECT_TRUE(results[0].workerTerminated);
+    auto* notice = window->findChild<QMessageBox*>(
+        QStringLiteral("generationalCloseFailureNotice"));
+    ASSERT_NE(notice, nullptr);
+    EXPECT_TRUE(notice->text().contains(
+        QStringLiteral("verrouillé"), Qt::CaseInsensitive));
+    EXPECT_TRUE(notice->text().contains(QStringLiteral("errno=28")));
+    EXPECT_FALSE(status->retryAvailable());
+    auto* stay = notice->findChild<QPushButton*>(
+        QStringLiteral("generationalCloseFailureStayButton"));
+    ASSERT_NE(stay, nullptr);
+    stay->click();
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return coordinator->generationalShutdownDrainState().status
+                == GenerationalShutdownDrainStatus::NotRequested
+            && window->findChild<QMessageBox*>(
+                QStringLiteral("generationalCloseFailureNotice")) == nullptr;
+    }));
+    EXPECT_TRUE(window->isVisible());
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    auto* centralWidget = window->findChild<QWidget*>(
+        QStringLiteral("centralwidget"));
+    ASSERT_NE(centralWidget, nullptr);
+    EXPECT_TRUE(centralWidget->isEnabled());
+    EXPECT_TRUE(coordinator->generationalBackupSuspension(vaultPath).suspended);
+    EXPECT_FALSE(status->retryAvailable());
 
-    EXPECT_TRUE(passwall::tests::waitFor([&] { return !window->isVisible(); }));
+    setWorkerMode("snapshot-published-file");
+    runBounded([&] { unlock(); });
+    ASSERT_TRUE(window->acquireLease().unlocked);
+    ASSERT_TRUE(status->retryAvailable());
+    auto* statusAction = window->findChild<QAction*>(
+        QStringLiteral("generationalBackupStatusAction"));
+    ASSERT_NE(statusAction, nullptr);
+    statusAction->trigger();
+    auto* retry = window->findChild<QPushButton*>(
+        QStringLiteral("generationalBackupRetryButton"));
+    ASSERT_NE(retry, nullptr);
+    ASSERT_TRUE(retry->isEnabled());
+    retry->click();
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return results.size() == 2; }, 10000))
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               results.size(), 0).toStdString();
     EXPECT_EQ(offers.size(), 2);
+    EXPECT_EQ(results[1].outcome, MutationBackupOutcome::Published);
+    EXPECT_TRUE(results[1].workerTerminated);
+    EXPECT_FALSE(status->retryAvailable());
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalCloseAfterFailedBackupAllowsExplicitDeparture)
+{
+    using namespace passwall::services;
+    const QString backupRoot = testDirectory->filePath(
+        QStringLiteral("close-failure-leave"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+    passwall::tests::setBackupSettingsTestWorker(
+        QString::fromLatin1(EXPORT_FAKE_WORKER));
+    const auto resetWorker = qScopeGuard([] {
+        passwall::tests::setBackupSettingsTestWorker({});
+    });
+    QFile selection(vaultPath + QStringLiteral(".fake-mode"));
+    ASSERT_TRUE(selection.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    ASSERT_EQ(selection.write("enospc", 6), 6);
+    selection.close();
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    ASSERT_NE(coordinator, nullptr);
+    QVector<MutationBackupResult> results;
+    QObject observer;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult result) {
+            results.push_back(std::move(result));
+        });
+    runBounded([&] { unlock(); });
+    commitGenerationalCredential(
+        "Fictitious failed generation before explicit departure");
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return results.size() == 1; }, 10000));
+    ASSERT_EQ(results[0].outcome, MutationBackupOutcome::Failed);
+
+    EXPECT_FALSE(window->close());
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return window->findChild<QMessageBox*>(
+            QStringLiteral("generationalCloseFailureNotice")) != nullptr;
+    }));
+    auto* leave = window->findChild<QPushButton*>(
+        QStringLiteral("generationalCloseFailureQuitButton"));
+    ASSERT_NE(leave, nullptr);
+    leave->click();
+    EXPECT_TRUE(passwall::tests::waitFor(
+        [&] { return !window->isVisible(); }, 10000));
+    EXPECT_EQ(results.size(), 1);
+    EXPECT_TRUE(coordinator->generationalBackupSuspension(vaultPath).suspended);
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalChangedOrUnreadablePreferencesDuringAdmissionRefuseDeletion)
+{
+    using namespace passwall::services;
+    for (int change = 0; change < 3; ++change) {
+        const bool changeRoot = change == 1;
+        const QString backupRoot = testDirectory->filePath(
+            changeRoot ? QStringLiteral("changing-root")
+                       : change == 0
+                ? QStringLiteral("changing-retention")
+                : QStringLiteral("unreadable-preferences"));
+        const QString replacementRoot = testDirectory->filePath(
+            QStringLiteral("replacement-root"));
+        ASSERT_TRUE(QDir().mkpath(backupRoot));
+        ASSERT_TRUE(QDir().mkpath(replacementRoot));
+        ASSERT_TRUE(GlobalBackupPreferencesStore().save(
+            {backupRoot, 7}).valid());
+        RotationCheckpointPause pause;
+        passwall::tests::setGenerationalRotationCheckpointHook(
+            pauseGenerationalRotation, &pause);
+        const auto release = qScopeGuard([&] {
+            pause.released = true;
+            pause.condition.notify_all();
+            passwall::tests::setGenerationalRotationCheckpointHook(
+                nullptr, nullptr);
+        });
+
+        window.reset();
+        QApplication::processEvents();
+        window = MainWindow::createForGenerationalTests();
+        window->setLifecycleProtectionValidator([] { return true; }, [] {});
+        window->setLifecycleProtectionAvailable(true);
+        window->show();
+        auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+            QStringLiteral("automaticBackupCoordinator"));
+        auto* controller = window->findChild<
+            GenerationalBackupRotationController*>(
+                QStringLiteral("generationalBackupRotationController"));
+        auto* status = window->findChild<
+            passwall::gui::GenerationalBackupStatusController*>();
+        ASSERT_NE(coordinator, nullptr);
+        ASSERT_NE(controller, nullptr);
+        ASSERT_NE(status, nullptr);
+        std::optional<MutationBackupResult> publication;
+        std::optional<GenerationalBackupRotationResult> rotation;
+        QObject observer;
+        QObject::connect(coordinator,
+            &AutomaticBackupCoordinator::mutationBatchSettled, &observer,
+            [&](MutationBackupResult result) {
+                publication = std::move(result);
+            });
+        QObject::connect(controller,
+            &GenerationalBackupRotationController::rotationSettled, &observer,
+            [&](GenerationalBackupRotationResult result) {
+                rotation = std::move(result);
+            });
+        runBounded([&] { unlock(); });
+        commitGenerationalCredential(
+            "Fictitious generation before rotation preference change");
+        const bool publicationEnteredRotation = passwall::tests::waitFor([&] {
+            return publication.has_value() && pause.entered.load();
+        }, 10000);
+        ASSERT_TRUE(publicationEnteredRotation)
+            << generationalStatusDiagnostic(coordinator, status, vaultPath,
+                   publication.has_value() ? 1 : 0,
+                   rotation.has_value() ? 1 : 0).toStdString();
+        ASSERT_EQ(publication->outcome, MutationBackupOutcome::Published);
+        if (change == 2) {
+            ASSERT_TRUE(QFile::setPermissions(
+                GlobalBackupPreferencesStore().fileName(),
+                QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                    | QFileDevice::ReadGroup));
+        } else {
+            const auto changed = changeRoot
+                ? GlobalBackupPreferences{replacementRoot, 7}
+                : GlobalBackupPreferences{backupRoot, 8};
+            ASSERT_TRUE(GlobalBackupPreferencesStore().save(changed).valid());
+        }
+        pause.released = true;
+        pause.condition.notify_all();
+        const bool rotationSettled = passwall::tests::waitFor(
+            [&] { return rotation.has_value(); }, 10000);
+        ASSERT_TRUE(rotationSettled)
+            << generationalStatusDiagnostic(coordinator, status, vaultPath,
+                   publication.has_value() ? 1 : 0,
+                   rotation.has_value() ? 1 : 0).toStdString();
+        EXPECT_EQ(rotation->rotation.outcome,
+            BackupSeriesRotationOutcome::Refused);
+        EXPECT_TRUE(rotation->rotation.deleted.isEmpty());
+        ASSERT_TRUE(publication->publication);
+        EXPECT_TRUE(QFileInfo::exists(
+            publication->publication->destination));
+        const auto presentationDiagnostic = generationalStatusDiagnostic(
+            coordinator, status, vaultPath,
+            publication.has_value() ? 1 : 0,
+            rotation.has_value() ? 1 : 0);
+        EXPECT_TRUE(status->lastBackupResultStatus().contains(
+            QStringLiteral("publiée"), Qt::CaseInsensitive))
+            << presentationDiagnostic.toStdString();
+        EXPECT_TRUE(status->rotationStatus().contains(
+            QStringLiteral("refusée"), Qt::CaseInsensitive))
+            << presentationDiagnostic.toStdString();
+        passwall::tests::setGenerationalRotationCheckpointHook(
+            nullptr, nullptr);
+        if (change == 2)
+            ASSERT_TRUE(QFile::setPermissions(
+                GlobalBackupPreferencesStore().fileName(),
+                QFileDevice::ReadOwner | QFileDevice::WriteOwner));
+    }
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalPreferenceChangeAfterDeletionStopsWithoutChangingPublication)
+{
+    using namespace passwall::services;
+    const QString backupRoot = testDirectory->filePath(
+        QStringLiteral("preference-change-after-deletion"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    auto* controller = window->findChild<
+        GenerationalBackupRotationController*>(
+            QStringLiteral("generationalBackupRotationController"));
+    auto* status = window->findChild<
+        passwall::gui::GenerationalBackupStatusController*>();
+    ASSERT_NE(coordinator, nullptr);
+    ASSERT_NE(controller, nullptr);
+    ASSERT_NE(status, nullptr);
+    QVector<MutationBackupResult> publications;
+    QVector<GenerationalBackupRotationResult> rotations;
+    QObject observer;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled, &observer,
+        [&](MutationBackupResult result) {
+            publications.push_back(std::move(result));
+        });
+    QObject::connect(controller,
+        &GenerationalBackupRotationController::rotationSettled, &observer,
+        [&](GenerationalBackupRotationResult result) {
+            rotations.push_back(std::move(result));
+        });
+    runBounded([&] { unlock(); });
+    commitGenerationalCredential(
+        "Fictitious first generation before deletion checkpoint");
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return publications.size() == 1 && rotations.size() == 1;
+    }, 10000));
+    ASSERT_TRUE(publications[0].publication);
+    const QString firstPublished = publications[0].publication->destination;
+    const QString series = QFileInfo(firstPublished).absolutePath();
+    for (int day = 1; day <= 7; ++day) {
+        const QString copy = QDir(series).filePath(
+            QStringLiteral("generation_%1_2026-03-01_00-00-00.pwdb").arg(day + 1));
+        ASSERT_TRUE(QFile::copy(firstPublished, copy));
+        ASSERT_TRUE(QFile::setPermissions(copy,
+            QFileDevice::ReadOwner | QFileDevice::WriteOwner));
+    }
+
+    RotationCheckpointPause pause;
+    pause.checkpoint = BackupSeriesRotationCheckpoint::AfterDeletion;
+    passwall::tests::setGenerationalRotationCheckpointHook(
+        pauseGenerationalRotation, &pause);
+    const auto release = qScopeGuard([&] {
+        pause.released = true;
+        pause.condition.notify_all();
+        passwall::tests::setGenerationalRotationCheckpointHook(nullptr, nullptr);
+    });
+    Credential added = makeCredential();
+    added.id = {};
+    added.title = "Fictitious publication during preference change";
+    const auto wipe = qScopeGuard([&] { wipeCredential(added); });
+    std::string error;
+    ASSERT_TRUE(CredentialService::add(vaultPath.toStdString(), verificationKey,
+        added, error, BackupTriggerMode::Generational)) << error;
+    const bool publicationEnteredRotation = passwall::tests::waitFor([&] {
+        return publications.size() == 2 && pause.entered.load();
+    }, 10000);
+    ASSERT_TRUE(publicationEnteredRotation)
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               publications.size(), rotations.size()).toStdString();
+    ASSERT_EQ(publications[1].outcome, MutationBackupOutcome::Published);
+    ASSERT_TRUE(publications[1].workerTerminated);
+    ASSERT_TRUE(publications[1].publication);
+    EXPECT_TRUE(QFileInfo::exists(publications[1].publication->destination));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 8}).valid());
+    pause.released = true;
+    pause.condition.notify_all();
+    const bool rotationSettled = passwall::tests::waitFor(
+        [&] { return rotations.size() == 2; }, 10000);
+    ASSERT_TRUE(rotationSettled)
+        << generationalStatusDiagnostic(coordinator, status, vaultPath,
+               publications.size(), rotations.size()).toStdString();
+    EXPECT_EQ(rotations[1].rotation.outcome,
+        BackupSeriesRotationOutcome::Partial);
+    EXPECT_EQ(rotations[1].rotation.deleted.size(), 1);
+    EXPECT_EQ(rotations[1].rotation.durableDeletions, 1U);
+    EXPECT_TRUE(QFileInfo::exists(publications[1].publication->destination));
+    EXPECT_EQ(publications[1].outcome, MutationBackupOutcome::Published);
+    const auto presentationDiagnostic = generationalStatusDiagnostic(
+        coordinator, status, vaultPath, publications.size(), rotations.size());
+    EXPECT_TRUE(status->lastBackupResultStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive))
+        << presentationDiagnostic.toStdString();
+    EXPECT_TRUE(status->rotationStatus().contains(
+        QStringLiteral("partielle"), Qt::CaseInsensitive))
+        << presentationDiagnostic.toStdString();
+    EXPECT_EQ(QDir(series).entryList({QStringLiteral("*.pwdb")},
+        QDir::Files).size(), 8);
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalCloseSupervisesAnActiveRotationWithoutBlockingGui)
+{
+    using namespace passwall::services;
+    const QString backupRoot = testDirectory->filePath(
+        QStringLiteral("close-during-rotation"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+    RotationCheckpointPause pause;
+    passwall::tests::setGenerationalRotationCheckpointHook(
+        pauseGenerationalRotation, &pause);
+    const auto release = qScopeGuard([&] {
+        pause.released = true;
+        pause.condition.notify_all();
+        passwall::tests::setGenerationalRotationCheckpointHook(nullptr, nullptr);
+    });
+
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* controller = window->findChild<
+        GenerationalBackupRotationController*>(
+            QStringLiteral("generationalBackupRotationController"));
+    ASSERT_NE(controller, nullptr);
+    int rotations = 0;
+    QObject observer;
+    QObject::connect(controller,
+        &GenerationalBackupRotationController::rotationSettled, &observer,
+        [&](GenerationalBackupRotationResult) { ++rotations; });
+    int heartbeatTicks = 0;
+    QTimer heartbeat;
+    QObject::connect(&heartbeat, &QTimer::timeout,
+        [&] { ++heartbeatTicks; });
+    heartbeat.start(0);
+    runBounded([&] { unlock(); });
+    commitGenerationalCredential(
+        "Fictitious generation before close during rotation");
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return pause.entered.load(); }, 10000));
+
+    EXPECT_FALSE(window->close());
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_TRUE(window->isVisible());
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return heartbeatTicks > 2; }, 1000));
+    pause.released = true;
+    pause.condition.notify_all();
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return rotations == 1 && !window->isVisible(); }, 10000));
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalOwnerDestructionRequestsControlledRotationCancellation)
+{
+    using namespace passwall::services;
+    const QString backupRoot = testDirectory->filePath(
+        QStringLiteral("destroy-during-rotation"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(GlobalBackupPreferencesStore().save({backupRoot, 7}).valid());
+    RotationCheckpointPause pause;
+    passwall::tests::setGenerationalRotationCheckpointHook(
+        pauseGenerationalRotation, &pause);
+    const auto release = qScopeGuard([&] {
+        pause.released = true;
+        pause.condition.notify_all();
+        passwall::tests::setGenerationalRotationCheckpointHook(nullptr, nullptr);
+    });
+    window.reset();
+    QApplication::processEvents();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    QString publishedPath;
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    ASSERT_NE(coordinator, nullptr);
+    QObject observer;
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::mutationBatchSettled, &observer,
+        [&](MutationBackupResult result) {
+            if (result.publication)
+                publishedPath = result.publication->destination;
+        });
+    runBounded([&] { unlock(); });
+    commitGenerationalCredential(
+        "Fictitious generation before owner destruction");
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return !publishedPath.isEmpty() && pause.entered.load();
+    }, 10000));
+    QElapsedTimer destruction;
+    destruction.start();
+    window.reset();
+    EXPECT_LT(destruction.elapsed(), 1000);
+    EXPECT_TRUE(QFileInfo::exists(publishedPath));
+    pause.released = true;
+    pause.condition.notify_all();
+    QElapsedTimer grace;
+    grace.start();
+    ASSERT_TRUE(passwall::tests::waitFor(
+        [&] { return grace.elapsed() >= 150; }, 1000));
+    EXPECT_TRUE(QFileInfo::exists(publishedPath));
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalCloseDuringAWorkerDrainsTheConfirmedResultOnlyOnce)
+{
+    using passwall::services::AutomaticBackupCoordinator;
+    using passwall::services::GenerationalOperationPhase;
+    using passwall::services::MutationBackupOutcome;
+    using passwall::services::MutationBackupResult;
+    const QString backupRoot = testDirectory->filePath(QStringLiteral("automatic-backups"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(passwall::services::GlobalBackupPreferencesStore().save(
+        {backupRoot, 7}).valid());
+
+    window.reset();
+    QApplication::processEvents();
+    passwall::tests::setBackupSettingsTestWorker(
+        QString::fromLatin1(EXPORT_FAKE_WORKER));
+    const auto resetWorker = qScopeGuard([] {
+        passwall::tests::setBackupSettingsTestWorker({});
+    });
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    ASSERT_NE(coordinator, nullptr);
+    auto* statusController = window->findChild<
+        passwall::gui::GenerationalBackupStatusController*>();
+    ASSERT_NE(statusController, nullptr);
+    QVector<MutationBackupResult> results;
+    QObject observer;
+    QObject::connect(coordinator, &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult result) {
+            results.push_back(std::move(result));
+        });
+    auto setWorkerMode = [&](const QByteArray& mode) {
+        QFile selection(vaultPath + QStringLiteral(".fake-mode"));
+        ASSERT_TRUE(selection.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        ASSERT_EQ(selection.write(mode), mode.size());
+    };
+    setWorkerMode("snapshot-published-file");
+    runBounded([&] { unlock(); });
+    commitGenerationalCredential(
+        "Fictitious first generation before active-worker close");
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return results.size() == 1; }, 10000));
+    ASSERT_EQ(results[0].outcome, MutationBackupOutcome::Published);
+
+    setWorkerMode("slow-snapshot-published-file");
+    Credential added = makeCredential();
+    added.id = {};
+    added.title = "Fictitious generation while worker is active";
+    const auto wipe = qScopeGuard([&] { wipeCredential(added); });
+    std::string error;
+    ASSERT_TRUE(CredentialService::add(vaultPath.toStdString(), verificationKey,
+        added, error, passwall::services::BackupTriggerMode::Generational))
+        << error;
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        const auto state = coordinator->generationalOperationState(vaultPath);
+        return state.phase == GenerationalOperationPhase::WorkerActive
+            && state.workerAlive;
+    }, 10000));
+    EXPECT_TRUE(statusController->backupStatus().contains(
+        QStringLiteral("en cours"), Qt::CaseInsensitive));
+    EXPECT_FALSE(statusController->backupStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive));
+
+    EXPECT_FALSE(window->close());
+    EXPECT_FALSE(window->close());
+    EXPECT_FALSE(window->acquireLease().unlocked);
+    EXPECT_TRUE(window->isVisible());
+    const bool drainedResultReceived = passwall::tests::waitFor(
+        [&] { return results.size() == 2; }, 10000);
+    ASSERT_TRUE(drainedResultReceived)
+        << generationalStatusDiagnostic(coordinator, statusController,
+               vaultPath, results.size(), 0).toStdString();
+    EXPECT_EQ(results[1].outcome, MutationBackupOutcome::Published);
+    ASSERT_TRUE(results[1].publication.has_value());
+    EXPECT_TRUE(QFileInfo(results[1].publication->destination).isFile());
+    EXPECT_TRUE(passwall::tests::waitFor([&] { return !window->isVisible(); }));
+    EXPECT_EQ(results.size(), 2);
+    EXPECT_TRUE(statusController->backupStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive))
+        << generationalStatusDiagnostic(coordinator, statusController,
+               vaultPath, results.size(), 0).toStdString();
+    EXPECT_TRUE(statusController->lastBackupResultStatus().contains(
+        QStringLiteral("publiée"), Qt::CaseInsensitive))
+        << generationalStatusDiagnostic(coordinator, statusController,
+               vaultPath, results.size(), 0).toStdString();
+}
+
+TEST_F(MainWindowEditorLockTest,
+    GenerationalPreferenceInvalidationConsumesNoLateCrudWorker)
+{
+    using passwall::services::AutomaticBackupCoordinator;
+    using passwall::services::GenerationalOperationPhase;
+    using passwall::services::GlobalBackupPreferencesResult;
+    using passwall::services::GlobalBackupPreferencesStatus;
+    using passwall::services::MutationBackupOutcome;
+    using passwall::services::MutationBackupResult;
+    const QString backupRoot = testDirectory->filePath(QStringLiteral("automatic-backups"));
+    ASSERT_TRUE(QDir().mkpath(backupRoot));
+    ASSERT_TRUE(passwall::services::GlobalBackupPreferencesStore().save(
+        {backupRoot, 7}).valid());
+
+    window.reset();
+    QApplication::processEvents();
+    passwall::tests::setBackupSettingsTestWorker(
+        QString::fromLatin1(EXPORT_FAKE_WORKER));
+    const auto resetWorker = qScopeGuard([] {
+        passwall::tests::setBackupSettingsTestWorker({});
+    });
+    QFile selection(vaultPath + QStringLiteral(".fake-mode"));
+    ASSERT_TRUE(selection.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    ASSERT_EQ(selection.write("snapshot-published-file"), 23);
+    selection.close();
+    window = MainWindow::createForGenerationalTests();
+    window->setLifecycleProtectionValidator([] { return true; }, [] {});
+    window->setLifecycleProtectionAvailable(true);
+    window->show();
+    auto* coordinator = window->findChild<passwall::services::AutomaticBackupCoordinator*>(
+        QStringLiteral("automaticBackupCoordinator"));
+    ASSERT_NE(coordinator, nullptr);
+    QVector<MutationBackupResult> results;
+    QVector<quint64> invalidated;
+    bool invalidateNextCrud = false;
+    bool preferenceInvalidated = false;
+    QObject observer;
+    QObject::connect(coordinator, &AutomaticBackupCoordinator::mutationBatchSettled,
+        &observer, [&](MutationBackupResult result) {
+            results.push_back(std::move(result));
+        });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequestInvalidated,
+        &observer, [&](quint64 requestId) { invalidated.push_back(requestId); });
+    QObject::connect(coordinator,
+        &AutomaticBackupCoordinator::generationalBackupRequested,
+        &observer, [&](passwall::services::GenerationalBackupRequestOffer offer) {
+            if (!invalidateNextCrud || preferenceInvalidated
+                || offer.kind != passwall::services::GenerationalBackupRequestKind::CrudGeneration)
+                return;
+            preferenceInvalidated = true;
+            GlobalBackupPreferencesResult unavailable;
+            unavailable.status = GlobalBackupPreferencesStatus::Absent;
+            coordinator->applyGlobalBackupPreferences(std::move(unavailable));
+        });
+    runBounded([&] { unlock(); });
+    commitGenerationalCredential(
+        "Fictitious first generation before preference invalidation");
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return results.size() == 1; }, 10000));
+    ASSERT_EQ(results[0].outcome, MutationBackupOutcome::Published);
+    invalidateNextCrud = true;
+
+    Credential added = makeCredential();
+    added.id = {};
+    added.title = "Fictitious invalidated generation";
+    const auto wipe = qScopeGuard([&] { wipeCredential(added); });
+    std::string error;
+    ASSERT_TRUE(CredentialService::add(vaultPath.toStdString(), verificationKey,
+        added, error, passwall::services::BackupTriggerMode::Generational))
+        << error;
+    ASSERT_TRUE(passwall::tests::waitFor([&] {
+        return preferenceInvalidated && !invalidated.isEmpty();
+    }, 10000));
+
+    QElapsedTimer grace; grace.start();
+    ASSERT_TRUE(passwall::tests::waitFor([&] { return grace.elapsed() >= 300; }, 1000));
+    const auto state = coordinator->generationalOperationState(vaultPath);
+    EXPECT_NE(state.phase, GenerationalOperationPhase::WorkerActive);
+    EXPECT_EQ(results.size(), 1);
 }
 #endif
 
@@ -1286,7 +4022,8 @@ TEST_P(RestoreDelegationRejectTest, CorruptedDelegationNeverReceivesPasswordOrCh
     EXPECT_FALSE(window->acquireLease().unlocked);
 }
 INSTANTIATE_TEST_SUITE_P(PrivateProtocol, RestoreDelegationRejectTest,
-    ::testing::Values("uuid", "principal", "vault", "inode", "session", "protocol", "duplicate"));
+    ::testing::Values("uuid", "principal", "vault", "inode", "policy",
+        "session", "protocol", "duplicate"));
 class RestoreTerminalRejectTest : public MainWindowEditorLockTest, public ::testing::WithParamInterface<const char*> {};
 TEST_P(RestoreTerminalRejectTest, DataAfterTerminalResultCannotBecomeFullSuccess)
 {
@@ -1992,7 +4729,7 @@ TEST_F(MainWindowEditorLockTest, ExternalLockCompletionMayDestroyTheWindowWithou
 
 TEST_F(MainWindowEditorLockTest, LinuxLifecycleStartsFailClosed)
 {
-    window = std::make_unique<MainWindow>(); // no injected readiness
+    window = MainWindow::createForHistoricalTests(); // no injected readiness
     EXPECT_FALSE(window->acquireLease().unlocked);
     EXPECT_FALSE(window->findChild<QPushButton*>(
         QStringLiteral("unlockVaultButton"))->isEnabled());
@@ -2004,7 +4741,7 @@ TEST_F(MainWindowEditorLockTest, LinuxLifecycleStartsFailClosed)
 
 TEST_F(MainWindowEditorLockTest, LinuxLifecycleCachedReadyAloneCannotUnlock)
 {
-    window = std::make_unique<MainWindow>();
+    window = MainWindow::createForHistoricalTests();
     window->setLifecycleProtectionAvailable(true); // deliberately no validator
     runBounded([&] { unlock(); });
     expectLockedAfterRefresh();
@@ -3063,6 +5800,13 @@ int main(int argc, char** argv)
     const auto probeRoot = qEnvironmentVariable("PW_RESTORE_PARENT_ROOT");
     QTemporaryDir nativeSettings(probeRoot.isEmpty() ? QDir::tempPath() + "/pw-native-XXXXXX" : probeRoot + "/native-XXXXXX");
     if (!nativeSettings.isValid())
+        return 1;
+    // QSettings::setPath() is process-local. Backup workers are separate
+    // processes and otherwise fall back to the user's shared native settings
+    // root, including PassWall.conf.registry-lock. Export the already-private
+    // root before any worker can start so every child resolves the same
+    // per-CTest-process recovery registry as its parent.
+    if (!qputenv("XDG_CONFIG_HOME", QFile::encodeName(nativeSettings.path())))
         return 1;
     QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, nativeSettings.path());
     QSettings::setPath(QSettings::NativeFormat, QSettings::SystemScope, nativeSettings.path());

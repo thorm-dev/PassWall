@@ -69,6 +69,15 @@ public:
     [[nodiscard]] static bool prevalidateVaultSource(const std::string& path,
         std::string& error, SnapshotSourceIdentity* identity = nullptr,
         SnapshotVaultContents* contents = nullptr);
+    // Read-only screening of the newly published file before rotation.
+    // It verifies the SQLite header, PassWall V1 metadata, required readable
+    // tables, vault_id and physical stability, but deliberately does not run
+    // integrity_check or scan every encrypted entry. It is not authentication
+    // and must never be used as deletion or restoration authority.
+    [[nodiscard]] static bool prevalidateVaultSourceLightweight(
+        const std::string& path, std::string& error,
+        SnapshotSourceIdentity* identity = nullptr,
+        SnapshotVaultContents* contents = nullptr);
     // Same directory traversal/permissions/filesystem policy as createSnapshot.
     // Never creates a missing directory or redirects to another destination.
     [[nodiscard]] static bool inspectDestinationDirectory(const std::string& path,

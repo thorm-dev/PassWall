@@ -15,6 +15,15 @@ struct ReplacementControl;
 struct ReplacementRecoveryResult;
 enum class ReplacementRecoveryAction;
 
+// Bound to the replacement authority by its owner. This is not a user
+// preference and is never inferred by the worker from serialized registry
+// data. Required is the fail-closed policy for a future Generational owner;
+// HistoricalRegistration preserves the existing per-vault contract.
+enum class ReplacementPrecautionPolicy {
+    Required,
+    HistoricalRegistration
+};
+
 enum class ReplacementFinalizationState {
     NotStarted,
     IdentityUnconfirmed,
@@ -92,9 +101,9 @@ private:
     std::shared_ptr<State> state_;
     explicit VaultReplacementAuthorization(std::shared_ptr<State>) noexcept;
     static std::shared_ptr<State> reserve(const VaultPreferencesStore&, const QString&,
-        std::function<bool()> cleanupStillValid, QString&);
+        ReplacementPrecautionPolicy, std::function<bool()> cleanupStillValid, QString&);
     static std::shared_ptr<State> reserve(const VaultPreferencesStore&, const QString&,
-        std::function<bool()> cleanupStillValid,
+        ReplacementPrecautionPolicy, std::function<bool()> cleanupStillValid,
         storage::VaultOperationGuard, QString&);
     static VaultReplacementAuthorization acknowledge(std::shared_ptr<State>, QString&);
     // Three-part issuance: owner-thread cleanup, secretless I/O, owner-thread
@@ -122,6 +131,8 @@ private:
     [[nodiscard]] bool armPublication(QString& error);
     [[nodiscard]] ReplacementFinalizationResult finalizePublication();
     [[nodiscard]] bool replacementContext(VaultRegistration&, VaultReplacementIntent&, QString&) const;
+    [[nodiscard]] bool precautionRequired(
+        const VaultRegistration&) const noexcept;
     [[nodiscard]] bool verifyBeforeExchange(QString&) const;
     [[nodiscard]] bool permitsSnapshot(const std::string&, const storage::VaultOperationGuard&,
         SnapshotCheckpoint, std::string&) const;

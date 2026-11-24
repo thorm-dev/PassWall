@@ -1,16 +1,20 @@
 #include "services/backup_destination_preparer.hpp"
 #include "services/backup_job.hpp"
+#include "services/backup_generation_name.hpp"
 
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 
+#include <algorithm>
 #include <cerrno>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <utility>
 
 #ifdef Q_OS_UNIX
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -136,50 +140,112 @@ bool openFamily(const QString& root, const QByteArray& familyName,
     return true;
 }
 
-bool chooseDestination(const QString& familyPath,
-    const SnapshotDirectoryIdentity& expectedFamily, const QDateTime& timestamp,
-    QString& destination, QString& error)
+bool openSeries(const QString& familyPath, const QByteArray& seriesName,
+    const SnapshotDirectoryIdentity& expectedFamily,
+    SnapshotDirectoryIdentity& seriesIdentity, QString& error)
 {
     Descriptor family;
     if (!openDirectory(familyPath, family, error)) return false;
-    if (directoryIdentity(family.value) != expectedFamily)
-        return fail(error, QStringLiteral("Le dossier familial a changé."));
+    struct stat familyStatus {};
+    if (::fstat(family.value, &familyStatus) != 0
+        || familyStatus.st_uid != ::geteuid()
+        || (familyStatus.st_mode & 0777) != 0700
+        || directoryIdentity(family.value) != expectedFamily)
+        return fail(error, QStringLiteral(
+            "Le dossier familial a changé ou n'est plus privé."));
 
-    const QString stem = timestamp.toUTC().toString(QStringLiteral("yyyy-MM-dd_HH-mm-ss"));
-    if (!timestamp.isValid() || stem.size() != 19)
-        return fail(error, QStringLiteral("Horodatage UTC invalide."));
-    for (quint64 suffix = 1; suffix != std::numeric_limits<quint64>::max(); ++suffix) {
-        const QString name = stem
-            + (suffix == 1 ? QString{} : QStringLiteral("_") + QString::number(suffix))
-            + QStringLiteral(".pwdb");
-        const QByteArray encoded = QFile::encodeName(name);
-        struct stat existing {};
-        if (::fstatat(family.value, encoded.constData(), &existing,
-                AT_SYMLINK_NOFOLLOW) == 0)
-            continue;
-        if (errno != ENOENT)
-            return fail(error, QStringLiteral(
-                "Vérification du nom de sauvegarde impossible."));
-        destination = QDir(familyPath).filePath(name);
-        return true;
+    bool created = false;
+    if (::mkdirat(family.value, seriesName.constData(), 0700) == 0) {
+        created = true;
+    } else if (errno != EEXIST) {
+        return fail(error, QStringLiteral("Création du dossier de série impossible."));
     }
-    return fail(error, QStringLiteral("Aucun nom de sauvegarde disponible."));
+    Descriptor series(::openat(family.value, seriesName.constData(),
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    struct stat seriesStatus {}, namedStatus {};
+    if (series.value < 0 || ::fstat(series.value, &seriesStatus) != 0
+        || ::fstatat(family.value, seriesName.constData(), &namedStatus,
+            AT_SYMLINK_NOFOLLOW) != 0
+        || !S_ISDIR(seriesStatus.st_mode) || !S_ISDIR(namedStatus.st_mode)
+        || seriesStatus.st_uid != ::geteuid() || namedStatus.st_uid != ::geteuid()
+        || (seriesStatus.st_mode & 0777) != 0700
+        || seriesStatus.st_dev != namedStatus.st_dev
+        || seriesStatus.st_ino != namedStatus.st_ino)
+        return fail(error, QStringLiteral(
+            "Dossier de série non privé, ambigu ou remplacé concurremment."));
+    if (created && (::fsync(series.value) != 0 || ::fsync(family.value) != 0))
+        return fail(error, QStringLiteral(
+            "Dossier de série visible, mais persistance non confirmée."));
+    seriesIdentity = directoryIdentity(series.value);
+    if (seriesIdentity.device == 0 || seriesIdentity.inode == 0)
+        return fail(error, QStringLiteral("Identité du dossier de série indisponible."));
+    return true;
+}
+
+bool chooseDestination(const QString& seriesPath,
+    const SnapshotDirectoryIdentity& expectedSeries, const QDateTime& timestamp,
+    QString& destination, QString& error)
+{
+    Descriptor series;
+    if (!openDirectory(seriesPath, series, error)) return false;
+    if (directoryIdentity(series.value) != expectedSeries)
+        return fail(error, QStringLiteral("Le dossier de série a changé."));
+
+    // Read names only. An independent directory descriptor keeps iteration
+    // separate from the descriptor used for the final absence check.
+    Descriptor listing(::openat(series.value, ".",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    if (listing.value < 0)
+        return fail(error, QStringLiteral("Lecture de la série impossible."));
+    DIR* stream = ::fdopendir(listing.value);
+    if (stream == nullptr)
+        return fail(error, QStringLiteral("Lecture de la série impossible."));
+    listing.value = -1;
+    const auto closeStream = [](DIR* directory) { (void)::closedir(directory); };
+    std::unique_ptr<DIR, decltype(closeStream)> names(stream, closeStream);
+    quint64 maximum = 0;
+    for (;;) {
+        errno = 0;
+        const dirent* entry = ::readdir(names.get());
+        if (entry == nullptr) {
+            if (errno != 0)
+                return fail(error, QStringLiteral("Lecture de la série interrompue."));
+            break;
+        }
+        quint64 generation = 0;
+        QDateTime previousTimestamp;
+        if (parseBackupGenerationName(QString::fromLatin1(entry->d_name),
+                generation, previousTimestamp))
+            maximum = std::max(maximum, generation);
+    }
+    if (maximum == std::numeric_limits<quint64>::max())
+        return fail(error, QStringLiteral("Numérotation des sauvegardes épuisée."));
+    const QString name = backupGenerationName(maximum + 1, timestamp);
+    if (name.isEmpty())
+        return fail(error, QStringLiteral("Nom de génération invalide."));
+    const QByteArray encoded = QFile::encodeName(name);
+    struct stat existing {};
+    if (::fstatat(series.value, encoded.constData(), &existing,
+            AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+        return fail(error, QStringLiteral("Nom de sauvegarde occupé ou non vérifiable."));
+    destination = QDir(seriesPath).filePath(name);
+    return true;
 }
 
 bool destinationStillAbsent(const PreparedBackupDestination& prepared,
     QString& error)
 {
-    Descriptor family;
-    if (!openDirectory(prepared.familyDirectory(), family, error)) return false;
-    if (directoryIdentity(family.value) != prepared.familyIdentity())
-        return fail(error, QStringLiteral("Le dossier familial a changé."));
+    Descriptor series;
+    if (!openDirectory(prepared.seriesDirectory(), series, error)) return false;
+    if (directoryIdentity(series.value) != prepared.seriesIdentity())
+        return fail(error, QStringLiteral("Le dossier de série a changé."));
     const QFileInfo destination(prepared.destinationPath());
-    if (destination.absolutePath() != prepared.familyDirectory()
+    if (destination.absolutePath() != prepared.seriesDirectory()
         || destination.fileName().isEmpty())
         return fail(error, QStringLiteral("Destination préparée incohérente."));
     const QByteArray name = QFile::encodeName(destination.fileName());
     struct stat status {};
-    if (::fstatat(family.value, name.constData(), &status, AT_SYMLINK_NOFOLLOW) == 0)
+    if (::fstatat(series.value, name.constData(), &status, AT_SYMLINK_NOFOLLOW) == 0)
         return fail(error, QStringLiteral(
             "Le nom préparé est désormais occupé ; aucun écrasement autorisé."));
     if (errno != ENOENT)
@@ -196,7 +262,10 @@ bool BackupDestinationPreparer::prepare(
     const VaultFileIdentity& expectedVault, quint64 bindingGeneration,
     const QDateTime& timestamp, PreparedBackupDestination& output, QString& error,
     const SnapshotDirectoryIdentity* expectedRoot,
-    const SnapshotDirectoryIdentity* expectedFamily, storage::VaultOperationGuard* existingSnapshotAccess)
+    const SnapshotDirectoryIdentity* expectedFamily,
+    const SnapshotDirectoryIdentity* expectedSeries,
+    storage::VaultOperationGuard* existingSnapshotAccess,
+    const BackupInstallationIdentity* installationIdentity)
 {
     output = {};
     error.clear();
@@ -214,6 +283,17 @@ bool BackupDestinationPreparer::prepare(
         return fail(error, QStringLiteral("Identité ou génération du coffre invalide."));
     if (!timestamp.isValid())
         return fail(error, QStringLiteral("Horodatage UTC invalide."));
+    BackupInstallationIdentity observedInstallation;
+    if (installationIdentity != nullptr) {
+        observedInstallation = *installationIdentity;
+    } else if (!BackupSeriesIdentityService::currentInstallation(
+            observedInstallation, error)) {
+        return false;
+    }
+    QString seriesId;
+    if (!BackupSeriesIdentityService::deriveSeriesId(
+            observedInstallation, expectedVault.vaultId, seriesId, error))
+        return false;
 #ifndef Q_OS_UNIX
     Q_UNUSED(timestamp);
     return fail(error, QStringLiteral(
@@ -252,7 +332,7 @@ bool BackupDestinationPreparer::prepare(
             : QString::fromStdString(destinationError));
     if (expectedRoot != nullptr && inspectedRoot != *expectedRoot)
         return fail(error, QStringLiteral(
-            "La racine de sauvegarde ne correspond plus à l'inspection initiale."));
+            "La racine de sauvegarde ne correspond plus à l'identité attendue."));
 
     const QByteArray familyName = expectedVault.vaultId.toHex();
     SnapshotDirectoryIdentity rootIdentity, familyIdentity;
@@ -262,7 +342,7 @@ bool BackupDestinationPreparer::prepare(
             "La racine de sauvegarde a changé pendant sa préparation."));
     if (expectedFamily != nullptr && familyIdentity != *expectedFamily)
         return fail(error, QStringLiteral(
-            "Le dossier familial ne correspond plus à l'inspection initiale."));
+            "Le dossier familial ne correspond plus à l'identité attendue."));
     const QString familyPath = QDir(root).filePath(QString::fromLatin1(familyName));
     SnapshotDirectoryIdentity inspectedFamily;
     if (!VaultSnapshotService::inspectDestinationDirectory(
@@ -271,8 +351,23 @@ bool BackupDestinationPreparer::prepare(
         return fail(error, destinationError.empty()
             ? QStringLiteral("Le dossier familial a changé pendant sa préparation.")
             : QString::fromStdString(destinationError));
+    const QByteArray seriesName = seriesId.toLatin1();
+    SnapshotDirectoryIdentity seriesIdentity;
+    if (!openSeries(familyPath, seriesName, familyIdentity, seriesIdentity, error))
+        return false;
+    if (expectedSeries != nullptr && seriesIdentity != *expectedSeries)
+        return fail(error, QStringLiteral(
+            "Le dossier de série ne correspond plus à l'identité attendue."));
+    const QString seriesPath = QDir(familyPath).filePath(seriesId);
+    SnapshotDirectoryIdentity inspectedSeries;
+    if (!VaultSnapshotService::inspectDestinationDirectory(
+            seriesPath.toStdString(), inspectedSeries, destinationError)
+        || inspectedSeries != seriesIdentity)
+        return fail(error, destinationError.empty()
+            ? QStringLiteral("Le dossier de série a changé pendant sa préparation.")
+            : QString::fromStdString(destinationError));
     QString destination;
-    if (!chooseDestination(familyPath, familyIdentity, timestamp, destination, error))
+    if (!chooseDestination(seriesPath, seriesIdentity, timestamp, destination, error))
         return false;
     if (!snapshotAccess->matchesSnapshotIdentity(vaultPath.toStdString(),
             expectedVault.device, expectedVault.inode, reservationError))
@@ -285,11 +380,15 @@ bool BackupDestinationPreparer::prepare(
     output.bindingGeneration_ = bindingGeneration;
     output.rootDirectory_ = root;
     output.familyDirectory_ = familyPath;
+    output.seriesId_ = seriesId;
+    output.seriesDirectory_ = seriesPath;
     output.destinationPath_ = destination;
     output.rootIdentity_ = rootIdentity;
     output.familyIdentity_ = familyIdentity;
+    output.seriesIdentity_ = seriesIdentity;
     output.preparedPreferences_ = configuration.preferences;
     output.preferencesSourceFile_ = configuration.sourceFile;
+    output.preferencesSourceIdentity_ = configuration.sourceIdentity;
     output.snapshotAccess_ = std::move(*snapshotAccess);
     return true;
 #endif
@@ -304,7 +403,10 @@ bool BackupDestinationPreparer::revalidateConfiguration(
         return observed.status == GlobalBackupPreferencesStatus::Valid
             && observed.preferences == prepared.preparedPreferences_
             && (prepared.preferencesSourceFile_.isEmpty()
-                || observed.sourceFile == prepared.preferencesSourceFile_);
+                || observed.sourceFile == prepared.preferencesSourceFile_)
+            && (!prepared.preferencesSourceIdentity_
+                || observed.sourceIdentity
+                    == prepared.preferencesSourceIdentity_);
     };
     if (current != nullptr && !matches(*current))
         return fail(error, QStringLiteral(
@@ -339,7 +441,13 @@ bool BackupDestinationPreparer::revalidate(
         || !sameVault(prepared.sourceIdentity_, expectedVault)
         || prepared.vaultId_ != expectedVault.vaultId
         || prepared.vaultId_.size() != 16
-        || prepared.vaultPath_.isEmpty() || prepared.destinationPath_.isEmpty())
+        || prepared.vaultPath_.isEmpty() || prepared.destinationPath_.isEmpty()
+        || prepared.seriesId_.size()
+            != BackupSeriesIdentityService::EncodedSeriesIdSize
+        || QFileInfo(prepared.seriesDirectory_).absolutePath()
+            != prepared.familyDirectory_
+        || QFileInfo(prepared.seriesDirectory_).fileName()
+            != prepared.seriesId_)
         return fail(error, QStringLiteral(
             "Destination préparée incomplète ou liée à une autre demande."));
     std::string reservationError;
@@ -357,7 +465,7 @@ bool BackupDestinationPreparer::revalidate(
         return fail(error, inspectionError.isEmpty()
             ? QStringLiteral("Identité du coffre devenue incohérente.")
             : inspectionError);
-    SnapshotDirectoryIdentity root, family;
+    SnapshotDirectoryIdentity root, family, series;
     std::string directoryError;
     if (!VaultSnapshotService::inspectDestinationDirectory(
             prepared.rootDirectory_.toStdString(), root, directoryError)
@@ -370,6 +478,12 @@ bool BackupDestinationPreparer::revalidate(
         || family != prepared.familyIdentity_)
         return fail(error, directoryError.empty()
             ? QStringLiteral("Le dossier familial a changé.")
+            : QString::fromStdString(directoryError));
+    if (!VaultSnapshotService::inspectDestinationDirectory(
+            prepared.seriesDirectory_.toStdString(), series, directoryError)
+        || series != prepared.seriesIdentity_)
+        return fail(error, directoryError.empty()
+            ? QStringLiteral("Le dossier de série a changé.")
             : QString::fromStdString(directoryError));
     if (!destinationStillAbsent(prepared, error)) return false;
     if (!prepared.snapshotAccess_.matchesSnapshotIdentity(
@@ -393,10 +507,10 @@ bool BackupDestinationPreparer::startPreparedSnapshot(
 
     const QString source = prepared.vaultPath_;
     const QString destination = prepared.destinationPath_;
-    const SnapshotDirectoryIdentity family = prepared.familyIdentity_;
+    const SnapshotDirectoryIdentity series = prepared.seriesIdentity_;
     auto access = std::move(prepared.snapshotAccess_);
     prepared = {};
-    if (!job.startSnapshotReserved(source, destination, std::move(access), {}, family)) {
+    if (!job.startSnapshotReserved(source, destination, std::move(access), {}, series)) {
         error = job.startError().isEmpty()
             ? QStringLiteral("Démarrage de la sauvegarde préparée refusé.")
             : job.startError();

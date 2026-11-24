@@ -46,17 +46,24 @@ public:
             ReplacementRecoveryAction::AbandonPrepared, std::move(check));
     }
     static VaultReplacementAuthorization issue(const VaultPreferencesStore& store,
-        const QString& id, QString& error) {
+        const QString& id, QString& error,
+        ReplacementPrecautionPolicy policy =
+            ReplacementPrecautionPolicy::HistoricalRegistration) {
         return VaultReplacementAuthorization::acknowledge(
-            VaultReplacementAuthorization::reserve(store, id, [] { return true; }, error), error);
+            VaultReplacementAuthorization::reserve(store, id, policy,
+                [] { return true; }, error), error);
     }
     static VaultReplacementAuthorization issueWithValidation(const VaultPreferencesStore& store,
         const QString& id, std::function<bool()> check, QString& error) {
         return VaultReplacementAuthorization::acknowledge(
-            VaultReplacementAuthorization::reserve(store, id, std::move(check), error), error);
+            VaultReplacementAuthorization::reserve(store, id,
+                ReplacementPrecautionPolicy::HistoricalRegistration,
+                std::move(check), error), error);
     }
     static auto reserve(const VaultPreferencesStore& store, const QString& id, QString& error) {
-        return VaultReplacementAuthorization::reserve(store, id, [] { return true; }, error);
+        return VaultReplacementAuthorization::reserve(store, id,
+            ReplacementPrecautionPolicy::HistoricalRegistration,
+            [] { return true; }, error);
     }
     static VaultReplacementAuthorization acknowledge(auto state, QString& error) {
         return VaultReplacementAuthorization::acknowledge(std::move(state), error);
@@ -213,6 +220,10 @@ protected:
 VaultReplacementAuthorization issueReplacementEngineTest(const VaultPreferencesStore& store,
     const QString& id, QString& error) {
     return ReplacementTestAccess::issue(store, id, error);
+}
+VaultReplacementAuthorization issueReplacementEngineTest(const VaultPreferencesStore& store,
+    const QString& id, ReplacementPrecautionPolicy policy, QString& error) {
+    return ReplacementTestAccess::issue(store, id, error, policy);
 }
 ReplacementRecoveryResult recoverPreparedReplacementForTest(const VaultPreferencesStore& store,
     const QString& id, const QString& operation) {

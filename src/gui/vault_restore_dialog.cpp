@@ -110,8 +110,11 @@ core::SecureBuffer VaultRestoreDialog::takePassword() {
     core::SecureBuffer result(utf8.size()); std::memcpy(result.data(), utf8.constData(), result.size());
     return result;
 }
-void VaultRestoreDialog::setRegistrations(const QVector<services::VaultRegistration>& records, const QSet<QString>& uncertain) {
-    records_ = records; uncertain_ = uncertain; principal_->clear();
+void VaultRestoreDialog::setRegistrations(const QVector<services::VaultRegistration>& records,
+    const QSet<QString>& uncertain, bool forcePrecaution) {
+    records_ = records; uncertain_ = uncertain;
+    forcePrecaution_ = forcePrecaution;
+    principal_->clear();
     for (const auto& record : records) principal_->addItem(record.file.path, record.localId);
     principal_->setCurrentIndex(-1);
     choosing();
@@ -121,12 +124,14 @@ void VaultRestoreDialog::updateSelection() {
     const auto index = principal_->currentIndex();
     const bool exists = index >= 0 && index < records_.size();
     const bool recovery = exists && (records_[index].replacement.has_value() || uncertain_.contains(records_[index].localId));
-    const bool required = exists && !records_[index].backup.automatic;
+    const bool required = exists
+        && (forcePrecaution_ || !records_[index].backup.automatic);
     precautionRow_->setVisible(required);
     if (auto* caption = qobject_cast<QFormLayout*>(choices_->layout())->labelForField(precautionRow_))
         caption->setVisible(required);
     policy_->setText(!exists ? tr("Sélectionnez explicitement un coffre principal enregistré.") : recovery ? tr("Récupération nécessaire : ce coffre est bloqué par une restauration interrompue. "
         "Aucune nouvelle restauration n'est autorisée. Le parcours de récupération sera fourni séparément.") :
+        forcePrecaution_ ? tr("Mode générationnel : les anciennes préférences et la configuration globale ne prouvent pas qu'une sauvegarde restaurable a été publiée. Une copie exceptionnelle, hors rotation, est obligatoire.") :
         required ? tr("Sauvegardes automatiques désactivées : une copie exceptionnelle, hors rotation, est obligatoire.") :
         tr("Sauvegardes automatiques activées : aucune copie supplémentaire ni disponibilité du dossier habituel exigée."));
     primary_->setEnabled(exists && !recovery);
@@ -206,8 +211,8 @@ void VaultRestoreDialog::chooseFile(QLineEdit* field, bool save) {
     selection->setAcceptMode(save ? QFileDialog::AcceptSave : QFileDialog::AcceptOpen);
     selection->setFileMode(save ? QFileDialog::AnyFile : QFileDialog::ExistingFile);
     if (!save) {
-        selection->setNameFilters({tr("Sauvegardes PassWall (*.db)"), tr("Tous les fichiers (*)")});
-        selection->selectNameFilter(tr("Sauvegardes PassWall (*.db)"));
+        selection->setNameFilters({tr("Sauvegardes PassWall (*.pwdb *.db)"), tr("Tous les fichiers (*)")});
+        selection->selectNameFilter(tr("Sauvegardes PassWall (*.pwdb *.db)"));
     }
     selection->setOption(QFileDialog::DontConfirmOverwrite); // Engine never overwrites this destination.
     connect(selection, &QFileDialog::fileSelected, this, [this, field](const QString& path) {

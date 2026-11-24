@@ -227,17 +227,18 @@ bool VaultReplacementAuthorization::replacePrincipal(const QString& requestedPri
         VaultRegistration registration; VaultReplacementIntent intent;
         if (!replacementContext(registration, intent, error) || intent.phase != "prepared" || intent.candidate)
             return fail(error, "Autorisation préparée sans candidat requise.");
+        const bool precautionIsRequired = precautionRequired(registration);
         result.operationId = intent.operationId;
         if (principal != registration.file.path || password.empty())
             return fail(error, "Principal lié et mot de passe maître propriétaire requis.");
         if (checkpoint(ReplacementCheckpoint::BeforeWork)) return false;
         StableSource stable;
         if (!stable.open(source, registration.file, error)) return false;
-        if (!registration.backup.automatic && precautionDestination.isEmpty())
+        if (precautionIsRequired && precautionDestination.isEmpty())
             return fail(error, "Une destination de copie de précaution est obligatoire.");
         // No-existing-file semantics also reject all physical aliases. Never
         // defer this check until after an expensive authentication.
-        if (!registration.backup.automatic) {
+        if (precautionIsRequired) {
             Fd parent; QByteArray name; struct stat existing {};
             if (!safeParent(precautionDestination, parent, name, error)) return false;
             if (::fstatat(parent.value, name.constData(), &existing, AT_SYMLINK_NOFOLLOW) == 0
@@ -267,7 +268,7 @@ bool VaultReplacementAuthorization::replacePrincipal(const QString& requestedPri
             return fail(error, snapshot.diagnostic.empty() ? "Copie privée non confirmée." : snapshot.diagnostic.c_str());
         if (checkpoint(ReplacementCheckpoint::SourceAuthenticated)) return false;
         if (!valid(error) || !stable.unchanged(error)) return false;
-        if (!registration.backup.automatic) {
+        if (precautionIsRequired) {
             if (!snapshotPrincipal(precautionDestination.toStdString(), result.precaution)
                 || result.precaution.publication != SnapshotPublication::Published)
                 return fail(error, "Copie de précaution non confirmée ; remplacement interdit.");

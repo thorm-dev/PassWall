@@ -4,6 +4,8 @@
 #include <QString>
 #include <QtGlobal>
 
+#include <optional>
+
 namespace passwall::services {
 
 struct GlobalBackupPreferences {
@@ -11,6 +13,20 @@ struct GlobalBackupPreferences {
     quint64 retainedVersions = 7;
 
     bool operator==(const GlobalBackupPreferences&) const = default;
+};
+
+// Transient provenance of the exact preferences file read from disk.  It is
+// never persisted and is only used to reject a preparation/rotation after the
+// configuration file has been replaced or modified concurrently.
+struct GlobalBackupPreferencesFileIdentity {
+    quint64 device = 0;
+    quint64 inode = 0;
+    quint64 size = 0;
+    qint64 modifiedSeconds = 0;
+    quint32 modifiedNanoseconds = 0;
+    qint64 changedSeconds = 0;
+    quint32 changedNanoseconds = 0;
+    bool operator==(const GlobalBackupPreferencesFileIdentity&) const = default;
 };
 
 enum class GlobalBackupPreferencesStatus {
@@ -28,6 +44,7 @@ struct GlobalBackupPreferencesResult {
     // Provenance of the snapshot read from disk. It is not persisted in the
     // INI file; prepared operations retain it solely for final revalidation.
     QString sourceFile;
+    std::optional<GlobalBackupPreferencesFileIdentity> sourceIdentity;
 
     [[nodiscard]] bool valid() const noexcept
     {
@@ -58,6 +75,10 @@ public:
 
     [[nodiscard]] QString fileName() const { return settingsFile_; }
     [[nodiscard]] GlobalBackupPreferencesResult load() const;
+    // Syntax and local path-shape validation only. A Valid result is not proof
+    // that the destination is mounted, writable or otherwise operational.
+    [[nodiscard]] static GlobalBackupPreferencesResult validate(
+        const GlobalBackupPreferences& preferences);
     [[nodiscard]] GlobalBackupPreferencesResult save(
         const GlobalBackupPreferences& preferences) const;
     static GlobalBackupPreferencesEvents& events();

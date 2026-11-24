@@ -36,6 +36,8 @@ using namespace passwall::services;
 using passwall::core::SecureBuffer;
 using passwall::storage::VaultOperationGuard;
 VaultReplacementAuthorization issueReplacementEngineTest(const VaultPreferencesStore&, const QString&, QString&);
+VaultReplacementAuthorization issueReplacementEngineTest(const VaultPreferencesStore&, const QString&,
+    ReplacementPrecautionPolicy, QString&);
 ReplacementRecoveryResult recoverPreparedReplacementForTest(const VaultPreferencesStore&, const QString&, const QString&);
 void replacementRegistrySyncFaultForTest(const QString&, int ordinal);
 void replacementCrashAfterRegistrySyncForTest(const QString&);
@@ -151,8 +153,12 @@ protected:
         ASSERT_TRUE(store().updatePreferences(registered.localId, preferences, error));
         registered = read();
     }
-    bool run(Control* control = nullptr, std::string_view value = master, const QString* destination = nullptr) {
-        auto authority = issueReplacementEngineTest(store(), registered.localId, error);
+    bool run(Control* control = nullptr, std::string_view value = master,
+        const QString* destination = nullptr,
+        ReplacementPrecautionPolicy policy =
+            ReplacementPrecautionPolicy::HistoricalRegistration) {
+        auto authority = issueReplacementEngineTest(
+            store(), registered.localId, policy, error);
         EXPECT_TRUE(authority.valid(error));
         active = &probe;
         const bool success = authority.replacePrincipal(principal, source, password(value),
@@ -540,6 +546,52 @@ TEST_F(VaultReplacementEngineTest, AutomaticEnabledDoesNotValidateAnUnusedPrecau
     const auto unavailable = directory.filePath("missing-support/not-used.db");
     ASSERT_TRUE(run(nullptr, master, &unavailable)); EXPECT_FALSE(QFile::exists(unavailable));
     EXPECT_TRUE(read().backupRequired);
+}
+TEST_F(VaultReplacementEngineTest,
+    GenerationalPolicyIgnoresHistoricalAutomaticTrueAndRequiresPrecaution) {
+    automatic();
+    const QString missing;
+    EXPECT_FALSE(run(nullptr, master, &missing,
+        ReplacementPrecautionPolicy::Required));
+    EXPECT_TRUE(result.diagnostic.contains("obligatoire"));
+    EXPECT_EQ(probe.decryptions, 0);
+    EXPECT_EQ(probe.exchanges, 0);
+    unchanged();
+}
+TEST_F(VaultReplacementEngineTest,
+    GenerationalPolicyPublishesPrecautionDespiteHistoricalAutomaticTrue) {
+    automatic();
+    ASSERT_TRUE(run(nullptr, master, nullptr,
+        ReplacementPrecautionPolicy::Required));
+    EXPECT_EQ(result.precaution.publication, SnapshotPublication::Published);
+    EXPECT_TRUE(QFile::exists(precaution));
+    EXPECT_TRUE(read().backupRequired);
+}
+TEST_F(VaultReplacementEngineTest,
+    GenerationalPolicyPrecautionFailureNeverAuthorizesExchange) {
+    automatic();
+    probe.failPrecautionDurability = true;
+    EXPECT_FALSE(run(nullptr, master, nullptr,
+        ReplacementPrecautionPolicy::Required));
+    EXPECT_EQ(result.precaution.publication,
+        SnapshotPublication::PublishedDurabilityUnconfirmed);
+    EXPECT_EQ(probe.exchanges, 0);
+    EXPECT_EQ(read().replacement->phase, "prepared");
+    unchanged();
+}
+TEST_F(VaultReplacementEngineTest,
+    GenerationalPolicyDoesNotTreatAnExistingFileAsPrecautionProof) {
+    automatic();
+    QFile file(precaution);
+    ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    ASSERT_EQ(file.write("unrelated-existing-file"), 23);
+    file.close();
+    EXPECT_FALSE(run(nullptr, master, nullptr,
+        ReplacementPrecautionPolicy::Required));
+    EXPECT_EQ(bytes(precaution), QByteArray("unrelated-existing-file"));
+    EXPECT_EQ(probe.decryptions, 0);
+    EXPECT_EQ(probe.exchanges, 0);
+    unchanged();
 }
 TEST_F(VaultReplacementEngineTest, CandidatePrivateAndDurableBeforeArm) {
     Control c{[&](auto p) { if (p == ReplacementCheckpoint::CandidateStaged) {

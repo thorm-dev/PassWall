@@ -19,7 +19,10 @@ class VaultRestoreDialog final : public QDialog {
 public:
     VaultRestoreDialog();
     ~VaultRestoreDialog() override;
-    void setRegistrations(const QVector<services::VaultRegistration>& records, const QSet<QString>& uncertain = {});
+    // forcePrecaution is presentation only. It can require an extra path but
+    // cannot relax the authority-bound service policy.
+    void setRegistrations(const QVector<services::VaultRegistration>& records,
+        const QSet<QString>& uncertain = {}, bool forcePrecaution = false);
     QString selectedId() const;
     QString source() const;
     QString precaution() const;
@@ -59,6 +62,7 @@ private:
     QPushButton* cancel_;
     QVector<services::VaultRegistration> records_;
     QSet<QString> uncertain_;
+    bool forcePrecaution_ = false;
     enum class Stage { Choosing, Preparing, Password, Running, Result } stage_ = Stage::Preparing;
 };
 } // namespace passwall::gui

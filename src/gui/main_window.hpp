@@ -5,6 +5,7 @@
 #include "models/credential.hpp"
 #include "native/native_request_processor.hpp"
 #include "services/backup_trigger_mode.hpp"
+#include "services/backup_series_identity.hpp"
 #include "services/vault_replacement_authorization.hpp"
 
 #include <QMainWindow>
@@ -20,11 +21,13 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <atomic>
 #include <vector>
 
 QT_BEGIN_NAMESPACE
 class QVariant;
+class QMessageBox;
 namespace Ui {
 class MainWindow;
 }
@@ -35,6 +38,9 @@ namespace passwall::services {
 class BackupJob;
 class AutomaticBackupCoordinator;
 class ManualBackupOperationAdmission;
+class GenerationalBackupRotationController;
+struct GenerationalBackupRequestOffer;
+struct VaultFileIdentity;
 }
 class QCloseEvent;
 #endif
@@ -44,8 +50,10 @@ namespace passwall::gui {
 #ifdef Q_OS_LINUX
 class VaultExportDialog;
 class VaultRestoreController;
-class VaultBackupSettingsController;
 class VaultRecoveryController;
+struct GenerationalCrudPreparation;
+class GlobalBackupPreferencesController;
+class GenerationalBackupStatusController;
 #endif
 
 class MainWindow : public QMainWindow, public native::NativeVaultAccess {
@@ -54,10 +62,22 @@ class MainWindow : public QMainWindow, public native::NativeVaultAccess {
 public:
     explicit MainWindow(QWidget* parent = nullptr);
 #ifdef PASSWALL_GUI_TESTING
-    // The production constructor always selects Historical.  GUI integration
-    // tests alone may exercise the already-implemented generational boundary.
+    // Production selects Generational exclusively. Historical remains
+    // constructible only by GUI fixtures that still verify the legacy
+    // recovery and export guarantees during their transition.
+    [[nodiscard]] static std::unique_ptr<MainWindow>
+        createForHistoricalTests(QWidget* parent = nullptr);
+    // GUI integration fixtures may use the reduced grouping delay and their
+    // explicit fictitious installation identity.
     [[nodiscard]] static std::unique_ptr<MainWindow>
         createForGenerationalTests(QWidget* parent = nullptr);
+    // This remains a test-only entry point, but deliberately uses the values
+    // that a future production activation will use: system identity, 20 s
+    // grouping and the normal sibling worker lookup.  It must not acquire the
+    // fixture identity, reduced delay or any worker test hook.
+    [[nodiscard]] static std::unique_ptr<MainWindow>
+        createForGenerationalProductionCompositionTests(
+            QWidget* parent = nullptr);
 #endif
     ~MainWindow() override;
 
@@ -124,13 +144,17 @@ protected:
 
 private:
 #ifdef Q_OS_LINUX
+#ifdef PASSWALL_GUI_TESTING
+    explicit MainWindow(services::BackupTriggerMode backupTriggerMode,
+                        QWidget* parent,
+                        bool useGenerationalTestInjections = false);
+#else
     explicit MainWindow(services::BackupTriggerMode backupTriggerMode,
                         QWidget* parent);
 #endif
+#endif
 #ifdef Q_OS_LINUX
     friend class VaultRestoreController; // Coordinates the real issuer; never a friend of Authorization.
-    friend class VaultBackupSettingsController; // Presentation uses the existing backup coordinator.
-    VaultBackupSettingsController* backupSettingsController_ = nullptr;
     friend class VaultRecoveryController;
     VaultRecoveryController* recoveryController_ = nullptr;
     std::shared_ptr<std::atomic<bool>> recoveryAdmission_;
@@ -190,12 +214,37 @@ private:
     void cancelVaultExport();
     void queueExportClose();
     void queueGenerationalDrainClose();
+    void handleGenerationalDrainTerminal();
+    void showGenerationalCloseFailureNotice();
+    void continueAfterGenerationalCloseFailure();
+    void consumeGenerationalBackupRequest(
+        services::GenerationalBackupRequestOffer offer);
+    void completeGenerationalCrudPreparation(
+        const std::shared_ptr<GenerationalCrudPreparation>& preparation);
+    void invalidateGenerationalCrudPreparation(quint64 requestId);
     bool exportInProgress_ = false;
     bool exportLockPending_ = false;
     bool exportCloseRequested_ = false;
     bool exportUncertain_ = false;
     bool generationalCloseDrainRequested_ = false;
     bool generationalDrainCloseQueued_ = false;
+    bool generationalCloseFailureAccepted_ = false;
+    QPointer<QMessageBox> generationalCloseFailureNotice_;
+    std::shared_ptr<GenerationalCrudPreparation> generationalCrudPreparation_;
+    // Constructed only when the immutable coordinator mode is Generational.
+    services::GenerationalBackupRotationController*
+        generationalRotationController_ = nullptr;
+    GlobalBackupPreferencesController*
+        globalBackupPreferencesController_ = nullptr;
+    GenerationalBackupStatusController*
+        generationalBackupStatusController_ = nullptr;
+    std::shared_ptr<const services::VaultFileIdentity>
+        authenticatedBackupVault_;
+    // Empty in production: the destination preparer then resolves the real
+    // libsystemd application-specific identity. Fixtures alone inject a fake
+    // identity through createForGenerationalTests().
+    std::optional<services::BackupInstallationIdentity>
+        backupInstallationIdentity_;
     QPointer<services::BackupJob> backupJob_;
     services::AutomaticBackupCoordinator* automaticBackup_ = nullptr;
     // Independent modeless window: lockVault must not reject/cancel a keyless

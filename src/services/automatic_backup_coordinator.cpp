@@ -2,6 +2,7 @@
 #include "services/backup_job.hpp"
 #include "services/credential_service.hpp"
 #include <QDateTime>
+
 #include <QDir>
 #include <QFileInfo>
 #include <QSocketNotifier>
@@ -9,7 +10,6 @@
 #include <QTimer>
 #include <QUuid>
 #include <algorithm>
-#include <mutex>
 #include <type_traits>
 
 namespace passwall::services {
@@ -18,7 +18,6 @@ constexpr int defaultMutationContentionWaitMs = 3000;
 
 static_assert(std::is_nothrow_move_constructible_v<storage::VaultOperationGuard>);
 static_assert(std::is_nothrow_move_constructible_v<PreparedBackupDestination>);
-static_assert(std::is_nothrow_move_constructible_v<InitialBackupRequest>);
 
 MutationBackupOutcome mutationOutcome(BackupOutcome outcome)
 {
@@ -35,11 +34,20 @@ MutationBackupOutcome mutationOutcome(BackupOutcome outcome)
     return MutationBackupOutcome::Unknown;
 }
 
-bool sameVaultIdentity(const VaultFileIdentity& first, const VaultFileIdentity& second)
+GenerationalBackupRotationContext rotationContext(
+    const PreparedBackupDestination& prepared)
 {
-    return first.path == second.path && first.vaultId == second.vaultId
-        && first.device != 0 && first.inode != 0
-        && first.device == second.device && first.inode == second.inode;
+    GenerationalBackupRotationContext context;
+    context.rootDirectory = prepared.rootDirectory();
+    context.vaultId = prepared.vaultId();
+    context.seriesId = prepared.seriesId();
+    context.preparedPreferences = prepared.preparedPreferences();
+    context.preferencesSourceFile = prepared.preferencesSourceFile();
+    context.preferencesSourceIdentity = prepared.preferencesSourceIdentity();
+    context.rootIdentity = prepared.rootIdentity();
+    context.familyIdentity = prepared.familyIdentity();
+    context.seriesIdentity = prepared.seriesIdentity();
+    return context;
 }
 
 QString normalizedPath(const QString& path)
@@ -51,14 +59,11 @@ QString normalizedPath(const QString& path)
 bool blocksUserOperation(GenerationalOperationPhase phase)
 {
     switch (phase) {
-    case GenerationalOperationPhase::Inspecting:
-    case GenerationalOperationPhase::PreparedReservation:
     case GenerationalOperationPhase::PendingRequest:
     case GenerationalOperationPhase::OfferedRequest:
     case GenerationalOperationPhase::WaitingForReservation:
     case GenerationalOperationPhase::AttemptActive:
     case GenerationalOperationPhase::WorkerActive:
-    case GenerationalOperationPhase::Cancelling:
         return true;
     case GenerationalOperationPhase::Idle:
     case GenerationalOperationPhase::Completed:
@@ -68,24 +73,6 @@ bool blocksUserOperation(GenerationalOperationPhase phase)
     return true;
 }
 
-GenerationalOperationState initialActivityState(GenerationalOperationPhase phase,
-    const QString& path, quint64 sessionGeneration, quint64 activityId,
-    bool reservationHeld = false)
-{
-    GenerationalOperationState state;
-    state.phase = phase;
-    state.kind = GenerationalBackupRequestKind::InitialCopy;
-    state.vaultPath = path;
-    state.sessionGeneration = sessionGeneration;
-    state.reservationHeld = reservationHeld;
-    state.activityId = activityId;
-    return state;
-}
-
-struct AsyncInitialBackupResult {
-    std::mutex mutex;
-    std::optional<InitialBackupPreparation> preparation;
-};
 }
 
 struct ManualBackupOperationAdmission::State {
@@ -302,15 +289,8 @@ AutomaticBackupCoordinator::AutomaticBackupCoordinator(
                     ? normalizedPath(globalBackupPreferences_->sourceFile)
                     : normalizedPath(GlobalBackupPreferencesStore().fileName());
                 if (observed.isEmpty() || observed != expected) return;
-                auto configuration =
-                    GlobalBackupPreferencesStore(settingsFile).load();
-                if (!persistenceConfirmed) {
-                    configuration.status =
-                        GlobalBackupPreferencesStatus::WriteError;
-                    configuration.diagnostic = QStringLiteral(
-                        "Modification visible, mais persistance des préférences non confirmée.");
-                }
-                applyGlobalBackupPreferences(std::move(configuration));
+                reloadGlobalBackupPreferencesAsync(
+                    settingsFile, persistenceConfirmed);
             }, Qt::QueuedConnection);
     } else {
         connect(&VaultPreferencesStore::events(), &VaultPreferencesEvents::changed, this,
@@ -356,14 +336,12 @@ void AutomaticBackupCoordinator::beginModificationSession(const VaultFileIdentit
 }
 void AutomaticBackupCoordinator::stopModificationGrouping()
 {
-    cancelInitialInspectionActivity();
-    completedInitialInspection_.reset();
-    pendingInitialReinspectionPath_.clear();
     mutationGroupingTimer_.stop();
     modificationSessionPath_.clear();
     modificationSessionVaultId_.clear();
     modificationSessionDevice_ = 0;
     modificationSessionInode_ = 0;
+    backupGeneration_ = 0;
     mutationGeneration_ = 0;
     scheduledMutationGeneration_ = 0;
     scheduledSessionGeneration_ = 0;
@@ -461,20 +439,12 @@ void AutomaticBackupCoordinator::retainSuspendedNeed(const MutationBatch& batch)
     auto* suspension = suspensionFor(
         batch.path, batch.vaultId, batch.device, batch.inode);
     if (!suspension || batch.resumeEpoch != 0) return;
-    if (batch.kind == GenerationalBackupRequestKind::CrudGeneration) {
-        const bool newerSession = batch.session > suspension->latestSessionGeneration;
-        const bool newerGeneration = batch.session == suspension->latestSessionGeneration
-            && batch.generation > suspension->latestMutationGeneration;
-        if (newerSession || newerGeneration) {
-            suspension->latestSessionGeneration = batch.session;
-            suspension->latestMutationGeneration = batch.generation;
-        }
-        suspension->pendingKind = GenerationalBackupRequestKind::CrudGeneration;
-    } else if (suspension->latestMutationGeneration == 0) {
-        suspension->pendingKind = GenerationalBackupRequestKind::InitialCopy;
-        if (batch.initialCopy)
-            suspension->latestSessionGeneration =
-                batch.initialCopy->sessionGeneration();
+    const bool newerSession = batch.session > suspension->latestSessionGeneration;
+    const bool newerGeneration = batch.session == suspension->latestSessionGeneration
+        && batch.generation > suspension->latestMutationGeneration;
+    if (newerSession || newerGeneration) {
+        suspension->latestSessionGeneration = batch.session;
+        suspension->latestMutationGeneration = batch.generation;
     }
     publishSuspension(*suspension);
 }
@@ -510,22 +480,12 @@ void AutomaticBackupCoordinator::suspendGenerationalBackup(
         ? GenerationalBackupSuspensionReason::Unknown
         : GenerationalBackupSuspensionReason::Failed;
     suspension->diagnostic = diagnostic;
-    if (failed.kind == GenerationalBackupRequestKind::CrudGeneration) {
-        suspension->pendingKind = GenerationalBackupRequestKind::CrudGeneration;
-        const bool newerSession = failed.session
-            > suspension->latestSessionGeneration;
-        const bool newerGeneration = failed.session
-                == suspension->latestSessionGeneration
-            && failed.generation > suspension->latestMutationGeneration;
-        if (newerSession || newerGeneration
-            || suspension->latestMutationGeneration == 0) {
-            suspension->latestSessionGeneration = failed.session;
-            suspension->latestMutationGeneration = failed.generation;
-        }
-    } else if (suspension->latestMutationGeneration == 0) {
-        suspension->pendingKind = GenerationalBackupRequestKind::InitialCopy;
-        suspension->latestSessionGeneration = failed.initialCopy
-            ? failed.initialCopy->sessionGeneration() : failed.session;
+    const bool newerSession = failed.session > suspension->latestSessionGeneration;
+    const bool newerGeneration = failed.session == suspension->latestSessionGeneration
+        && failed.generation > suspension->latestMutationGeneration;
+    if (newerSession || newerGeneration || suspension->latestMutationGeneration == 0) {
+        suspension->latestSessionGeneration = failed.session;
+        suspension->latestMutationGeneration = failed.generation;
     }
 
     if (scheduledMutationGeneration_ != 0
@@ -571,12 +531,6 @@ void AutomaticBackupCoordinator::suspendGenerationalBackup(
     };
     absorbSingle(offeredMutationBatch_);
     absorbSingle(waitingMutationBatch_);
-    if (initialInspectionActivity_
-        && initialInspectionActivity_->path == suspension->path
-        && initialInspectionActivity_->vaultId == suspension->vaultId
-        && initialInspectionActivity_->device == suspension->device
-        && initialInspectionActivity_->inode == suspension->inode)
-        cancelInitialInspectionActivity();
     publishSuspension(*suspension);
 }
 
@@ -589,12 +543,9 @@ void AutomaticBackupCoordinator::clearSuspensionAfterPublishedResume(
     if (!suspension || suspension->epoch != completed.resumeEpoch
         || suspension->resumeRequestId != completed.requestId)
         return;
-    const bool newerCrud = suspension->pendingKind
-            == GenerationalBackupRequestKind::CrudGeneration
-        && (completed.kind == GenerationalBackupRequestKind::InitialCopy
-            || suspension->latestSessionGeneration > completed.session
-            || (suspension->latestSessionGeneration == completed.session
-                && suspension->latestMutationGeneration > completed.generation));
+    const bool newerCrud = suspension->latestSessionGeneration > completed.session
+        || (suspension->latestSessionGeneration == completed.session
+            && suspension->latestMutationGeneration > completed.generation);
     const GenerationalSuspension retained = *suspension;
     generationalSuspensions_.erase(std::remove_if(
         generationalSuspensions_.begin(), generationalSuspensions_.end(),
@@ -665,11 +616,6 @@ bool AutomaticBackupCoordinator::resumeGenerationalBackup(
     suspension->resumeRequested = true;
     suspension->resumeRequestId = 0;
     publishSuspension(*suspension);
-    if (suspension->pendingKind == GenerationalBackupRequestKind::InitialCopy
-        && suspension->latestMutationGeneration == 0) {
-        emit generationalInitialCopyResumeRequested(source);
-        return true;
-    }
     MutationBatch resumed{source, suspension->latestMutationGeneration,
         suspension->latestSessionGeneration, 0, current.device, current.inode};
     resumed.vaultId = current.vaultId;
@@ -677,16 +623,78 @@ bool AutomaticBackupCoordinator::resumeGenerationalBackup(
     retainReadyMutationBatch(std::move(resumed));
     return true;
 }
+bool AutomaticBackupCoordinator::requestGenerationalBackup(
+    const QString& vaultPath, QString& error)
+{
+    error.clear();
+    if (QThread::currentThread() != thread()) {
+        error = QStringLiteral("Demande de sauvegarde hors du thread propriétaire.");
+        return false;
+    }
+    const QString source = normalizedPath(vaultPath);
+    if (!usesGenerationalTrigger() || closing_ || generationalShutdownDrainRequested_
+        || source.isEmpty() || source != modificationSessionPath_
+        || modificationSessionGeneration_ == 0
+        || modificationSessionVaultId_.size() != 16
+        || modificationSessionDevice_ == 0 || modificationSessionInode_ == 0) {
+        error = QStringLiteral("Une session authentifiée du coffre est nécessaire.");
+        return false;
+    }
+    if (!globalPreferencesAllowDispatch()) {
+        error = QStringLiteral("Configuration globale de sauvegarde indisponible ou invalide.");
+        return false;
+    }
+    if (suspensionFor(source, modificationSessionVaultId_,
+            modificationSessionDevice_, modificationSessionInode_)) {
+        error = QStringLiteral("Utiliser la relance explicite après l'incident de sauvegarde.");
+        return false;
+    }
+    // The grouping timer is the only outstanding work we may accelerate.
+    // Never add a second voluntary copy while an earlier offer, reservation
+    // or worker is outstanding, including a worker with an Unknown result.
+    if (job_ || activeMutationBatch_ || mutationWorkerState_
+        || offeredMutationBatch_ || waitingMutationBatch_
+        || !readyMutationBatches_.isEmpty() || !lockCapturedMutationBatches_.isEmpty()
+        || manualOperationBlocks(source)) {
+        error = QStringLiteral("Une opération de sauvegarde ou du coffre est déjà en cours ou en attente.");
+        return false;
+    }
+    // Carry the authenticated identity, not one re-read from a potentially
+    // replaced path. The existing asynchronous preparation revalidates this
+    // exact identity while holding its snapshot reservation.
+    quint64 generation = scheduledMutationGeneration_;
+    if (generation != 0) {
+        if (scheduledSessionGeneration_ != modificationSessionGeneration_) {
+            error = QStringLiteral("Génération planifiée incohérente.");
+            return false;
+        }
+        mutationGroupingTimer_.stop();
+        scheduledMutationGeneration_ = 0;
+        scheduledSessionGeneration_ = 0;
+    } else {
+        // Reserve a non-zero binding for the common pipeline without emitting
+        // a fake COMMIT or scheduling an automatic backup.
+        if (++backupGeneration_ == 0) ++backupGeneration_;
+        generation = backupGeneration_;
+    }
+    MutationBatch batch{source, generation, modificationSessionGeneration_,
+        0, modificationSessionDevice_, modificationSessionInode_};
+    batch.vaultId = modificationSessionVaultId_;
+    retainReadyMutationBatch(std::move(batch));
+    return true;
+}
+
 void AutomaticBackupCoordinator::requestPendingMutationsForLock(const QString& path)
 {
     if (!usesGenerationalTrigger()) return;
+    // Locking revokes the authenticated session immediately. Confirmed CRUD
+    // generations remain drainable.
     if (generationalShutdownDrainRequested_) {
         // beginGenerationalShutdownDrain() already captured the scheduled
         // generation before GUI cleanup.  Keep the authenticated physical
         // identity until the drain is terminal so that a COMMIT completing
         // concurrently with the lock remains a distinct immediate request.
         mutationGroupingTimer_.stop();
-        cancelInitialInspectionActivity();
         evaluateGenerationalShutdownDrain();
         return;
     }
@@ -743,9 +751,7 @@ bool AutomaticBackupCoordinator::hasOutstandingGenerationalRequest() const noexc
         || !readyMutationBatches_.isEmpty()
         || offeredMutationBatch_.has_value()
         || waitingMutationBatch_.has_value()
-        || activeMutationBatch_.has_value()
-        || initialInspectionActivity_.has_value()
-        || !pendingInitialReinspectionPath_.isEmpty();
+        || activeMutationBatch_.has_value();
 }
 
 void AutomaticBackupCoordinator::captureScheduledMutationForShutdownDrain()
@@ -794,11 +800,6 @@ void AutomaticBackupCoordinator::evaluateGenerationalShutdownDrain()
             GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension;
         state.diagnostic = QStringLiteral(
             "Vidange incomplète : une sauvegarde est suspendue après un échec ou un résultat incertain.");
-    } else if (!pendingInitialReinspectionPath_.isEmpty()) {
-        state.status =
-            GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension;
-        state.diagnostic = QStringLiteral(
-            "Vidange incomplète : une nouvelle inspection initiale serait nécessaire.");
     } else if (state.requestPending && !globalPreferencesAllowDispatch()) {
         state.status =
             GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension;
@@ -806,9 +807,7 @@ void AutomaticBackupCoordinator::evaluateGenerationalShutdownDrain()
             "Vidange incomplète : la configuration globale de sauvegarde n'est plus admissible.");
     } else if (state.requestPending) {
         state.status = GenerationalShutdownDrainStatus::Draining;
-        state.diagnostic = initialInspectionActivity_
-            ? QStringLiteral("Annulation de l'inspection initiale en cours.")
-            : QStringLiteral("Vidange des demandes de sauvegarde en cours.");
+        state.diagnostic = QStringLiteral("Vidange des demandes de sauvegarde en cours.");
     } else {
         state.status = GenerationalShutdownDrainStatus::Completed;
     }
@@ -830,7 +829,6 @@ bool AutomaticBackupCoordinator::beginGenerationalShutdownDrain(QString& error)
     }
     if (!generationalShutdownDrainRequested_) {
         generationalShutdownDrainRequested_ = true;
-        cancelInitialInspectionActivity();
         captureScheduledMutationForShutdownDrain();
         scheduleReadyMutationBatch();
     }
@@ -838,142 +836,38 @@ bool AutomaticBackupCoordinator::beginGenerationalShutdownDrain(QString& error)
     return true;
 }
 
-quint64 AutomaticBackupCoordinator::beginInitialBackupInspection(
-    const VaultFileIdentity& identity, quint64 sessionGeneration, QString& error)
+bool AutomaticBackupCoordinator::continueAfterGenerationalShutdownFailure(
+    QString& error)
 {
     error.clear();
     if (QThread::currentThread() != thread()) {
-        error = QStringLiteral("Inspection initiale hors du thread propriétaire.");
-        return 0;
-    }
-    if (!usesGenerationalTrigger() || closing_
-        || generationalShutdownDrainRequested_ || sessionGeneration == 0) {
-        error = QStringLiteral("Inspection initiale indisponible dans l'état courant.");
-        return 0;
-    }
-    const QString source = normalizedPath(identity.path);
-    if (manualOperationBlocks(source)) {
         error = QStringLiteral(
-            "Une opération manuelle déjà admise est en cours de réservation exclusive.");
-        return 0;
-    }
-    if (source.isEmpty() || source != modificationSessionPath_
-        || identity.device == 0 || identity.inode == 0
-        || identity.device != modificationSessionDevice_
-        || identity.inode != modificationSessionInode_
-        || identity.vaultId != modificationSessionVaultId_) {
-        error = QStringLiteral("L'inspection ne correspond pas à la session physique courante.");
-        return 0;
-    }
-    if (const auto* suspension = suspensionFor(
-            source, identity.vaultId, identity.device, identity.inode);
-        suspension && !suspension->resumeRequested) {
-        error = QStringLiteral(
-            "Les sauvegardes automatiques sont suspendues jusqu'à une reprise explicite.");
-        return 0;
-    }
-    if (initialInspectionActivity_) {
-        error = QStringLiteral("Une inspection de première sauvegarde est déjà active.");
-        return 0;
-    }
-    if (++nextInitialInspectionId_ == 0) ++nextInitialInspectionId_;
-    InitialInspectionActivity activity;
-    activity.path = source;
-    activity.vaultId = identity.vaultId;
-    activity.device = identity.device;
-    activity.inode = identity.inode;
-    activity.sessionGeneration = sessionGeneration;
-    activity.activityId = nextInitialInspectionId_;
-    initialInspectionActivity_ = std::move(activity);
-    publishOperationState(initialActivityState(GenerationalOperationPhase::Inspecting,
-        source, sessionGeneration, nextInitialInspectionId_));
-    return nextInitialInspectionId_;
-}
-
-bool AutomaticBackupCoordinator::markInitialBackupPrepared(quint64 activityId,
-    InitialBackupRequest request, QString& error)
-{
-    error.clear();
-    if (QThread::currentThread() != thread()) {
-        error = QStringLiteral("Préparation initiale reçue hors du thread propriétaire.");
+            "Reprise après fermeture hors du thread propriétaire.");
         return false;
     }
     if (!usesGenerationalTrigger() || closing_
-        || generationalShutdownDrainRequested_ || activityId == 0
-        || !initialInspectionActivity_
-        || initialInspectionActivity_->activityId != activityId
-        || initialInspectionActivity_->phase != GenerationalOperationPhase::Inspecting) {
-        error = QStringLiteral("Inspection initiale absente, annulée ou obsolète.");
+        || !generationalShutdownDrainRequested_
+        || generationalShutdownDrainState_.status
+            != GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension) {
+        error = QStringLiteral(
+            "La vidange générationnelle n'est pas dans un état d'échec terminal.");
         return false;
     }
-    const auto& activity = *initialInspectionActivity_;
-    const auto& prepared = request.destination();
-    if (request.consumed() || request.sessionGeneration() != activity.sessionGeneration
-        || prepared.bindingGeneration() != activity.sessionGeneration
-        || prepared.vaultPath() != activity.path
-        || prepared.vaultId() != activity.vaultId) {
-        error = QStringLiteral("La destination préparée ne correspond pas à l'inspection active.");
-        cancelInitialInspectionActivity();
+    if ((job_ && job_->isActive()) || activeMutationBatch_
+        || mutationWorkerState_) {
+        error = QStringLiteral(
+            "Un worker de sauvegarde peut encore agir ; reprise locale refusée.");
         return false;
     }
-    std::shared_ptr<InitialBackupRequest> retained;
-    try {
-        retained = std::make_shared<InitialBackupRequest>(std::move(request));
-    } catch (...) {
-        error = QStringLiteral("Impossible de conserver la destination préparée.");
-        cancelInitialInspectionActivity();
-        return false;
-    }
-    initialInspectionActivity_->phase = GenerationalOperationPhase::PreparedReservation;
-    initialInspectionActivity_->preparedRequest = std::move(retained);
-    publishOperationState(initialActivityState(
-        GenerationalOperationPhase::PreparedReservation, activity.path,
-        activity.sessionGeneration, activity.activityId, true));
+
+    // The authenticated GUI session was already invalidated by lockVault().
+    // Preserve every suspension and retained CRUD need; only the close intent
+    // is withdrawn. A later retry still requires an explicit user action and
+    // all ordinary identity/configuration/reservation checks.
+    generationalShutdownDrainRequested_ = false;
+    generationalShutdownDrainFailure_.clear();
+    publishGenerationalShutdownDrain({});
     return true;
-}
-
-InitialBackupArbitration AutomaticBackupCoordinator::admitPreparedInitialBackup(
-    quint64 activityId, InitialBackupAdmission admission, QString& error)
-{
-    if (QThread::currentThread() != thread() || activityId == 0
-        || !initialInspectionActivity_
-        || initialInspectionActivity_->activityId != activityId
-        || initialInspectionActivity_->phase
-            != GenerationalOperationPhase::PreparedReservation
-        || !initialInspectionActivity_->preparedRequest) {
-        error = QStringLiteral("Préparation initiale absente, annulée ou obsolète.");
-        return InitialBackupArbitration::Refused;
-    }
-    InitialBackupRequest request(
-        std::move(*initialInspectionActivity_->preparedRequest));
-    admission.inspectionActivityId = activityId;
-    return admitInitialBackup(std::move(request), admission, error);
-}
-
-bool AutomaticBackupCoordinator::cancelInitialBackupInspection(quint64 activityId)
-{
-    if (QThread::currentThread() != thread() || activityId == 0
-        || !initialInspectionActivity_
-        || initialInspectionActivity_->activityId != activityId)
-        return false;
-    cancelInitialInspectionActivity();
-    return true;
-}
-
-bool AutomaticBackupCoordinator::initialInspectionMatches(
-    const InitialInspectionFingerprint& fingerprint,
-    const GlobalBackupPreferencesResult& configuration,
-    const AuthenticatedBackupSession& session) const
-{
-    return fingerprint.path == normalizedPath(session.vault.path)
-        && fingerprint.vaultId == session.vault.vaultId
-        && fingerprint.device == session.vault.device
-        && fingerprint.inode == session.vault.inode
-        && fingerprint.sessionGeneration == session.sessionGeneration
-        && fingerprint.forceInitialCopy == session.forceInitialCopy
-        && fingerprint.configurationStatus == configuration.status
-        && fingerprint.preferences == configuration.preferences
-        && fingerprint.configurationSourceFile == configuration.sourceFile;
 }
 
 bool AutomaticBackupCoordinator::globalPreferencesMatch(
@@ -982,15 +876,19 @@ bool AutomaticBackupCoordinator::globalPreferencesMatch(
     return globalBackupPreferences_
         && globalBackupPreferences_->status == configuration.status
         && globalBackupPreferences_->preferences == configuration.preferences
-        && globalBackupPreferences_->sourceFile == configuration.sourceFile;
+        && globalBackupPreferences_->sourceFile == configuration.sourceFile
+        && globalBackupPreferences_->sourceIdentity
+            == configuration.sourceIdentity;
 }
 
 bool AutomaticBackupCoordinator::globalPreferencesAllowDispatch() const noexcept
 {
     // Foundation tests may inject prepared requests without a persistent
-    // configuration owner. Once a real configuration has been observed,
-    // fail closed until it is valid again.
-    return !globalBackupPreferences_ || globalBackupPreferences_->valid();
+    // configuration owner. A real integration owner explicitly closes that
+    // injection boundary before exposing an authenticated session.
+    return globalBackupPreferences_
+        ? globalBackupPreferences_->valid()
+        : !globalPreferencesInitializationRequired_;
 }
 
 void AutomaticBackupCoordinator::retainCrudAfterConfigurationInvalidation(
@@ -1015,47 +913,12 @@ void AutomaticBackupCoordinator::retainCrudAfterConfigurationInvalidation(
 
 void AutomaticBackupCoordinator::invalidatePreparedRequestsForGlobalPreferences()
 {
-    completedInitialInspection_.reset();
-    if (initialInspectionActivity_)
-        pendingInitialReinspectionPath_ = initialInspectionActivity_->path;
-    cancelInitialInspectionActivity();
-
-    const auto removeInitialCopies = [&](QVector<MutationBatch>& batches) {
-        QVector<GenerationalOperationState> cancelled;
-        batches.erase(std::remove_if(batches.begin(), batches.end(),
-            [&](const MutationBatch& batch) {
-                if (batch.kind != GenerationalBackupRequestKind::InitialCopy)
-                    return false;
-                if (pendingInitialReinspectionPath_.isEmpty())
-                    pendingInitialReinspectionPath_ = batch.path;
-                auto state = stateFor(
-                    GenerationalOperationPhase::Cancelled, batch);
-                state.reservationHeld = false;
-                cancelled.push_back(std::move(state));
-                return true;
-            }), batches.end());
-        for (auto& state : cancelled)
-            publishOperationState(std::move(state));
-    };
-    removeInitialCopies(lockCapturedMutationBatches_);
-    removeInitialCopies(readyMutationBatches_);
-
     const auto invalidateSingle = [&](std::optional<MutationBatch>& batch) {
         if (!batch) return;
         const quint64 invalidated = batch->requestId;
-        if (batch->kind == GenerationalBackupRequestKind::InitialCopy) {
-            if (pendingInitialReinspectionPath_.isEmpty())
-                pendingInitialReinspectionPath_ = batch->path;
-            auto state = stateFor(
-                GenerationalOperationPhase::Cancelled, *batch);
-            state.reservationHeld = false;
-            batch.reset();
-            publishOperationState(std::move(state));
-        } else {
-            MutationBatch retained = std::move(*batch);
-            batch.reset();
-            retainCrudAfterConfigurationInvalidation(std::move(retained));
-        }
+        MutationBatch retained = std::move(*batch);
+        batch.reset();
+        retainCrudAfterConfigurationInvalidation(std::move(retained));
         if (invalidated != 0)
             emit generationalBackupRequestInvalidated(invalidated);
     };
@@ -1064,10 +927,6 @@ void AutomaticBackupCoordinator::invalidatePreparedRequestsForGlobalPreferences(
     mutationContentionTimer_.stop();
     mutationContentionCycle_ = false;
 
-    if (!pendingInitialReinspectionPath_.isEmpty()
-        && globalPreferencesAllowDispatch())
-        emit globalBackupReinspectionRequested(
-            pendingInitialReinspectionPath_);
     scheduleReadyMutationBatch();
 }
 
@@ -1082,266 +941,64 @@ void AutomaticBackupCoordinator::applyGlobalBackupPreferences(
     evaluateGenerationalShutdownDrain();
 }
 
-InitialBackupInspectionLaunchResult
-AutomaticBackupCoordinator::startInitialBackupInspectionAsync(
-    GlobalBackupPreferencesResult configuration,
-    AuthenticatedBackupSession session, QDateTime timestamp,
-    InitialBackupCancellation observer)
+void AutomaticBackupCoordinator::requireGlobalBackupPreferencesInitialization()
 {
-    InitialBackupInspectionLaunchResult launch;
-    if (QThread::currentThread() != thread()) {
-        launch.diagnostic = QStringLiteral(
-            "Démarrage de l'inspection hors du thread propriétaire.");
-        return launch;
-    }
-    if (!usesGenerationalTrigger() || closing_
-        || generationalShutdownDrainRequested_) {
-        launch.diagnostic = QStringLiteral(
-            "Inspection asynchrone indisponible dans le mode courant.");
-        return launch;
-    }
-    if (!session.authenticated || session.sessionGeneration == 0
-        || session.vault.path.isEmpty() || session.vault.vaultId.size() != 16
-        || session.vault.device == 0 || session.vault.inode == 0
-        || !timestamp.isValid()) {
-        launch.diagnostic = QStringLiteral(
-            "Session authentifiée, identité ou horodatage d'inspection invalide.");
-        return launch;
-    }
-    applyGlobalBackupPreferences(configuration);
-    if (!globalPreferencesAllowDispatch()) {
-        launch.diagnostic = configuration.diagnostic.isEmpty()
-            ? QStringLiteral("Configuration globale indisponible ou désactivée.")
-            : configuration.diagnostic;
-        return launch;
-    }
-    const QString sessionPath = normalizedPath(session.vault.path);
-    if (pendingInitialReinspectionPath_ == sessionPath)
-        pendingInitialReinspectionPath_.clear();
-    const auto* suspended = suspensionFor(sessionPath, session.vault.vaultId,
-        session.vault.device, session.vault.inode);
-    session.forceInitialCopy = suspended && suspended->resumeRequested
-        && suspended->vaultId == session.vault.vaultId
-        && suspended->pendingKind == GenerationalBackupRequestKind::InitialCopy
-        && suspended->latestMutationGeneration == 0;
-    if (initialInspectionActivity_) {
-        launch.activityId = initialInspectionActivity_->activityId;
-        if (initialInspectionMatches(*initialInspectionActivity_,
-                configuration, session)) {
-            launch.outcome = InitialBackupInspectionLaunch::AlreadyRunning;
-            return launch;
-        }
-        cancelInitialInspectionActivity();
-        launch.diagnostic = QStringLiteral(
-            "Inspection antérieure invalidée ; attendre sa terminaison avant une nouvelle inspection.");
-        return launch;
-    }
-    if (completedInitialInspection_
-        && initialInspectionMatches(*completedInitialInspection_,
-            configuration, session)) {
-        launch.outcome = InitialBackupInspectionLaunch::AlreadySettled;
-        launch.activityId = completedInitialInspection_->activityId;
-        return launch;
-    }
+    if (QThread::currentThread() != thread() || !usesGenerationalTrigger()
+        || globalPreferencesInitializationRequired_)
+        return;
+    globalPreferencesInitializationRequired_ = true;
+    if (globalBackupPreferences_) return;
+    invalidatePreparedRequestsForGlobalPreferences();
+    evaluateGenerationalShutdownDrain();
+}
 
-    QString error;
-    const quint64 activityId = beginInitialBackupInspection(
-        session.vault, session.sessionGeneration, error);
-    if (activityId == 0) {
-        launch.diagnostic = std::move(error);
-        return launch;
-    }
-    auto control = std::make_shared<InitialInspectionControl>();
-    control->observer = observer;
-    initialInspectionActivity_->configurationStatus = configuration.status;
-    initialInspectionActivity_->preferences = configuration.preferences;
-    initialInspectionActivity_->configurationSourceFile = configuration.sourceFile;
-    initialInspectionActivity_->forceInitialCopy = session.forceInitialCopy;
-    initialInspectionActivity_->control = control;
+void AutomaticBackupCoordinator::reloadGlobalBackupPreferencesAsync(
+    const QString& settingsFile, bool persistenceConfirmed)
+{
+    if (QThread::currentThread() != thread() || !usesGenerationalTrigger())
+        return;
+    const quint64 serial = ++globalPreferencesReloadSerial_;
+    GlobalBackupPreferencesResult pending;
+    pending.status = GlobalBackupPreferencesStatus::ReadError;
+    pending.sourceFile = settingsFile;
+    pending.diagnostic = QStringLiteral(
+        "Préférences modifiées ; relecture sécurisée en cours.");
+    applyGlobalBackupPreferences(std::move(pending));
 
-    auto result = std::make_shared<AsyncInitialBackupResult>();
-    auto* delivery = new QObject;
+    std::shared_ptr<GlobalBackupPreferencesResult> result;
+    QObject* delivery = nullptr;
     QThread* task = nullptr;
     try {
-        task = QThread::create(
-            [configuration = std::move(configuration), session = std::move(session),
-             timestamp, control, result]() mutable {
-                InitialBackupCancellation cancellation;
-                cancellation.context = control.get();
-                cancellation.requested = [](void* raw, quint64 generation,
-                                             InitialBackupCheckpoint checkpoint) noexcept {
-                    auto& state = *static_cast<InitialInspectionControl*>(raw);
-                    if (checkpoint
-                        == InitialBackupCheckpoint::AfterSnapshotReservation)
-                        state.snapshotReservationHeld.store(
-                            true, std::memory_order_release);
-                    if (state.cancellationRequested.load(std::memory_order_acquire))
-                        return true;
-                    bool observedCancellation = false;
-                    try {
-                        observedCancellation = state.observer.requested != nullptr
-                            && state.observer.requested(
-                                state.observer.context, generation, checkpoint);
-                    } catch (...) {
-                        observedCancellation = true;
-                    }
-                    return observedCancellation
-                        || state.cancellationRequested.load(std::memory_order_acquire);
-                };
-                InitialBackupPreparation preparation;
-                try {
-                    preparation = InitialBackupPreparer::prepare(
-                        configuration, session, timestamp, cancellation);
-                } catch (...) {
-                    preparation.decision = InitialBackupDecision::Refused;
-                    preparation.diagnostic = QStringLiteral(
-                        "Inspection asynchrone interrompue.");
+        result = std::make_shared<GlobalBackupPreferencesResult>();
+        delivery = new QObject;
+        task = QThread::create([settingsFile, persistenceConfirmed, result] {
+            try {
+                *result = GlobalBackupPreferencesStore(settingsFile).load();
+                if (!persistenceConfirmed) {
+                    result->status = GlobalBackupPreferencesStatus::WriteError;
+                    result->diagnostic = QStringLiteral(
+                        "Modification visible, mais persistance des préférences non confirmée.");
                 }
-                const std::lock_guard lock(result->mutex);
-                result->preparation.emplace(std::move(preparation));
-            });
+            } catch (...) {
+                result->status = GlobalBackupPreferencesStatus::ReadError;
+                result->sourceFile = settingsFile;
+                result->diagnostic = QStringLiteral(
+                    "Relecture des préférences globales interrompue.");
+            }
+        });
     } catch (...) {
         delete delivery;
-        finishInitialInspectionActivity(activityId,
-            GenerationalOperationPhase::Cancelled);
-        launch.diagnostic = QStringLiteral(
-            "Création du thread d'inspection impossible.");
-        return launch;
+        return; // The immediate fail-closed state remains authoritative.
     }
-
     const QPointer<AutomaticBackupCoordinator> guarded(this);
-    QObject::connect(task, &QThread::finished, delivery,
-        [task, delivery, guarded, activityId, control, result] {
-            std::optional<InitialBackupPreparation> preparation;
-            {
-                const std::lock_guard lock(result->mutex);
-                if (result->preparation)
-                    preparation.emplace(std::move(*result->preparation));
-                result->preparation.reset();
-            }
-            if (guarded && preparation)
-                guarded->completeInitialBackupInspection(
-                    activityId, control, std::move(*preparation));
+    connect(task, &QThread::finished, delivery,
+        [task, delivery, guarded, serial, result] {
+            if (guarded && guarded->globalPreferencesReloadSerial_ == serial)
+                guarded->applyGlobalBackupPreferences(std::move(*result));
             task->deleteLater();
             delivery->deleteLater();
         }, Qt::QueuedConnection);
     task->start();
-    launch.outcome = InitialBackupInspectionLaunch::Started;
-    launch.activityId = activityId;
-    return launch;
-}
-
-void AutomaticBackupCoordinator::invalidateInitialBackupInspection()
-{
-    if (QThread::currentThread() != thread()) return;
-    completedInitialInspection_.reset();
-    cancelInitialInspectionActivity();
-}
-
-bool AutomaticBackupCoordinator::initialBackupInspectionActive() const noexcept
-{
-    return initialInspectionActivity_.has_value();
-}
-
-void AutomaticBackupCoordinator::finishInitialInspectionActivity(
-    quint64 activityId, GenerationalOperationPhase terminalPhase,
-    std::optional<InitialInspectionFingerprint> completed)
-{
-    if (!initialInspectionActivity_
-        || initialInspectionActivity_->activityId != activityId)
-        return;
-    const QString path = initialInspectionActivity_->path;
-    const quint64 sessionGeneration =
-        initialInspectionActivity_->sessionGeneration;
-    initialInspectionActivity_.reset();
-    if (completed) completedInitialInspection_ = std::move(*completed);
-    publishOperationState(initialActivityState(terminalPhase, path,
-        sessionGeneration, activityId));
-    evaluateGenerationalShutdownDrain();
-}
-
-void AutomaticBackupCoordinator::completeInitialBackupInspection(
-    quint64 activityId,
-    const std::shared_ptr<InitialInspectionControl>& control,
-    InitialBackupPreparation preparation)
-{
-    if (QThread::currentThread() != thread()) return;
-    if (!initialInspectionActivity_
-        || initialInspectionActivity_->activityId != activityId
-        || initialInspectionActivity_->control != control) {
-        preparation.request.reset();
-        return;
-    }
-
-    InitialInspectionFingerprint fingerprint = *initialInspectionActivity_;
-    const bool sessionCurrent = !closing_
-        && !generationalShutdownDrainRequested_
-        && initialInspectionActivity_->phase
-            != GenerationalOperationPhase::Cancelling
-        && !control->cancellationRequested.load(std::memory_order_acquire)
-        && modificationSessionPath_ == fingerprint.path
-        && modificationSessionVaultId_ == fingerprint.vaultId
-        && modificationSessionDevice_ == fingerprint.device
-        && modificationSessionInode_ == fingerprint.inode;
-    initialInspectionActivity_->control.reset(); // The worker has terminated.
-
-    InitialBackupInspectionResult settled;
-    settled.activityId = activityId;
-    settled.decision = preparation.decision;
-    settled.diagnostic = preparation.diagnostic;
-    if (!sessionCurrent || preparation.decision == InitialBackupDecision::Cancelled) {
-        preparation.request.reset(); // Release before publishing Cancelled.
-        settled.decision = InitialBackupDecision::Cancelled;
-        if (settled.diagnostic.isEmpty() && !sessionCurrent)
-            settled.diagnostic = QStringLiteral(
-                "Inspection invalidée par le cycle de session ou la configuration.");
-        finishInitialInspectionActivity(activityId,
-            GenerationalOperationPhase::Cancelled, fingerprint);
-        emit initialBackupInspectionSettled(std::move(settled));
-        return;
-    }
-
-    if (preparation.decision != InitialBackupDecision::Prepared
-        || !preparation.request) {
-        preparation.request.reset();
-        finishInitialInspectionActivity(activityId,
-            GenerationalOperationPhase::Completed, fingerprint);
-        emit initialBackupInspectionSettled(std::move(settled));
-        return;
-    }
-
-    QString admissionError;
-    if (!markInitialBackupPrepared(activityId,
-            std::move(*preparation.request), admissionError)) {
-        preparation.request.reset();
-        completedInitialInspection_ = fingerprint;
-        settled.decision = InitialBackupDecision::Refused;
-        settled.diagnostic = std::move(admissionError);
-        emit initialBackupInspectionSettled(std::move(settled));
-        return;
-    }
-    preparation.request.reset();
-
-    InitialBackupAdmission admission;
-    admission.currentVault.path = modificationSessionPath_;
-    admission.currentVault.vaultId = modificationSessionVaultId_;
-    admission.currentVault.device = modificationSessionDevice_;
-    admission.currentVault.inode = modificationSessionInode_;
-    admission.currentSessionGeneration = fingerprint.sessionGeneration;
-    admission.triggerMode = triggerMode_;
-    admission.sessionCurrent = true;
-    admission.closing = closing_ || generationalShutdownDrainRequested_;
-    admission.operationAdmissible = !closing_
-        && !generationalShutdownDrainRequested_;
-    admission.inspectionActivityId = activityId;
-    settled.arbitration = admitPreparedInitialBackup(
-        activityId, admission, admissionError);
-    completedInitialInspection_ = fingerprint;
-    if (settled.arbitration == InitialBackupArbitration::Refused) {
-        settled.decision = InitialBackupDecision::Refused;
-        settled.diagnostic = std::move(admissionError);
-    }
-    emit initialBackupInspectionSettled(std::move(settled));
 }
 
 GenerationalOperationState AutomaticBackupCoordinator::stateFor(
@@ -1353,12 +1010,9 @@ GenerationalOperationState AutomaticBackupCoordinator::stateFor(
     state.kind = batch.kind;
     state.vaultPath = batch.path;
     state.mutationGeneration = batch.generation;
-    state.sessionGeneration = batch.kind == GenerationalBackupRequestKind::InitialCopy
-        && batch.initialCopy ? batch.initialCopy->sessionGeneration() : batch.session;
+    state.sessionGeneration = batch.session;
     state.requestId = batch.requestId;
-    state.reservationHeld = reservationHeld
-        || (batch.kind == GenerationalBackupRequestKind::InitialCopy
-            && batch.initialCopy && !batch.initialCopy->consumed());
+    state.reservationHeld = reservationHeld;
     state.workerAlive = workerAlive;
     return state;
 }
@@ -1367,30 +1021,6 @@ void AutomaticBackupCoordinator::publishOperationState(GenerationalOperationStat
 {
     lastGenerationalOperationState_ = state;
     emit generationalOperationStateChanged(std::move(state));
-}
-
-void AutomaticBackupCoordinator::cancelInitialInspectionActivity()
-{
-    if (!initialInspectionActivity_) return;
-    if (initialInspectionActivity_->control) {
-        initialInspectionActivity_->control->cancellationRequested.store(
-            true, std::memory_order_release);
-        if (initialInspectionActivity_->phase
-            != GenerationalOperationPhase::Cancelling) {
-            initialInspectionActivity_->phase =
-                GenerationalOperationPhase::Cancelling;
-            publishOperationState(initialActivityState(
-                GenerationalOperationPhase::Cancelling,
-                initialInspectionActivity_->path,
-                initialInspectionActivity_->sessionGeneration,
-                initialInspectionActivity_->activityId,
-                initialInspectionActivity_->control->snapshotReservationHeld.load(
-                    std::memory_order_acquire)));
-        }
-        return;
-    }
-    finishInitialInspectionActivity(initialInspectionActivity_->activityId,
-        GenerationalOperationPhase::Cancelled);
 }
 
 GenerationalOperationState AutomaticBackupCoordinator::generationalOperationState(
@@ -1404,15 +1034,6 @@ GenerationalOperationState AutomaticBackupCoordinator::generationalOperationStat
     if (activeMutationBatch_ && matches(*activeMutationBatch_))
         return stateFor(GenerationalOperationPhase::AttemptActive,
             *activeMutationBatch_, false, false);
-    if (initialInspectionActivity_ && initialInspectionActivity_->path == source) {
-        const auto& activity = *initialInspectionActivity_;
-        return initialActivityState(activity.phase, activity.path,
-            activity.sessionGeneration, activity.activityId,
-            activity.phase == GenerationalOperationPhase::PreparedReservation
-                || (activity.control
-                    && activity.control->snapshotReservationHeld.load(
-                        std::memory_order_acquire)));
-    }
     if (waitingMutationBatch_ && matches(*waitingMutationBatch_))
         return stateFor(GenerationalOperationPhase::WaitingForReservation,
             *waitingMutationBatch_);
@@ -1544,155 +1165,6 @@ void AutomaticBackupCoordinator::releaseManualOperation(quint64 id) noexcept
     evaluateGenerationalShutdownDrain();
 }
 
-InitialBackupArbitration AutomaticBackupCoordinator::admitInitialBackup(
-    InitialBackupRequest request, const InitialBackupAdmission& admission,
-    QString& error)
-{
-    error.clear();
-    const quint64 trackedActivity = admission.inspectionActivityId;
-    const auto finishTrackedActivity = [this, trackedActivity](bool cancelled) {
-        if (trackedActivity == 0 || !initialInspectionActivity_
-            || initialInspectionActivity_->activityId != trackedActivity)
-            return;
-        const QString path = initialInspectionActivity_->path;
-        const quint64 sessionGeneration = initialInspectionActivity_->sessionGeneration;
-        initialInspectionActivity_.reset();
-        if (cancelled)
-            publishOperationState(initialActivityState(
-                GenerationalOperationPhase::Cancelled, path,
-                sessionGeneration, trackedActivity));
-    };
-    const auto refuse = [&error, &finishTrackedActivity,
-                         &request](QString diagnostic) {
-        // Release the local single-use snapshot capability before exposing a
-        // terminal state. A caller observing Cancelled must never race a guard
-        // which is merely waiting for this stack frame to unwind.
-        request = InitialBackupRequest(0, PreparedBackupDestination{});
-        finishTrackedActivity(true);
-        error = std::move(diagnostic);
-        return InitialBackupArbitration::Refused;
-    };
-    try {
-        if (QThread::currentThread() != thread())
-            return refuse(QStringLiteral(
-                "Arbitrage de la première sauvegarde hors du thread propriétaire."));
-        if (!usesGenerationalTrigger()
-            || admission.triggerMode != BackupTriggerMode::Generational)
-            return refuse(QStringLiteral(
-                "Le moteur générationnel n'est pas sélectionné pour cette demande."));
-        if (closing_ || generationalShutdownDrainRequested_
-            || admission.closing || !admission.sessionCurrent)
-            return refuse(QStringLiteral(
-                "Session fermée, invalidée ou en cours de fermeture."));
-        if (!admission.operationAdmissible)
-            return refuse(QStringLiteral(
-                "Une opération incompatible empêche la première sauvegarde."));
-        if (request.consumed() || request.sessionGeneration() == 0
-            || admission.currentSessionGeneration != request.sessionGeneration())
-            return refuse(QStringLiteral(
-                "Génération de session obsolète ou demande déjà consommée."));
-        if (trackedActivity != 0
-            && (!initialInspectionActivity_
-                || initialInspectionActivity_->activityId != trackedActivity
-                || initialInspectionActivity_->phase
-                    != GenerationalOperationPhase::PreparedReservation
-                || initialInspectionActivity_->sessionGeneration
-                    != request.sessionGeneration()))
-            return refuse(QStringLiteral(
-                "L'activité préparatoire est absente, annulée ou obsolète."));
-        if (trackedActivity == 0 && initialInspectionActivity_)
-            return refuse(QStringLiteral(
-                "Une activité préparatoire suivie exige son identifiant d'admission."));
-
-        const QString source = admission.currentVault.path.isEmpty()
-            ? QString{}
-            : QDir::cleanPath(QFileInfo(admission.currentVault.path).absoluteFilePath());
-        if (manualOperationBlocks(source))
-            return refuse(QStringLiteral(
-                "Une opération manuelle déjà admise a priorité sur cette première sauvegarde."));
-        const auto& prepared = request.destination();
-        if (source.isEmpty() || source != modificationSessionPath_
-            || source != prepared.vaultPath()
-            || modificationSessionDevice_ != admission.currentVault.device
-            || modificationSessionInode_ != admission.currentVault.inode
-            || prepared.vaultId() != admission.currentVault.vaultId
-            || prepared.bindingGeneration() != request.sessionGeneration())
-            return refuse(QStringLiteral(
-                "La demande ne correspond plus à la session de coffre courante."));
-
-        VaultFileIdentity current = admission.currentVault;
-        current.path = source;
-        VaultFileIdentity observed;
-        QString inspectionError;
-        if (!VaultPreferencesStore::inspectVault(source, observed, inspectionError)
-            || !sameVaultIdentity(current, observed))
-            return refuse(inspectionError.isEmpty()
-                ? QStringLiteral("L'identité physique du coffre est devenue incohérente.")
-                : inspectionError);
-        if (!BackupDestinationPreparer::revalidate(
-                prepared, current, request.sessionGeneration(), error)) {
-            if (error.isEmpty())
-                error = QStringLiteral("Revalidation de la première sauvegarde refusée.");
-            return refuse(error);
-        }
-
-        auto* suspension = suspensionFor(
-            source, current.vaultId, current.device, current.inode);
-        if (suspension
-            && (!suspension->resumeRequested
-                || suspension->vaultId != current.vaultId))
-            return refuse(QStringLiteral(
-                "La sauvegarde automatique reste suspendue ou son identité a changé."));
-        if (suspension && suspension->pendingKind
-                == GenerationalBackupRequestKind::CrudGeneration
-            && suspension->latestMutationGeneration != 0) {
-            const quint64 sessionGeneration = request.sessionGeneration();
-            request = InitialBackupRequest(0, PreparedBackupDestination{});
-            finishTrackedActivity(false);
-            MutationBatch resumed{source, suspension->latestMutationGeneration,
-                suspension->latestSessionGeneration, 0,
-                current.device, current.inode};
-            resumed.vaultId = current.vaultId;
-            resumed.resumeEpoch = suspension->epoch;
-            retainReadyMutationBatch(std::move(resumed));
-            publishOperationState(initialActivityState(
-                GenerationalOperationPhase::Completed, source,
-                sessionGeneration, trackedActivity));
-            return InitialBackupArbitration::MergedWithExistingRequest;
-        }
-
-        if (hasPendingMutationFor(source, current.device, current.inode)
-            || hasPendingInitialCopyFor(source, current.device, current.inode)) {
-            // The existing request covers the need. Release the local
-            // capability before exposing the terminal merge state; no raw
-            // guard is copied or exposed.
-            const quint64 requestSessionGeneration = request.sessionGeneration();
-            request = InitialBackupRequest(0, PreparedBackupDestination{});
-            finishTrackedActivity(false);
-            publishOperationState(initialActivityState(
-                GenerationalOperationPhase::Completed, source,
-                requestSessionGeneration, trackedActivity));
-            return InitialBackupArbitration::MergedWithExistingRequest;
-        }
-
-        auto retained = std::make_shared<InitialBackupRequest>(std::move(request));
-        MutationBatch batch;
-        batch.path = source;
-        batch.session = modificationSessionGeneration_;
-        batch.device = current.device;
-        batch.inode = current.inode;
-        batch.kind = GenerationalBackupRequestKind::InitialCopy;
-        batch.initialCopy = std::move(retained);
-        batch.vaultId = current.vaultId;
-        if (suspension) batch.resumeEpoch = suspension->epoch;
-        finishTrackedActivity(false);
-        retainReadyMutationBatch(std::move(batch));
-        return InitialBackupArbitration::Offered;
-    } catch (...) {
-        return refuse(QStringLiteral(
-            "Arbitrage de la première sauvegarde interrompu."));
-    }
-}
 std::optional<AutomaticBackupCoordinator::MutationBatch>
 AutomaticBackupCoordinator::takeScheduledMutationBatch(const QString& expectedPath)
 {
@@ -1748,11 +1220,9 @@ void AutomaticBackupCoordinator::retainReadyMutationBatch(MutationBatch batch)
     const quint64 retainedDevice = batch.device;
     const quint64 retainedInode = batch.inode;
     const bool validCrud = batch.kind == GenerationalBackupRequestKind::CrudGeneration
-        && batch.generation != 0 && !batch.initialCopy;
-    const bool validInitial = batch.kind == GenerationalBackupRequestKind::InitialCopy
-        && batch.generation == 0 && batch.initialCopy;
+        && batch.generation != 0;
     if (!usesGenerationalTrigger() || closing_ || batch.path.isEmpty()
-        || (!validCrud && !validInitial) || batch.session == 0
+        || !validCrud || batch.session == 0
         || batch.device == 0 || batch.inode == 0 || batch.vaultId.size() != 16)
         return;
     if (suspensionFor(batch.path, batch.vaultId, batch.device, batch.inode)
@@ -1765,18 +1235,12 @@ void AutomaticBackupCoordinator::retainReadyMutationBatch(MutationBatch batch)
             const bool samePhysicalVault = value.path == batch.path
                 && value.device == batch.device && value.inode == batch.inode;
             if (!samePhysicalVault) return false;
-            return value.kind == GenerationalBackupRequestKind::InitialCopy
-                || batch.kind == GenerationalBackupRequestKind::InitialCopy
-                || value.session == batch.session;
+            if (generationalShutdownDrainRequested_) return false;
+            return value.session == batch.session;
         });
     if (existing == readyMutationBatches_.end())
         readyMutationBatches_.push_back(std::move(batch));
-    else if (existing->kind == GenerationalBackupRequestKind::InitialCopy
-        && batch.kind == GenerationalBackupRequestKind::CrudGeneration)
-        *existing = std::move(batch);
-    else if (existing->kind == GenerationalBackupRequestKind::CrudGeneration
-        && batch.kind == GenerationalBackupRequestKind::CrudGeneration
-        && batch.generation > existing->generation)
+    else if (batch.generation > existing->generation)
         existing->generation = batch.generation;
     const auto pending = std::find_if(readyMutationBatches_.cbegin(),
         readyMutationBatches_.cend(), [&](const MutationBatch& value) {
@@ -1790,89 +1254,15 @@ void AutomaticBackupCoordinator::retainReadyMutationBatch(MutationBatch batch)
     evaluateGenerationalShutdownDrain();
 }
 
-bool AutomaticBackupCoordinator::hasPendingMutationFor(
-    const QString& path, quint64 device, quint64 inode) const
-{
-    if (scheduledMutationGeneration_ != 0
-        && scheduledSessionGeneration_ == modificationSessionGeneration_
-        && modificationSessionPath_ == path
-        && modificationSessionDevice_ == device
-        && modificationSessionInode_ == inode)
-        return true;
-    const auto matches = [&](const MutationBatch& batch) {
-        return batch.kind == GenerationalBackupRequestKind::CrudGeneration
-            && batch.path == path && batch.device == device && batch.inode == inode;
-    };
-    return std::any_of(lockCapturedMutationBatches_.cbegin(),
-               lockCapturedMutationBatches_.cend(), matches)
-        || std::any_of(readyMutationBatches_.cbegin(),
-               readyMutationBatches_.cend(), matches)
-        || (offeredMutationBatch_ && matches(*offeredMutationBatch_))
-        || (waitingMutationBatch_ && matches(*waitingMutationBatch_))
-        || (activeMutationBatch_ && matches(*activeMutationBatch_));
-}
-
-bool AutomaticBackupCoordinator::hasPendingInitialCopyFor(
-    const QString& path, quint64 device, quint64 inode) const
-{
-    const auto matches = [&](const MutationBatch& batch) {
-        return batch.kind == GenerationalBackupRequestKind::InitialCopy
-            && batch.path == path && batch.device == device && batch.inode == inode;
-    };
-    return std::any_of(lockCapturedMutationBatches_.cbegin(),
-               lockCapturedMutationBatches_.cend(), matches)
-        || std::any_of(readyMutationBatches_.cbegin(),
-               readyMutationBatches_.cend(), matches)
-        || (offeredMutationBatch_ && matches(*offeredMutationBatch_))
-        || (waitingMutationBatch_ && matches(*waitingMutationBatch_))
-        || (activeMutationBatch_ && matches(*activeMutationBatch_));
-}
-
-void AutomaticBackupCoordinator::replacePendingInitialCopyWithMutation(
-    const QString& path, quint64 device, quint64 inode)
-{
-    const auto matches = [&](const MutationBatch& batch) {
-        return batch.kind == GenerationalBackupRequestKind::InitialCopy
-            && batch.path == path && batch.device == device && batch.inode == inode;
-    };
-    const auto removeFrom = [&](QVector<MutationBatch>& batches) {
-        QVector<GenerationalOperationState> cancelled;
-        batches.erase(std::remove_if(batches.begin(), batches.end(), [&](const MutationBatch& batch) {
-            if (!matches(batch)) return false;
-            auto state = stateFor(GenerationalOperationPhase::Cancelled, batch);
-            state.reservationHeld = false;
-            cancelled.push_back(std::move(state));
-            return true;
-        }), batches.end());
-        for (auto& state : cancelled) publishOperationState(std::move(state));
-    };
-    removeFrom(lockCapturedMutationBatches_);
-    removeFrom(readyMutationBatches_);
-    const auto invalidate = [&](std::optional<MutationBatch>& batch) {
-        if (!batch || !matches(*batch)) return;
-        auto state = stateFor(GenerationalOperationPhase::Cancelled, *batch);
-        state.reservationHeld = false;
-        const quint64 staleRequestId = batch->requestId;
-        batch.reset();
-        publishOperationState(std::move(state));
-        if (staleRequestId != 0)
-            emit generationalBackupRequestInvalidated(staleRequestId);
-    };
-    invalidate(offeredMutationBatch_);
-    invalidate(waitingMutationBatch_);
-}
-
 GenerationalBackupRequestOffer AutomaticBackupCoordinator::offerFor(
     const MutationBatch& batch) const
 {
     GenerationalBackupRequestOffer offer;
     offer.kind = batch.kind;
     offer.vaultPath = batch.path;
+    offer.vault = {batch.path, batch.vaultId, batch.device, batch.inode};
     offer.requestId = batch.requestId;
-    if (batch.kind == GenerationalBackupRequestKind::CrudGeneration)
-        offer.mutationGeneration = batch.generation;
-    else if (batch.initialCopy)
-        offer.sessionGeneration = batch.initialCopy->sessionGeneration();
+    offer.mutationGeneration = batch.generation;
     return offer;
 }
 void AutomaticBackupCoordinator::scheduleReadyMutationBatch()
@@ -1966,23 +1356,6 @@ void AutomaticBackupCoordinator::settleUnstartedMutationBatch(MutationBatch batc
     const MutationBackupOutcome coarseOutcome = mutationOutcome(outcome);
     if (coarseOutcome != MutationBackupOutcome::Published)
         suspendGenerationalBackup(batch, coarseOutcome, diagnostic);
-    if (batch.kind == GenerationalBackupRequestKind::InitialCopy) {
-        const quint64 sessionGeneration = batch.initialCopy
-            ? batch.initialCopy->sessionGeneration() : 0;
-        auto terminal = stateFor(terminalPhase, batch);
-        terminal.reservationHeld = false;
-        batch.initialCopy.reset(); // Release the capability before notifying observers.
-        publishOperationState(std::move(terminal));
-        if (batch.requestId != 0)
-            emit generationalBackupRequestInvalidated(batch.requestId);
-        emit mutationBatchSettled(MutationBackupResult{
-            batch.path, 0, batch.requestId, mutationOutcome(outcome), outcome,
-            diagnostic, {}, GenerationalBackupRequestKind::InitialCopy,
-            sessionGeneration});
-        scheduleReadyMutationBatch();
-        evaluateGenerationalShutdownDrain();
-        return;
-    }
     if (!diagnostic.isEmpty())
         emit mutationBatchDiagnostic(batch.path, batch.generation, diagnostic);
     publishOperationState(stateFor(terminalPhase, batch));
@@ -2061,16 +1434,14 @@ bool AutomaticBackupCoordinator::markMutationBackupFinished(
 }
 bool AutomaticBackupCoordinator::finishMutationBackup(
     quint64 requestId, BackupResult result,
-    std::optional<MutationBackupPublicationReceipt> publication)
+    std::optional<MutationBackupPublicationReceipt> publication,
+    bool workerTerminated)
 {
     if (!usesGenerationalTrigger() || !activeMutationBatch_ || requestId == 0
         || requestId != activeMutationBatch_->requestId)
         return false;
     const MutationBatch completed = *activeMutationBatch_;
-    const quint64 completedSessionGeneration =
-        completed.kind == GenerationalBackupRequestKind::InitialCopy
-            && completed.initialCopy
-        ? completed.initialCopy->sessionGeneration() : 0;
+    constexpr quint64 completedSessionGeneration = 0;
     const MutationBackupOutcome outcome = mutationOutcome(result.outcome);
     if (outcome == MutationBackupOutcome::Published) {
         if (!publication || !result.receipt
@@ -2100,10 +1471,14 @@ bool AutomaticBackupCoordinator::finishMutationBackup(
     if (!workerStillAlive)
         publishOperationState(stateFor(
             GenerationalOperationPhase::Completed, completed));
+    std::optional<BackupResult> confirmedPublication;
+    if (outcome == MutationBackupOutcome::Published && workerTerminated)
+        confirmedPublication = result;
     emit mutationBatchSettled(MutationBackupResult{completed.path,
         completed.generation, completed.requestId, outcome, result.outcome,
         std::move(result.diagnostic), std::move(publication), completed.kind,
-        completedSessionGeneration});
+        completedSessionGeneration, std::move(confirmedPublication),
+        workerTerminated});
     // A terminal failure is retained by the volatile suspension instead of
     // being requeued. Only an explicit resume can create the next attempt.
     scheduleReadyMutationBatch();
@@ -2303,6 +1678,7 @@ bool AutomaticBackupCoordinator::startPreparedMutationBackupSnapshot(
         scheduleReadyMutationBatch();
         return false;
     }
+    offeredMutationBatch_->rotationContext = rotationContext(prepared);
     if (!markMutationBackupStarted(
             requestId, source, generation, destination)) {
         error = QStringLiteral(
@@ -2324,116 +1700,6 @@ bool AutomaticBackupCoordinator::startPreparedMutationBackupSnapshot(
             prepared, expected, generation, *job, error)) {
         if (error.isEmpty())
             error = QStringLiteral("Démarrage de la génération préparée refusé.");
-        job_.clear();
-        mutationJobRequestId_ = 0;
-        mutationJobResult_.reset();
-        mutationJobReceipt_.reset();
-        mutationJobSettled_ = false;
-        job->deleteLater();
-        static_cast<void>(finishMutationBackup(requestId,
-            BackupResult{BackupOutcome::FailedBeforePublication, error}));
-        return false;
-    }
-    mutationWorkerState_ = stateFor(GenerationalOperationPhase::WorkerActive,
-        *activeMutationBatch_, true, true);
-    publishOperationState(*mutationWorkerState_);
-    emit activityChanged(true);
-    evaluateGenerationalShutdownDrain();
-    return true;
-}
-
-bool AutomaticBackupCoordinator::startInitialBackupSnapshot(
-    quint64 requestId, QString& error)
-{
-    error.clear();
-    if (QThread::currentThread() != thread()) {
-        error = QStringLiteral(
-            "Consommation de la première sauvegarde hors du thread propriétaire.");
-        return false;
-    }
-    if (!usesGenerationalTrigger() || !globalPreferencesAllowDispatch()
-        || closing_ || activeMutationBatch_ || job_) {
-        error = QStringLiteral(
-            "Une sauvegarde générationnelle est déjà active ou le coordinateur se ferme.");
-        return false;
-    }
-    if (!offeredMutationBatch_ || requestId == 0
-        || offeredMutationBatch_->requestId != requestId
-        || offeredMutationBatch_->kind != GenerationalBackupRequestKind::InitialCopy
-        || !offeredMutationBatch_->initialCopy
-        || offeredMutationBatch_->initialCopy->consumed()) {
-        error = QStringLiteral(
-            "Demande de première sauvegarde absente, obsolète ou déjà consommée.");
-        return false;
-    }
-
-    auto& offered = *offeredMutationBatch_;
-    const quint64 sessionGeneration = offered.initialCopy->sessionGeneration();
-    const QString destination =
-        offered.initialCopy->destination().destinationPath();
-    const bool sessionCurrent = !modificationSessionPath_.isEmpty()
-        && offered.session == modificationSessionGeneration_
-        && offered.path == modificationSessionPath_
-        && offered.vaultId == modificationSessionVaultId_
-        && offered.device == modificationSessionDevice_
-        && offered.inode == modificationSessionInode_;
-    if (!sessionCurrent || destination.isEmpty()) {
-        MutationBatch rejected = std::move(offered);
-        offeredMutationBatch_.reset();
-        error = QStringLiteral(
-            "La première sauvegarde ne correspond plus à la session courante.");
-        settleUnstartedMutationBatch(std::move(rejected),
-            BackupOutcome::FailedBeforePublication, error);
-        return false;
-    }
-    const auto* currentConfiguration = globalBackupPreferences_
-        ? &*globalBackupPreferences_ : nullptr;
-    if (!BackupDestinationPreparer::revalidateConfiguration(
-            offered.initialCopy->destination(), currentConfiguration, error)) {
-        const QString stalePath = offered.path;
-        const quint64 staleRequestId = offered.requestId;
-        offeredMutationBatch_.reset();
-        emit generationalBackupRequestInvalidated(staleRequestId);
-        pendingInitialReinspectionPath_ = stalePath;
-        if (globalPreferencesAllowDispatch())
-            emit globalBackupReinspectionRequested(stalePath);
-        scheduleReadyMutationBatch();
-        return false;
-    }
-
-    InitialBackupAdmission admission;
-    admission.currentVault.path = modificationSessionPath_;
-    admission.currentVault.vaultId = modificationSessionVaultId_;
-    admission.currentVault.device = modificationSessionDevice_;
-    admission.currentVault.inode = modificationSessionInode_;
-    admission.currentSessionGeneration = sessionGeneration;
-    admission.triggerMode = triggerMode_;
-    admission.sessionCurrent = true;
-    admission.closing = false;
-    admission.operationAdmissible = true;
-
-    mutationContentionTimer_.stop();
-    mutationContentionCycle_ = false;
-    offered.destination = destination;
-    activeMutationBatch_ = std::move(offeredMutationBatch_);
-    offeredMutationBatch_.reset();
-    publishOperationState(stateFor(
-        GenerationalOperationPhase::AttemptActive, *activeMutationBatch_, true));
-
-    BackupJob* job = nullptr;
-    try {
-        job = new BackupJob(worker_, this);
-    } catch (...) {
-        error = QStringLiteral("Impossible de préparer le processus de sauvegarde.");
-        static_cast<void>(finishMutationBackup(requestId,
-            BackupResult{BackupOutcome::FailedBeforePublication, error}));
-        return false;
-    }
-    superviseGenerationalJob(job, requestId);
-    if (!activeMutationBatch_->initialCopy->admitAndStart(
-            *job, admission, error)) {
-        if (error.isEmpty())
-            error = QStringLiteral("Démarrage de la première sauvegarde refusé.");
         job_.clear();
         mutationJobRequestId_ = 0;
         mutationJobResult_.reset();
@@ -2474,15 +1740,12 @@ void AutomaticBackupCoordinator::superviseGenerationalJob(
                 && result.receipt
                 && result.publishedPath == activeMutationBatch_->destination
                 && result.receipt->permitsDeletion()) {
-                const quint64 sessionGeneration =
-                    activeMutationBatch_->kind
-                        == GenerationalBackupRequestKind::InitialCopy
-                        && activeMutationBatch_->initialCopy
-                    ? activeMutationBatch_->initialCopy->sessionGeneration() : 0;
+                constexpr quint64 sessionGeneration = 0;
                 mutationJobReceipt_ = MutationBackupPublicationReceipt{
                     activeMutationBatch_->path, activeMutationBatch_->destination,
                     activeMutationBatch_->generation, requestId, *result.receipt,
-                    activeMutationBatch_->kind, sessionGeneration};
+                    activeMutationBatch_->kind, sessionGeneration,
+                    activeMutationBatch_->rotationContext};
             } else if (result.outcome == BackupOutcome::Published) {
                 result = {BackupOutcome::Unknown,
                     QStringLiteral("Preuve de publication absente ou incohérente.")};
@@ -2525,7 +1788,7 @@ void AutomaticBackupCoordinator::superviseGenerationalJob(
         job->deleteLater();
         emit activityChanged(false);
         if (!mutationJobSettled_) {
-            if (!finishMutationBackup(requestId, result, std::move(publication))
+            if (!finishMutationBackup(requestId, result, std::move(publication), true)
                 && result.outcome == BackupOutcome::Published) {
                 static_cast<void>(finishMutationBackup(requestId,
                     BackupResult{BackupOutcome::Unknown,
@@ -2572,6 +1835,32 @@ bool AutomaticBackupCoordinator::cancelMutationBackupBeforeLaunch(
         QStringLiteral("Demande de sauvegarde annulée avant lancement."));
     return true;
 }
+
+bool AutomaticBackupCoordinator::failMutationBackupPreparation(
+    quint64 requestId, const QString& path, quint64 generation,
+    QString diagnostic)
+{
+    if (QThread::currentThread() != thread()
+        || !usesGenerationalTrigger() || requestId == 0)
+        return false;
+    const QString source = path.isEmpty()
+        ? QString{} : QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+    if (!offeredMutationBatch_
+        || offeredMutationBatch_->kind
+            != GenerationalBackupRequestKind::CrudGeneration
+        || offeredMutationBatch_->requestId != requestId
+        || offeredMutationBatch_->generation != generation
+        || offeredMutationBatch_->path != source)
+        return false;
+    MutationBatch failed = std::move(*offeredMutationBatch_);
+    offeredMutationBatch_.reset();
+    if (diagnostic.isEmpty())
+        diagnostic = QStringLiteral(
+            "Préparation de la destination de sauvegarde refusée.");
+    settleUnstartedMutationBatch(std::move(failed),
+        BackupOutcome::FailedBeforePublication, std::move(diagnostic));
+    return true;
+}
 void AutomaticBackupCoordinator::observeCommittedMutation(
     const QString& path, quint64 commitGeneration)
 {
@@ -2582,7 +1871,8 @@ void AutomaticBackupCoordinator::observeCommittedMutation(
     const QString source = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
     if (source != modificationSessionPath_) return;
     lastAcceptedCommitGeneration_ = commitGeneration;
-    if (++mutationGeneration_ == 0) ++mutationGeneration_;
+    if (++backupGeneration_ == 0) ++backupGeneration_;
+    mutationGeneration_ = backupGeneration_;
     MutationBatch committed{source, mutationGeneration_,
         modificationSessionGeneration_, 0, modificationSessionDevice_,
         modificationSessionInode_};
@@ -2619,19 +1909,12 @@ void AutomaticBackupCoordinator::observeCommittedMutation(
         return;
     }
     if (generationalShutdownDrainRequested_) {
-        replacePendingInitialCopyWithMutation(source,
-            modificationSessionDevice_, modificationSessionInode_);
         retainReadyMutationBatch(std::move(committed));
         evaluateGenerationalShutdownDrain();
         return;
     }
     scheduledMutationGeneration_ = mutationGeneration_;
     scheduledSessionGeneration_ = modificationSessionGeneration_;
-    // A CRUD commit that arrives after an InitialCopy inspection owns the next
-    // snapshot need. Invalidate any unstarted initial offer, release its held
-    // capability by RAII and honor the freshly restarted twenty-second delay.
-    replacePendingInitialCopyWithMutation(source,
-        modificationSessionDevice_, modificationSessionInode_);
     MutationBatch scheduled{source, scheduledMutationGeneration_,
         scheduledSessionGeneration_, 0, modificationSessionDevice_,
         modificationSessionInode_};
@@ -2692,7 +1975,6 @@ void AutomaticBackupCoordinator::shutdown()
         if (admission.state)
             admission.state->active.store(false, std::memory_order_release);
     manualOperations_.clear();
-    cancelInitialInspectionActivity();
     // A direct destruction path must not silently erase the last committed
     // generation even when MainWindow did not get a normal closeEvent.
     if (auto captured = takeScheduledMutationBatch())

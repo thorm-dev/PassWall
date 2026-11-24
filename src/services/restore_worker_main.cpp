@@ -43,7 +43,7 @@ public:
             operation_ = begin["operation"].toString(); session_ = begin["session"].toString();
             const auto grant = begin["grant"].toObject();
             const int passwordSize = begin["size"].toInt(-1);
-            if (!canonicalUuid(operation_) || !canonicalUuid(session_) || grant.size() != 8
+            if (!canonicalUuid(operation_) || !canonicalUuid(session_) || grant.size() != 9
                 || grant["operation"] != QJsonValue(operation_) || passwordSize <= 0
                 || quint32(passwordSize) > wire::passwordLimit || begin["size"].toDouble() != passwordSize) return 65;
             for (auto it = grant.begin(); it != grant.end(); ++it)

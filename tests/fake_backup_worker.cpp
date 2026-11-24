@@ -1,6 +1,7 @@
 // Deliberately faulty protocol peer. Never linked to production.
 #include "services/backup_protocol.hpp"
 #include "services/backup_rotation_service.hpp"
+#include "services/backup_publication_verifier.hpp"
 #include "posix_test_io.hpp"
 #include <QCoreApplication>
 #include <QFile>
@@ -69,7 +70,7 @@ int main(int argc, char** argv)
     }
     if (mode == "slow") QThread::msleep(250);
     if (mode == "slow-published-file" || mode == "slow-snapshot-published-file") QThread::msleep(250);
-    if (mode == "gated-snapshot-published-file")
+    if (mode == "gated-snapshot-published-file" || mode == "gated-enospc")
         while (!QFile::exists(destination + ".release")) QThread::msleep(5);
     if (mode == "published-file" || mode == "slow-published-file" || mode == "durability-file"
         || mode == "snapshot-published-file" || mode == "slow-snapshot-published-file"
@@ -86,14 +87,17 @@ int main(int argc, char** argv)
         if (passwall::test_io::readSome(0, &byte, 1) < 0) return 1;
     }
     const auto outcome = mode == "cancel" ? BackupOutcome::CancelledBeforePublication :
-        (mode == "failed" || mode == "enospc") ? BackupOutcome::FailedBeforePublication :
+        (mode == "failed" || mode == "enospc" || mode == "gated-enospc")
+            ? BackupOutcome::FailedBeforePublication :
         (mode == "durability" || mode == "durability-file") ? BackupOutcome::DurabilityUnconfirmed : BackupOutcome::Published;
-    BackupResult value{outcome, mode == "enospc" ? QStringLiteral("Écriture [errno=28].") : QString()};
+    BackupResult value{outcome,
+        (mode == "enospc" || mode == "gated-enospc")
+            ? QStringLiteral("Écriture [errno=28].") : QString()};
     if (wantReceipt && outcome != BackupOutcome::FailedBeforePublication
         && outcome != BackupOutcome::CancelledBeforePublication
         && mode != "snapshot-published-without-receipt") {
         BackupFileEvidence evidence; QString error;
-        if (!BackupRotationService::inspectEncryptedFile(destination, evidence, error)) return 1;
+        if (!BackupPublicationVerifier::inspectEncryptedFile(destination, evidence, error)) return 1;
         if (mode == "snapshot-insufficient-receipt") evidence.mount = 0;
         value.receipt = evidence;
         value.publishedPath = mode == "snapshot-wrong-path-receipt" ? source : destination;

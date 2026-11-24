@@ -3,6 +3,7 @@
 #include "gui/vault_restore_controller.hpp"
 #include "gui/vault_recovery_controller.hpp"
 #include "services/credential_service.hpp"
+#include "services/global_backup_preferences_store.hpp"
 #include "services/vault_lifecycle_service.hpp"
 #include "storage/vault_operation_guard.hpp"
 #include "private_dbus.hpp" // Existing bounded event-driven waitFor helper.
@@ -25,6 +26,7 @@
 #include <QPushButton>
 #include <QScopeGuard>
 #include <QSettings>
+#include <QStatusBar>
 #include <QTemporaryDir>
 #include <cstring>
 #include <fcntl.h>
@@ -118,10 +120,17 @@ protected:
         settings.setValue("unrelated/value", "keep"); settings.sync(); newWindow();
     }
     void newWindow() {
-        window = std::make_unique<MainWindow>();
+        window = MainWindow::createForHistoricalTests();
         window->setLifecycleProtectionValidator([] { return true; }, [] {});
         window->setLifecycleProtectionAvailable(true); window->show();
     }
+#ifdef PASSWALL_GUI_TESTING
+    void newGenerationalWindow() {
+        window = MainWindow::createForGenerationalTests();
+        window->setLifecycleProtectionValidator([] { return true; }, [] {});
+        window->setLifecycleProtectionAvailable(true); window->show();
+    }
+#endif
     void TearDown() override { window.reset(); QApplication::processEvents(); }
     template<class T> T* widget(const char* name) { return dialog->findChild<T*>(QString::fromLatin1(name)); }
     void open() {
@@ -275,7 +284,7 @@ TEST_F(VaultRestoreGuiTest, ChangingAChosenPathInvalidatesTheConfirmation)
     widget<QPushButton>("restorePrepareButton")->click(); EXPECT_FALSE(record().replacement);
     EXPECT_FALSE(window->findChild<RestoreJob*>());
 }
-TEST_F(VaultRestoreGuiTest, SourcePickerPrefersDbButKeepsAnExplicitAllFilesChoice)
+TEST_F(VaultRestoreGuiTest, SourcePickerOffersPwdbAndDbWithAllFilesChoice)
 {
     open();
     QPushButton* browse = nullptr;
@@ -283,7 +292,8 @@ TEST_F(VaultRestoreGuiTest, SourcePickerPrefersDbButKeepsAnExplicitAllFilesChoic
         if (button->text() == "Parcourir…") { browse = button; break; }
     ASSERT_NE(browse, nullptr); browse->click(); QApplication::processEvents();
     auto* picker = dialog->findChild<QFileDialog*>(); ASSERT_NE(picker, nullptr);
-    EXPECT_TRUE(picker->nameFilters().contains("Sauvegardes PassWall (*.db)"));
+    EXPECT_TRUE(picker->nameFilters().contains(
+        "Sauvegardes PassWall (*.pwdb *.db)"));
     EXPECT_TRUE(picker->nameFilters().contains("Tous les fichiers (*)"));
     picker->reject();
 }
@@ -440,6 +450,76 @@ TEST_F(VaultRestoreGuiTest, AutomaticPolicyDoesNotRequireExtraCopyOrAvailableAut
     EXPECT_FALSE(QFile::exists(precaution)); EXPECT_FALSE(QFile::exists(p.directory));
     EXPECT_TRUE(record().backup == p); EXPECT_TRUE(record().backupRequired); EXPECT_TRUE(record().automaticVersions.isEmpty());
 }
+#ifdef PASSWALL_GUI_TESTING
+TEST_F(VaultRestoreGuiTest,
+    GenerationalPolicyRequiresAndPublishesPrecautionDespiteHistoricalAutomaticTrue)
+{
+    window.reset();
+    QApplication::processEvents();
+    auto preferences = record().backup;
+    preferences.automatic = true;
+    preferences.directory = directory.filePath("unused-historical-destination");
+    QString error;
+    ASSERT_TRUE(VaultPreferencesStore().updatePreferences(
+        local, preferences, error)) << error.toStdString();
+    newGenerationalWindow();
+
+    choose();
+    EXPECT_TRUE(widget<QLineEdit>("restorePrecautionEdit")->isVisible());
+    EXPECT_TRUE(widget<QLabel>("restorePolicyLabel")->text().contains(
+        "Mode générationnel"));
+    widget<QLineEdit>("restorePrecautionEdit")->clear();
+    widget<QCheckBox>("restoreConfirmationCheck")->setChecked(true);
+    widget<QPushButton>("restorePrepareButton")->click();
+    EXPECT_FALSE(record().replacement);
+    EXPECT_FALSE(widget<QLineEdit>("restoreMasterPasswordEdit")->isEnabled());
+
+    const auto principalBefore = encryptedState(principal);
+    widget<QLineEdit>("restorePrecautionEdit")->setText(precaution);
+    prepare();
+    auto* job = execute();
+    ASSERT_NE(job, nullptr);
+    bool precautionConfirmed = false;
+    QObject::connect(job, &RestoreJob::phaseChanged, window.get(),
+        [&](auto point) {
+            if (point == ReplacementCheckpoint::PrecautionCreated) {
+                precautionConfirmed = true;
+                EXPECT_TRUE(status().startsWith(
+                    "Copie de précaution confirmée"));
+            }
+        });
+    done();
+    EXPECT_TRUE(precautionConfirmed);
+    EXPECT_TRUE(status().startsWith("Restauration confirmée"))
+        << status().toStdString();
+    EXPECT_EQ(encryptedState(precaution), principalBefore);
+    EXPECT_FALSE(QFile::exists(preferences.directory));
+    EXPECT_EQ(record().backup, preferences);
+}
+
+TEST_F(VaultRestoreGuiTest,
+    GenerationalValidGlobalPreferencesNeverDispenseHistoricalPrecaution)
+{
+    const QString globalRoot = directory.filePath("configured-generation-root");
+    ASSERT_TRUE(QDir().mkpath(globalRoot));
+    const auto saved = GlobalBackupPreferencesStore().save({globalRoot, 7});
+    ASSERT_TRUE(saved.valid()) << saved.diagnostic.toStdString();
+    ASSERT_FALSE(record().backup.automatic);
+
+    window.reset();
+    QApplication::processEvents();
+    newGenerationalWindow();
+    choose();
+    widget<QLineEdit>("restorePrecautionEdit")->clear();
+    widget<QCheckBox>("restoreConfirmationCheck")->setChecked(true);
+    widget<QPushButton>("restorePrepareButton")->click();
+    EXPECT_TRUE(widget<QLabel>("restorePolicyLabel")->text().contains(
+        "Mode générationnel"));
+    EXPECT_FALSE(record().replacement);
+    EXPECT_FALSE(widget<QLineEdit>("restoreMasterPasswordEdit")->isEnabled());
+    EXPECT_TRUE(QDir(globalRoot).isEmpty());
+}
+#endif
 TEST_F(VaultRestoreGuiTest, SecurityLockWipesMasterBeforePositiveGlobalAcknowledgement)
 {
     choose(); prepare(); widget<QLineEdit>("restoreMasterPasswordEdit")->setText(master); bool acknowledged = false;
@@ -536,18 +616,42 @@ TEST_F(VaultRestoreGuiTest, ReceivedBusinessResultIsNotSuccessUntilActualProcess
 }
 TEST_F(VaultRestoreGuiTest, ClosingTheDialogCancelsButDoesNotDestroyTheSupervisorOrReservation)
 {
+    const auto before = bytes(principal);
     Hold hold(directory.filePath("phase-fifo"), "PW_RESTORE_HOLD_PHASE", "0"); ASSERT_GE(hold.fd, 0);
-    choose(); prepare(); auto* job = execute(); ASSERT_NE(job, nullptr); bool phaseSeen = false, terminated = false;
+    choose(); prepare();
+    const auto prepared = record(); ASSERT_TRUE(prepared.replacement);
+    const auto operationId = prepared.replacement->operationId;
+    auto* job = execute(); ASSERT_NE(job, nullptr); bool phaseSeen = false, terminated = false;
+    bool abandonmentResolved = false;
+    std::optional<RestoreResult> result;
     QObject::connect(job, &RestoreJob::phaseChanged, window.get(), [&](auto) { phaseSeen = true; });
+    QObject::connect(job, &RestoreJob::finished, window.get(), [&](auto value) { result = std::move(value); });
     QObject::connect(job, &RestoreJob::processTerminated, window.get(), [&] { terminated = true; });
+    QObject::connect(window->statusBar(), &QStatusBar::messageChanged, window.get(),
+        [&](const QString& message) {
+            if (message == "Restauration annulée") abandonmentResolved = true;
+        });
     ASSERT_TRUE(waitFor([&] { return phaseSeen; })); dialog->reject();
     EXPECT_TRUE(job->isActive()); passwall::storage::VaultOperationGuard access; std::string error;
     EXPECT_FALSE(access.tryReserve(principal.toStdString(), error)); hold.release();
     ASSERT_TRUE(waitFor([&] { return terminated; }, 10000));
-    // The worker is reaped first; the new controlled abandonment still owns a
-    // recovery reservation until its durable resolution is confirmed.
-    ASSERT_TRUE(waitFor([&] { return access.tryReserve(principal.toStdString(), error); }, 10000));
-    EXPECT_FALSE(record().replacement);
+    ASSERT_TRUE(waitFor([&] { return abandonmentResolved; }, 10000));
+    QString recoveryError;
+    ASSERT_EQ(VaultPreferencesStore().recoveryAccess(principal, recoveryError),
+        VaultRecoveryAccess::Allowed) << recoveryError.toStdString();
+    ASSERT_TRUE(result); ASSERT_TRUE(result->replacementStatusKnown);
+    EXPECT_EQ(result->outcome, RestoreOutcome::EngineResult);
+    EXPECT_EQ(result->replacement.outcome, ReplacementOutcome::CancelledBeforeEngagement);
+    EXPECT_EQ(result->replacement.operationId, operationId);
+    EXPECT_EQ(bytes(principal), before);
+    const auto resolved = record();
+    EXPECT_FALSE(resolved.replacement); ASSERT_TRUE(resolved.resolvedReplacement);
+    EXPECT_EQ(resolved.resolvedReplacement->operationId, operationId);
+    EXPECT_EQ(resolved.resolvedReplacement->phase, "abandoned");
+    error.clear(); ASSERT_TRUE(access.tryReserve(principal.toStdString(), error)) << error;
+    access.reset(); error.clear();
+    EXPECT_TRUE(access.tryReserve(principal.toStdString(), error)) << error;
+    access.reset();
 }
 TEST_F(VaultRestoreGuiTest, DestroyingMainWindowDoesNotWaitForTheHeldChildOrReleaseItsReservation)
 {

@@ -84,6 +84,8 @@ struct VaultReplacementAuthorization::State {
     VaultRegistration registration;
     VaultReplacementIntent intent;
     storage::VaultOperationGuard reservation, candidateReservation;
+    ReplacementPrecautionPolicy precautionPolicy =
+        ReplacementPrecautionPolicy::Required;
     std::function<bool()> cleanupStillValid;
     std::atomic<bool> live{true};
     bool preparing = false, delegated = false, acknowledged = false, persisted = false;
@@ -127,6 +129,13 @@ bool VaultReplacementAuthorization::matchesSelection(const VaultRegistration& ex
     return state_ && state_->registration.localId == expected.localId
         && state_->registration.file == expected.file && state_->registration.backup == expected.backup;
 }
+bool VaultReplacementAuthorization::precautionRequired(
+    const VaultRegistration& registration) const noexcept
+{
+    return !state_
+        || state_->precautionPolicy == ReplacementPrecautionPolicy::Required
+        || !registration.backup.automatic;
+}
 
 bool VaultReplacementAuthorization::delegationCurrent() const noexcept
 {
@@ -147,7 +156,9 @@ QJsonObject VaultReplacementAuthorization::delegate(QString& error)
     QJsonObject result{{"config", state_->store.fileName()}, {"local", localId()}, {"operation", operationId()},
         {"principal", f.path}, {"device", QString::number(f.device)}, {"inode", QString::number(f.inode)},
         {"vault", QString::fromLatin1(f.vaultId.toHex())},
-        {"digest", QString::fromLatin1(state_->intent.previousDigest.toHex())}};
+        {"digest", QString::fromLatin1(state_->intent.previousDigest.toHex())},
+        {"precaution-policy", state_->precautionPolicy == ReplacementPrecautionPolicy::Required
+            ? QStringLiteral("required") : QStringLiteral("historical-registration")}};
     state_->delegated = true; // Only this session may now consume the grant.
     return result;
 }
@@ -156,6 +167,16 @@ VaultReplacementAuthorization VaultReplacementAuthorization::receiveDelegation(
 {
     // Called only AFTER RestoreWorker verifies its OS parent/channel provenance.
     // A registry record, FD or JSON object alone never reaches this private API.
+    const auto serializedPolicy = message["precaution-policy"].toString();
+    ReplacementPrecautionPolicy precautionPolicy = ReplacementPrecautionPolicy::Required;
+    if (serializedPolicy == QStringLiteral("required")) {
+        precautionPolicy = ReplacementPrecautionPolicy::Required;
+    } else if (serializedPolicy == QStringLiteral("historical-registration")) {
+        precautionPolicy = ReplacementPrecautionPolicy::HistoricalRegistration;
+    } else {
+        fail(error, "Politique de précaution absente ou invalide.");
+        return {};
+    }
     const VaultPreferencesStore store(message["config"].toString());
     QVector<VaultRegistration> records;
     if (!check || !check() || !store.list(records, error)) return {};
@@ -170,6 +191,7 @@ VaultReplacementAuthorization VaultReplacementAuthorization::receiveDelegation(
             || QString::fromLatin1(r.replacement->previousDigest.toHex()) != message["digest"].toString()) break;
         auto state = std::make_shared<State>(store);
         state->registration = r; state->intent = *r.replacement;
+        state->precautionPolicy = precautionPolicy;
         state->cleanupStillValid = std::move(check);
         std::string failure;
         if (!state->reservation.adoptReservation(r.file.path.toStdString(), handles, failure)) {
@@ -185,11 +207,13 @@ VaultReplacementAuthorization VaultReplacementAuthorization::receiveDelegation(
 
 std::shared_ptr<VaultReplacementAuthorization::State> VaultReplacementAuthorization::reserve(
     const VaultPreferencesStore& store, const QString& localId,
+    ReplacementPrecautionPolicy precautionPolicy,
     std::function<bool()> cleanupStillValid, QString& error)
 {
     QVector<VaultRegistration> records;
     if (!store.list(records, error)) return {};
     auto state = std::make_shared<State>(store);
+    state->precautionPolicy = precautionPolicy;
     state->cleanupStillValid = std::move(cleanupStillValid);
     bool found = false;
     for (const auto& record : records) if (record.localId == localId) {
@@ -210,12 +234,14 @@ std::shared_ptr<VaultReplacementAuthorization::State> VaultReplacementAuthorizat
 
 std::shared_ptr<VaultReplacementAuthorization::State> VaultReplacementAuthorization::reserve(
     const VaultPreferencesStore& store, const QString& localId,
+    ReplacementPrecautionPolicy precautionPolicy,
     std::function<bool()> cleanupStillValid,
     storage::VaultOperationGuard reservation, QString& error)
 {
     QVector<VaultRegistration> records;
     if (!store.list(records, error)) return {};
     auto state = std::make_shared<State>(store);
+    state->precautionPolicy = precautionPolicy;
     state->cleanupStillValid = std::move(cleanupStillValid);
     bool found = false;
     for (const auto& record : records) if (record.localId == localId) {

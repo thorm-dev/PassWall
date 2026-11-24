@@ -7,14 +7,17 @@
 #include "services/vault_preferences_store.hpp"
 #ifdef Q_OS_LINUX
 #include "services/automatic_backup_coordinator.hpp"
+#include "services/backup_destination_preparer.hpp"
 #include "services/global_backup_preferences_store.hpp"
+#include "gui/generational_backup_status_controller.hpp"
+#include "gui/global_backup_preferences_controller.hpp"
+#include "services/generational_backup_rotation_controller.hpp"
 #endif
 #include "storage/vault_operation_guard.hpp"
 #include "ui_main_window.h"
 #ifdef Q_OS_LINUX
 #include "gui/vault_export_dialog.hpp"
 #include "gui/vault_restore_controller.hpp"
-#include "gui/vault_backup_settings_controller.hpp"
 #include "gui/vault_recovery_controller.hpp"
 #include "services/backup_job.hpp"
 #endif
@@ -26,6 +29,7 @@
 #include <QClipboard>
 #include <QCoreApplication>
 #include <QDateTime>
+
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QEvent>
@@ -55,6 +59,7 @@
 #include <QTextDocument>
 #include <QTimer>
 #include <QThread>
+#include <QToolButton>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -71,6 +76,17 @@
 #endif
 namespace passwall::gui
 {
+#ifdef Q_OS_LINUX
+    struct GenerationalCrudPreparation final {
+        services::GenerationalBackupRequestOffer offer;
+        services::PreparedBackupDestination destination;
+        std::optional<services::BackupInstallationIdentity>
+            installationIdentity;
+        QString error;
+        std::atomic_bool invalidated{false};
+        std::atomic_bool completed{false};
+    };
+#endif
     namespace
     {
         using detail::wipeCredential;
@@ -546,11 +562,15 @@ namespace passwall::gui
     } // namespace
     MainWindow::MainWindow(QWidget *parent)
 #ifdef Q_OS_LINUX
-        : MainWindow(services::BackupTriggerMode::Historical, parent)
+        : MainWindow(services::BackupTriggerMode::Generational, parent)
     {}
 
     MainWindow::MainWindow(services::BackupTriggerMode backupTriggerMode,
-                           QWidget *parent)
+                           QWidget *parent
+#ifdef PASSWALL_GUI_TESTING
+                           , bool useGenerationalTestInjections
+#endif
+                           )
 #endif
         : QMainWindow(parent),
           inactivityTimer_(this),
@@ -558,13 +578,29 @@ namespace passwall::gui
     {
         ui_->setupUi(this);
 #ifdef Q_OS_LINUX
+#ifdef PASSWALL_GUI_TESTING
+        if (backupTriggerMode == services::BackupTriggerMode::Generational
+            && useGenerationalTestInjections) {
+            backupInstallationIdentity_ = services::BackupInstallationIdentity{
+                services::BackupInstallationIdentityDomain::
+                    LinuxSystemdMachineAppSpecificV1,
+                QByteArray::fromHex("102132435465768798a9bacbdcedfe0f")};
+        }
+#endif
         if (backupTriggerMode == services::BackupTriggerMode::Historical) {
             automaticBackup_ = new services::AutomaticBackupCoordinator(this);
-        } else {
-            automaticBackup_ = new services::AutomaticBackupCoordinator(
-                services::VaultPreferencesStore(),
-                services::BackupJob::siblingWorkerPath(), 20000, 3000,
-                backupTriggerMode, this);
+
+	} else {
+#ifdef PASSWALL_GUI_TESTING
+	  const int groupingDelayMs = useGenerationalTestInjections ? 100 : 20000;
+#else
+	  constexpr int groupingDelayMs = 20000;
+#endif
+	  automaticBackup_ = new services::AutomaticBackupCoordinator(
+								      services::VaultPreferencesStore(),
+								      services::BackupJob::siblingWorkerPath(), groupingDelayMs, 3000,
+								      backupTriggerMode, this);
+          automaticBackup_->requireGlobalBackupPreferencesInitialization();
         }
         automaticBackup_->setPaused(true);
         connect(automaticBackup_, &services::AutomaticBackupCoordinator::notification, this,
@@ -582,15 +618,72 @@ namespace passwall::gui
             this, [this](bool) { updateExportAction(); });
         connect(automaticBackup_,
             &services::AutomaticBackupCoordinator::generationalShutdownDrainChanged,
-            this, [this](services::GenerationalShutdownDrainState state) {
-                if (!generationalCloseDrainRequested_)
-                    return;
-                if (state.status == services::GenerationalShutdownDrainStatus::Completed
-                    || state.status == services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension)
-                    queueGenerationalDrainClose();
+            this, [this](services::GenerationalShutdownDrainState) {
+                handleGenerationalDrainTerminal();
             });
+        if (automaticBackup_->triggerMode()
+            == services::BackupTriggerMode::Generational) {
+            connect(automaticBackup_,
+                &services::AutomaticBackupCoordinator::generationalBackupRequestInvalidated,
+                this, &MainWindow::invalidateGenerationalCrudPreparation);
+            generationalRotationController_ =
+                new services::GenerationalBackupRotationController(
+                    *automaticBackup_, this);
+            globalBackupPreferencesController_ =
+                new GlobalBackupPreferencesController(
+                    services::GlobalBackupPreferencesStore(), this);
+            generationalBackupStatusController_ =
+                new GenerationalBackupStatusController(
+                    *automaticBackup_, *generationalRotationController_, this);
+            auto* generationalStatusButton = new QToolButton(this);
+            generationalStatusButton->setObjectName(
+                QStringLiteral("generationalBackupStatusButton"));
+            generationalStatusButton->setAutoRaise(true);
+            generationalStatusButton->setText(
+                tr("Sauvegardes : état disponible"));
+            generationalStatusButton->setToolTip(tr(
+                "Consulter l'état transitoire des sauvegardes générationnelles."));
+            statusBar()->addPermanentWidget(generationalStatusButton);
+            connect(generationalStatusButton, &QToolButton::clicked,
+                generationalBackupStatusController_,
+                &GenerationalBackupStatusController::open);
+            connect(generationalBackupStatusController_,
+                &GenerationalBackupStatusController::presentationChanged,
+                this, [generationalStatusButton](const QString& summary,
+                          bool attentionRequired) {
+                    generationalStatusButton->setText(attentionRequired
+                        ? tr("Sauvegardes : intervention nécessaire")
+                        : tr("Sauvegardes : état disponible"));
+                    generationalStatusButton->setToolTip(summary);
+                });
+            connect(globalBackupPreferencesController_,
+                &GlobalBackupPreferencesController::configurationRead,
+                automaticBackup_,
+                &services::AutomaticBackupCoordinator::applyGlobalBackupPreferences);
+            connect(globalBackupPreferencesController_,
+                &GlobalBackupPreferencesController::readSettled,
+                generationalBackupStatusController_,
+                &GenerationalBackupStatusController::preferencesReadSettled);
+            connect(globalBackupPreferencesController_,
+                &GlobalBackupPreferencesController::writeSettled,
+                generationalBackupStatusController_,
+                &GenerationalBackupStatusController::preferencesWriteSettled);
+            connect(generationalRotationController_,
+                &services::GenerationalBackupRotationController::shutdownDrainCompleted,
+                this, &MainWindow::handleGenerationalDrainTerminal);
+            QTimer::singleShot(0, globalBackupPreferencesController_,
+                [controller = QPointer<GlobalBackupPreferencesController>(
+                     globalBackupPreferencesController_)] {
+                    if (controller) controller->offerInitialConfiguration();
+                });
+            // The presentation observer is connected first, so a direct offer
+            // cannot start its worker before the UI has bound the exact token.
+            connect(automaticBackup_,
+                &services::AutomaticBackupCoordinator::generationalBackupRequested,
+                this, &MainWindow::consumeGenerationalBackupRequest);
+        }
 #endif
-        inactivityTimer_.setObjectName(QStringLiteral("vaultInactivityTimer"));
+	inactivityTimer_.setObjectName(QStringLiteral("vaultInactivityTimer"));
         // An absent preference uses one minute. A legacy/invalid preference
         // cannot disable protection, even if its migration cannot be saved.
         QSettings settings("PassWall", "PassWall");
@@ -720,13 +813,27 @@ namespace passwall::gui
             if (!recoveryController_) recoveryController_ = new VaultRecoveryController(*this);
             recoveryController_->open();
         });
-        auto* backupSettings = restoreMenu->addAction(tr("Sauvegardes automatiques…"));
-        backupSettings->setObjectName(QStringLiteral("backupSettingsAction"));
-        connect(backupSettings, &QAction::triggered, this, [this] {
-            if (externalLockClosing_ || exportCloseRequested_) return;
-            if (!backupSettingsController_) backupSettingsController_ = new VaultBackupSettingsController(*this);
-            backupSettingsController_->open();
-        });
+        if (globalBackupPreferencesController_) {
+            auto* globalBackupSettings = restoreMenu->addAction(
+                tr("Préférences globales de sauvegarde…"));
+            globalBackupSettings->setObjectName(
+                QStringLiteral("globalBackupPreferencesAction"));
+            connect(globalBackupSettings, &QAction::triggered, this, [this] {
+                if (externalLockClosing_ || exportCloseRequested_
+                    || !globalBackupPreferencesController_)
+                    return;
+                globalBackupPreferencesController_->open();
+            });
+            if (generationalBackupStatusController_) {
+                auto* backupStatus = restoreMenu->addAction(
+                    tr("État des sauvegardes…"));
+                backupStatus->setObjectName(
+                    QStringLiteral("generationalBackupStatusAction"));
+                connect(backupStatus, &QAction::triggered,
+                    generationalBackupStatusController_,
+                    &GenerationalBackupStatusController::open);
+            }
+        }
         connect(ui_->exportVaultButton, &QPushButton::clicked,
                 this, &MainWindow::exportVault);
 #else
@@ -747,19 +854,167 @@ namespace passwall::gui
     }
 #ifdef Q_OS_LINUX
 #ifdef PASSWALL_GUI_TESTING
+    std::unique_ptr<MainWindow> MainWindow::createForHistoricalTests(
+        QWidget* parent)
+    {
+        return std::unique_ptr<MainWindow>(new MainWindow(
+            services::BackupTriggerMode::Historical, parent, false));
+    }
+
     std::unique_ptr<MainWindow> MainWindow::createForGenerationalTests(
         QWidget* parent)
     {
         return std::unique_ptr<MainWindow>(new MainWindow(
-            services::BackupTriggerMode::Generational, parent));
+            services::BackupTriggerMode::Generational, parent, true));
+    }
+
+    std::unique_ptr<MainWindow>
+    MainWindow::createForGenerationalProductionCompositionTests(
+        QWidget* parent)
+    {
+        return std::unique_ptr<MainWindow>(new MainWindow(
+            services::BackupTriggerMode::Generational, parent, false));
     }
 #endif
+#endif
+#ifdef Q_OS_LINUX
+    void MainWindow::consumeGenerationalBackupRequest(
+        services::GenerationalBackupRequestOffer offer)
+    {
+        if (!automaticBackup_
+            || automaticBackup_->triggerMode()
+                != services::BackupTriggerMode::Generational
+            || offer.requestId == 0)
+            return;
+        if (offer.kind != services::GenerationalBackupRequestKind::CrudGeneration)
+            return;
+        if (offer.mutationGeneration == 0 || offer.vault.path.isEmpty()
+            || offer.vault.vaultId.size() != 16 || offer.vault.device == 0
+            || offer.vault.inode == 0) {
+            static_cast<void>(automaticBackup_->failMutationBackupPreparation(
+                offer.requestId, offer.vaultPath, offer.mutationGeneration,
+                QStringLiteral("Offre CRUD générationnelle incomplète ou incohérente.")));
+            return;
+        }
+        invalidateGenerationalCrudPreparation(0);
+        std::shared_ptr<GenerationalCrudPreparation> preparation;
+        try {
+            preparation = std::make_shared<GenerationalCrudPreparation>();
+        } catch (...) {
+            static_cast<void>(automaticBackup_->failMutationBackupPreparation(
+                offer.requestId, offer.vaultPath, offer.mutationGeneration,
+                QStringLiteral("Allocation de la préparation de sauvegarde impossible.")));
+            return;
+        }
+        preparation->offer = std::move(offer);
+        preparation->installationIdentity = backupInstallationIdentity_;
+        generationalCrudPreparation_ = preparation;
+        const QPointer<MainWindow> owner(this);
+        auto* delivery = new QObject;
+        QThread* task = nullptr;
+        try {
+            task = QThread::create([preparation] {
+                try {
+                    if (!preparation->invalidated.load(std::memory_order_acquire)) {
+                        const auto configuration =
+                            services::GlobalBackupPreferencesStore().load();
+                        QString error;
+                        services::PreparedBackupDestination destination;
+                        if (!preparation->invalidated.load(std::memory_order_acquire)
+                            && services::BackupDestinationPreparer::prepare(
+                                configuration, preparation->offer.vault,
+                                preparation->offer.mutationGeneration,
+                                QDateTime::currentDateTimeUtc(), destination, error,
+                                nullptr, nullptr, nullptr, nullptr,
+                                preparation->installationIdentity
+                                    ? &*preparation->installationIdentity : nullptr)
+                            && !preparation->invalidated.load(std::memory_order_acquire)) {
+                            preparation->destination = std::move(destination);
+                        } else {
+                            preparation->error = std::move(error);
+                        }
+                    }
+                } catch (...) {
+                    preparation->error = QStringLiteral(
+                        "Préparation asynchrone de sauvegarde interrompue.");
+                }
+                preparation->completed.store(true, std::memory_order_release);
+            });
+        } catch (...) {
+            delete delivery;
+            preparation->error = QStringLiteral(
+                "Création de la préparation de sauvegarde impossible.");
+            completeGenerationalCrudPreparation(preparation);
+            return;
+        }
+        QObject::connect(task, &QThread::finished, delivery,
+            [task, delivery, owner, preparation] {
+                if (owner)
+                    owner->completeGenerationalCrudPreparation(preparation);
+                task->deleteLater();
+                delivery->deleteLater();
+            }, Qt::QueuedConnection);
+        task->start();
+    }
+
+    void MainWindow::completeGenerationalCrudPreparation(
+        const std::shared_ptr<GenerationalCrudPreparation>& preparation)
+    {
+        if (!preparation) return;
+        if (preparation->invalidated.load(std::memory_order_acquire)
+            || generationalCrudPreparation_ != preparation) {
+            preparation->destination = {};
+            return;
+        }
+        generationalCrudPreparation_.reset();
+        if (!automaticBackup_
+            || automaticBackup_->triggerMode()
+                != services::BackupTriggerMode::Generational) {
+            preparation->destination = {};
+            return;
+        }
+        const auto& offer = preparation->offer;
+        if (preparation->destination.destinationPath().isEmpty()) {
+            static_cast<void>(automaticBackup_->failMutationBackupPreparation(
+                offer.requestId, offer.vaultPath, offer.mutationGeneration,
+                preparation->error));
+            return;
+        }
+        QString error;
+        if (!automaticBackup_->startPreparedMutationBackupSnapshot(
+                offer.requestId, offer.vaultPath, offer.mutationGeneration,
+                std::move(preparation->destination), error)) {
+            // A configuration invalidation may have already removed the exact
+            // offer and retained its generation.  Only the still-current
+            // offer is terminally failed here.
+            static_cast<void>(automaticBackup_->failMutationBackupPreparation(
+                offer.requestId, offer.vaultPath, offer.mutationGeneration,
+                std::move(error)));
+        }
+    }
+
+    void MainWindow::invalidateGenerationalCrudPreparation(quint64 requestId)
+    {
+        if (!generationalCrudPreparation_) return;
+        if (requestId != 0
+            && generationalCrudPreparation_->offer.requestId != requestId)
+            return;
+        generationalCrudPreparation_->invalidated.store(
+            true, std::memory_order_release);
+        if (generationalCrudPreparation_->completed.load(std::memory_order_acquire))
+            generationalCrudPreparation_->destination = {};
+        generationalCrudPreparation_.reset();
+    }
 #endif
     MainWindow::~MainWindow()
     {
         revokeReplacement();
 #ifdef Q_OS_LINUX
         exportCloseRequested_ = true;
+        if (generationalBackupStatusController_)
+            generationalBackupStatusController_->invalidateAuthenticatedSession();
+        authenticatedBackupVault_.reset();
+        invalidateGenerationalCrudPreparation(0);
         if (automaticBackup_ && !vaultPath_.isEmpty())
             automaticBackup_->requestPendingMutationsForLock(vaultPath_);
         if (backupJob_)
@@ -780,7 +1035,6 @@ namespace passwall::gui
 #ifdef Q_OS_LINUX
         if (automaticBackup_) automaticBackup_->shutdown();
         delete std::exchange(restoreController_, nullptr);
-        delete std::exchange(backupSettingsController_, nullptr);
         delete std::exchange(recoveryController_, nullptr);
 #endif
         delete ui_;
@@ -1337,29 +1591,24 @@ namespace passwall::gui
                 || result == services::VaultRecognition::Recognized)
             {
 #ifdef Q_OS_LINUX
-                automaticBackup_->trackVault(registration);
-                // Inactive in current production: the default coordinator is
-                // Historical. This is the real session-cycle hook for the
-                // future immutable Generational selection. It carries no key
-                // or password, and the potentially long inspection runs on a
-                // dedicated thread owned indirectly by the coordinator.
-                if (automaticBackup_->triggerMode()
-                    == services::BackupTriggerMode::Generational) {
-                    services::AuthenticatedBackupSession backupSession;
-                    backupSession.vault = registration.file;
-                    backupSession.sessionGeneration = sessionGeneration_;
-                    backupSession.pendingMutationGeneration = 0;
-                    backupSession.authenticated = true;
-                    const auto launch =
-                        automaticBackup_->startInitialBackupInspectionAsync(
-                            services::GlobalBackupPreferencesStore().load(),
-                            std::move(backupSession),
-                            QDateTime::currentDateTimeUtc());
-                    Q_UNUSED(launch);
-                }
+	      automaticBackup_->trackVault(registration);
+	      if (automaticBackup_->triggerMode()
+		  == services::BackupTriggerMode::Generational) {
+		try {
+		  authenticatedBackupVault_ =
+		      std::make_shared<const services::VaultFileIdentity>(
+			  registration.file);
+		} catch (...) {
+		  authenticatedBackupVault_.reset();
+		}
+		if (authenticatedBackupVault_
+		    && generationalBackupStatusController_)
+		  generationalBackupStatusController_->setAuthenticatedVault(
+		      *authenticatedBackupVault_);
+	      }
 #endif
-                persistUiPreference("vault/lastPath", QFileInfo(path).absoluteFilePath());
-                return;
+	      persistUiPreference("vault/lastPath", QFileInfo(path).absoluteFilePath());
+	      return;
             }
         }
         catch (...)
@@ -1792,6 +2041,9 @@ namespace passwall::gui
         }
 #ifdef Q_OS_LINUX
         const QString lockedSource = vaultPath_; // Non-secret, before session cleanup.
+        if (generationalBackupStatusController_)
+            generationalBackupStatusController_->invalidateAuthenticatedSession();
+        authenticatedBackupVault_.reset();
 #endif
         const QScopedValueRollback<bool> locking(vaultLockInProgress_, true);
 #ifdef Q_OS_LINUX

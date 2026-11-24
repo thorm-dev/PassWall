@@ -1,7 +1,9 @@
 #include "gui/main_window.hpp"
+#include "generational_backup_status_controller.hpp"
 #include "gui/vault_export_dialog.hpp"
 #include "services/backup_job.hpp"
 #include "services/automatic_backup_coordinator.hpp"
+#include "services/generational_backup_rotation_controller.hpp"
 #include "ui_main_window.h"
 
 #include <QCloseEvent>
@@ -266,6 +268,133 @@ void MainWindow::queueGenerationalDrainClose()
         close();
     });
 }
+void MainWindow::handleGenerationalDrainTerminal()
+{
+    if (!generationalCloseDrainRequested_ || !automaticBackup_)
+        return;
+    const auto state = automaticBackup_->generationalShutdownDrainState();
+    if (state.status != services::GenerationalShutdownDrainStatus::Completed
+        && state.status
+            != services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension)
+        return;
+    if (generationalRotationController_
+        && !generationalRotationController_->idle())
+        return;
+    if (state.status == services::GenerationalShutdownDrainStatus::Completed
+        || generationalCloseFailureAccepted_) {
+        queueGenerationalDrainClose();
+        return;
+    }
+    // A direct drain signal may be emitted inside the first closeEvent(),
+    // before lockVault() has wiped the session and rejected old dialogs.
+    // Defer presentation until that cleanup stack has returned.
+    QTimer::singleShot(0, this, [this] {
+        if (!generationalCloseDrainRequested_ || !automaticBackup_)
+            return;
+        const auto current =
+            automaticBackup_->generationalShutdownDrainState();
+        if (current.status
+                == services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension
+            && (!generationalRotationController_
+                || generationalRotationController_->idle())
+            && !generationalCloseFailureAccepted_)
+            showGenerationalCloseFailureNotice();
+    });
+}
+void MainWindow::showGenerationalCloseFailureNotice()
+{
+    if (generationalCloseFailureNotice_) {
+        generationalCloseFailureNotice_->show();
+        generationalCloseFailureNotice_->raise();
+        generationalCloseFailureNotice_->activateWindow();
+        return;
+    }
+    if (!automaticBackup_ || !generationalCloseDrainRequested_)
+        return;
+    const auto drain = automaticBackup_->generationalShutdownDrainState();
+    if (drain.status
+            != services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension
+        || (generationalRotationController_
+            && !generationalRotationController_->idle()))
+        return;
+
+    const QString resultStatus = generationalBackupStatusController_
+        ? generationalBackupStatusController_->lastBackupResultStatus()
+        : QString{};
+    const QString resultDetail = generationalBackupStatusController_
+        ? generationalBackupStatusController_->lastBackupResultDetail()
+        : QString{};
+    QString message = tr(
+        "Le coffre est verrouillé et ses secrets ont été effacés, mais la "
+        "sauvegarde requise pour la fermeture n'est pas confirmée.");
+    if (!drain.diagnostic.isEmpty())
+        message += QStringLiteral("\n\n") + drain.diagnostic.left(2048);
+    if (!resultStatus.isEmpty()) {
+        message += tr("\n\nDernier résultat terminal observé : %1")
+            .arg(resultStatus.left(2048));
+        if (!resultDetail.isEmpty())
+            message += QStringLiteral("\n") + resultDetail.left(2048);
+    }
+    message += tr(
+        "\n\nVous pouvez quitter, ou rester dans PassWall puis vous "
+        "réauthentifier avant de demander explicitement une nouvelle tentative.");
+
+    auto* notice = new QMessageBox(QMessageBox::Warning,
+        tr("Sauvegarde non confirmée"), message,
+        QMessageBox::NoButton, this);
+    notice->setObjectName(QStringLiteral("generationalCloseFailureNotice"));
+    notice->setTextFormat(Qt::PlainText);
+    notice->setModal(false);
+    notice->setAttribute(Qt::WA_DeleteOnClose);
+    auto* stay = notice->addButton(
+        tr("Rester dans PassWall"), QMessageBox::RejectRole);
+    stay->setObjectName(QStringLiteral("generationalCloseFailureStayButton"));
+    auto* leave = notice->addButton(tr("Quitter"), QMessageBox::AcceptRole);
+    leave->setObjectName(QStringLiteral("generationalCloseFailureQuitButton"));
+    notice->setDefaultButton(stay);
+    notice->setEscapeButton(stay);
+    generationalCloseFailureNotice_ = notice;
+    connect(notice, &QDialog::finished, this, [this, notice, leave] {
+        const bool leaveRequested = notice->clickedButton() == leave;
+        if (generationalCloseFailureNotice_ == notice)
+            generationalCloseFailureNotice_.clear();
+        if (leaveRequested) {
+            generationalCloseFailureAccepted_ = true;
+            queueGenerationalDrainClose();
+        } else {
+            continueAfterGenerationalCloseFailure();
+        }
+    });
+    notice->show();
+}
+void MainWindow::continueAfterGenerationalCloseFailure()
+{
+    if (!automaticBackup_ || !generationalCloseDrainRequested_)
+        return;
+    QString error;
+    const bool coordinatorContinued =
+        automaticBackup_->continueAfterGenerationalShutdownFailure(error);
+    const bool rotationContinued = !generationalRotationController_
+        || generationalRotationController_->continueAfterShutdownDrain();
+    if (!coordinatorContinued || !rotationContinued) {
+        // Restore the close-drain intent if one side unexpectedly refused the
+        // transition. Remain locked and fail closed; no retry is inferred.
+        QString ignored;
+        static_cast<void>(automaticBackup_->beginGenerationalShutdownDrain(
+            ignored));
+        if (!generationalCloseDrainRequested_
+            && generationalRotationController_)
+            generationalRotationController_->beginShutdownDrain();
+        QTimer::singleShot(0, this,
+            &MainWindow::showGenerationalCloseFailureNotice);
+        return;
+    }
+    generationalCloseDrainRequested_ = false;
+    generationalCloseFailureAccepted_ = false;
+    exportCloseRequested_ = false;
+    ui_->centralwidget->setEnabled(true);
+    updateSessionAccessUi();
+}
 void MainWindow::closeEvent(QCloseEvent* event)
 {
     exportCloseRequested_ = true; // Fail-closed while asynchronous close runs.
@@ -277,23 +406,38 @@ void MainWindow::closeEvent(QCloseEvent* event)
         && automaticBackup_->triggerMode()
             == services::BackupTriggerMode::Generational;
     if (generational) {
-      const bool firstDrainClose = !generationalCloseDrainRequested_;
-      const auto drainState = automaticBackup_->generationalShutdownDrainState();
-      const bool terminal = drainState.status
-	== services::GenerationalShutdownDrainStatus::Completed
-	|| drainState.status
-	== services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension;
-      if (!generationalCloseDrainRequested_ || !terminal) {
-	event->ignore();
-	ui_->centralwidget->setEnabled(false);
-	if (!generationalCloseDrainRequested_) {
-	  generationalCloseDrainRequested_ = true;
-	  QString drainError;
-	  if (!automaticBackup_->beginGenerationalShutdownDrain(drainError)) {
-	    // No progressive state can be supervised.  Fall back to
-	    // the pre-existing fail-closed shutdown path; do not
-	    // claim that an unstarted generation was saved.
-	    automaticBackup_->shutdown();
+        if (generationalCloseFailureNotice_
+            && !generationalCloseFailureAccepted_) {
+            event->ignore();
+            generationalCloseFailureNotice_->show();
+            generationalCloseFailureNotice_->raise();
+            generationalCloseFailureNotice_->activateWindow();
+            return;
+        }
+        if (generationalRotationController_)
+            generationalRotationController_->beginShutdownDrain();
+        const bool firstDrainClose = !generationalCloseDrainRequested_;
+        const auto drainState =
+            automaticBackup_->generationalShutdownDrainState();
+        const bool terminal = drainState.status
+                == services::GenerationalShutdownDrainStatus::Completed
+            || drainState.status
+                == services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension;
+        const bool rotationTerminal = !generationalRotationController_
+            || generationalRotationController_->idle();
+        if (!generationalCloseDrainRequested_ || !terminal
+            || !rotationTerminal) {
+            event->ignore();
+            ui_->centralwidget->setEnabled(false);
+            if (!generationalCloseDrainRequested_) {
+                generationalCloseDrainRequested_ = true;
+                QString drainError;
+                if (!automaticBackup_->beginGenerationalShutdownDrain(
+                        drainError)) {
+                    // No progressive state can be supervised. Fall back to
+                    // the pre-existing fail-closed shutdown path; do not
+                    // claim that an unstarted generation was saved.
+                    automaticBackup_->shutdown();
                     if (!automaticBackup_->canClose())
                         return;
                     queueGenerationalDrainClose();
@@ -305,10 +449,23 @@ void MainWindow::closeEvent(QCloseEvent* event)
             // The drain has already captured the current generation, but its
             // queued dispatch still cannot run before this cleanup returns.
             if (firstDrainClose) lockVault();
-            const auto current = automaticBackup_->generationalShutdownDrainState();
-            if (current.status == services::GenerationalShutdownDrainStatus::Completed
-                || current.status == services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension)
-                queueGenerationalDrainClose();
+            const auto current =
+                automaticBackup_->generationalShutdownDrainState();
+            const bool currentTerminal = current.status
+                    == services::GenerationalShutdownDrainStatus::Completed
+                || current.status
+                    == services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension;
+            if (currentTerminal && (!generationalRotationController_
+                    || generationalRotationController_->idle()))
+                handleGenerationalDrainTerminal();
+            return;
+        }
+        if (drainState.status
+                == services::GenerationalShutdownDrainStatus::CompletedWithFailureOrSuspension
+            && !generationalCloseFailureAccepted_) {
+            event->ignore();
+            ui_->centralwidget->setEnabled(false);
+            handleGenerationalDrainTerminal();
             return;
         }
         // A terminal drain has no active worker.  Do not call shutdown(): its

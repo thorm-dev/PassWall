@@ -35,6 +35,8 @@ private:
     void fail(const QString&);
     void phase(services::ReplacementCheckpoint);
     void displayResult(bool terminated);
+    [[nodiscard]] bool precautionRequired(
+        const services::VaultRegistration&) const noexcept;
     MainWindow& owner_;
     QPointer<VaultRestoreDialog> dialog_;
     QPointer<services::RestoreJob> job_;

@@ -282,6 +282,25 @@ bool validateMetadata(sqlite3* database, std::string& error)
     return true;
 }
 
+bool validateLightweightSnapshot(sqlite3* database, std::string& error)
+{
+    if (!singleInteger(database,
+            "SELECT count(*) FROM main.sqlite_schema WHERE "
+            "type='table' AND name=tbl_name AND "
+            "name IN ('vault_metadata','entries');", 2, error))
+        return false;
+    constexpr std::string_view metadataNames[] = {"id", "vault_id", "format_version", "salt",
+        "argon2_operations", "argon2_memory", "wrap_nonce", "wrapped_dek"};
+    constexpr std::string_view metadataTypes[] = {"INTEGER", "BLOB", "INTEGER", "BLOB",
+        "INTEGER", "INTEGER", "BLOB", "BLOB"};
+    constexpr std::string_view entryNames[] = {"entry_id", "entry_version", "nonce", "ciphertext"};
+    constexpr std::string_view entryTypes[] = {"BLOB", "INTEGER", "BLOB", "BLOB"};
+    return checkColumns(database, "PRAGMA main.table_xinfo(vault_metadata);",
+               metadataNames, metadataTypes, 8, error)
+        && checkColumns(database, "PRAGMA main.table_xinfo(entries);",
+               entryNames, entryTypes, 4, error);
+}
+
 bool validateSnapshot(sqlite3* database, std::string& error)
 {
     // Explicit object allow-list, including the two implicit UNIQUE/PK indexes.
@@ -359,11 +378,9 @@ bool inspectSnapshotContents(sqlite3* database, SnapshotVaultContents& contents,
     return true;
 }
 
-} // namespace
-
-bool VaultSnapshotService::prevalidateVaultSource(const std::string& path,
-    std::string& error, SnapshotSourceIdentity* identity,
-    SnapshotVaultContents* contents)
+bool prevalidateVaultSourceImpl(const std::string& path, std::string& error,
+    SnapshotSourceIdentity* identity, SnapshotVaultContents* contents,
+    bool exhaustive)
 {
     error.clear();
     if (identity) *identity = {};
@@ -393,7 +410,9 @@ bool VaultSnapshotService::prevalidateVaultSource(const std::string& path,
         Database database;
         SnapshotVaultContents observedContents;
         if (!openDatabase(path, true, database, error)
-            || !validateSnapshot(database.value, error)
+            || (exhaustive
+                ? !validateSnapshot(database.value, error)
+                : !validateLightweightSnapshot(database.value, error))
             || !validateMetadata(database.value, error)
             || (contents != nullptr
                 && !inspectSnapshotContents(database.value, observedContents, error)))
@@ -425,6 +444,22 @@ bool VaultSnapshotService::prevalidateVaultSource(const std::string& path,
         catch (...) { error.clear(); }
         return false;
     }
+}
+
+} // namespace
+
+bool VaultSnapshotService::prevalidateVaultSource(const std::string& path,
+    std::string& error, SnapshotSourceIdentity* identity,
+    SnapshotVaultContents* contents)
+{
+    return prevalidateVaultSourceImpl(path, error, identity, contents, true);
+}
+
+bool VaultSnapshotService::prevalidateVaultSourceLightweight(
+    const std::string& path, std::string& error,
+    SnapshotSourceIdentity* identity, SnapshotVaultContents* contents)
+{
+    return prevalidateVaultSourceImpl(path, error, identity, contents, false);
 }
 
 bool VaultSnapshotService::inspectDestinationDirectory(const std::string& path,
